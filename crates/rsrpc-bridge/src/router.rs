@@ -247,8 +247,7 @@ impl Shared {
   }
 
   /// Handle one `SET_ACTIVITY` command: fingerprint, flood-guard,
-  /// envelope build, handoff, change detection, genuine-clear resume,
-  /// conditional fan-out.
+  /// handoff, change detection, clear resume, envelope build, fan-out.
   pub(crate) async fn handle_set_activity(&self, mut cmd: ActivityCmd) {
     // Fingerprint first (runs `fix()`): flood-dropped publishes return
     // before the envelope (JSON + MessagePack) is ever built.
@@ -263,25 +262,24 @@ impl Shared {
       tracing::debug!("[bridge] Dropping duplicate SET_ACTIVITY (app {app_key}, pid {pid})");
       return;
     }
-    let Some(mut payload) = commands::cached_activity(&mut cmd, fingerprint.clone()) else {
+    // Reject early, exactly where the payload build used to reject it: the
+    // side effects below run for anything the build would have accepted.
+    if cmd.args.is_none() {
       tracing::warn!("[bridge] Invalid activity command, skipping");
       return;
-    };
-    // Freshly built (sole owner): stamp SDK provenance so snapshots tell
-    // client-published cards apart from detected generics.
-    if let Some(payload) = Arc::get_mut(&mut payload) {
-      payload.provenance = Some(commands::ActivityProvenance {
-        source: "sdk".to_string(),
-        latency_ms: None,
-      });
     }
+    // An `AppId` clone is a refcount bump, not a byte copy, so this is
+    // cheap — and it keeps `app_key` alive for the log at the bottom
+    // without borrowing `cmd` past the move below.
     let app_key = cmd.application_id.as_deref().unwrap_or("");
     let activity = cmd.args.as_ref().and_then(|args| args.activity.as_ref());
+    let changed = self.activity_changed(pid, fingerprint.as_deref());
+    // Freshly built (sole owner): SDK provenance is stamped on the payload
+    // below, so snapshots tell client cards apart from detected generics.
     self.note_sdk_publish(&cmd);
     // NOTE: no ignore-list filtering here by design. Forwarded client
     // frames are indistinguishable on this path — filtering would kill
     // the companion this bridge exists to carry.
-    let changed = self.activity_changed(pid, fingerprint.as_deref());
     match activity {
       Some(activity) => {
         if changed {
@@ -315,13 +313,28 @@ impl Shared {
     // A genuine clear (null activity) from a real connection means the
     // SDK source went away: hand the slot back to generic detection.
     self.resume_after_clear(&cmd, changed);
-    // Identical republishes change nothing observable: the replay cache
-    // already holds these exact bytes (late joiners replay them) and the
-    // refresh re-asserts them — so skip the fan-out. First publishes,
-    // real changes and effective clears always pass.
+
+    // Envelope build last, and only when the payload is actually used: it
+    // is pure, so it is the only step that may sit after the side effects
+    // above, and it consumes `cmd`. An identical republish discards the
+    // payload either way, so it never pays for the build.
     if changed {
+      let Some(mut payload) = commands::cached_activity(cmd, fingerprint) else {
+        tracing::warn!("[bridge] Invalid activity command, skipping");
+        return;
+      };
+      if let Some(payload) = Arc::get_mut(&mut payload) {
+        payload.provenance = Some(commands::ActivityProvenance {
+          source: "sdk".to_string(),
+          latency_ms: None,
+        });
+      }
       self.broadcast_activity(payload, SocketId::from(pid.to_string()));
     } else {
+      // Identical republishes change nothing observable: the replay cache
+      // already holds these exact bytes (late joiners replay them) and the
+      // refresh re-asserts them — so skip the fan-out. First publishes,
+      // real changes and effective clears always pass.
       tracing::debug!(
         "[bridge] Already published identical activity (app {app_key}, pid {pid}), skipping fan-out"
       );

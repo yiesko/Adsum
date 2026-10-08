@@ -37,11 +37,22 @@ fn benchmark_cached_activity_json(c: &mut Criterion) {
   cmd.fix();
 
   c.bench_function("cached_activity_json_build", |b| {
-    b.iter(|| {
-      let fp = activity_fingerprint(black_box(&mut cmd));
-      let cached = cached_activity(black_box(&mut cmd), fp).expect("payload");
-      black_box(cached.json.len())
-    })
+    // The command is consumed by the build now, so each iteration needs a
+    // fresh one. `iter_with_setup` keeps the fixture (a serde parse) out of
+    // the timed region — cloning inside the loop would charge the benchmark
+    // for a copy it no longer performs.
+    b.iter_with_setup(
+      || {
+        let mut cmd = sample_command();
+        cmd.fix();
+        cmd
+      },
+      |mut cmd| {
+        let fp = activity_fingerprint(black_box(&mut cmd)).expect("fingerprint");
+        let cached = cached_activity(cmd, Some(fp)).expect("payload");
+        black_box(cached.json.len())
+      },
+    )
   });
 }
 
@@ -50,11 +61,18 @@ fn benchmark_cached_activity_msgpack(c: &mut Criterion) {
   cmd.fix();
 
   c.bench_function("cached_activity_msgpack_build", |b| {
-    b.iter(|| {
-      let fp = activity_fingerprint(black_box(&mut cmd));
-      let cached = cached_activity(black_box(&mut cmd), fp).expect("payload");
-      black_box(cached.msgpack.len())
-    })
+    b.iter_with_setup(
+      || {
+        let mut cmd = sample_command();
+        cmd.fix();
+        cmd
+      },
+      |mut cmd| {
+        let fp = activity_fingerprint(black_box(&mut cmd)).expect("fingerprint");
+        let cached = cached_activity(cmd, Some(fp)).expect("payload");
+        black_box(cached.msgpack.len())
+      },
+    )
   });
 }
 
@@ -62,7 +80,7 @@ fn benchmark_json_decode(c: &mut Criterion) {
   let mut cmd = sample_command();
   cmd.fix();
   let fp = activity_fingerprint(&mut cmd);
-  let cached = cached_activity(&mut cmd, fp).expect("payload");
+  let cached = cached_activity(cmd, fp).expect("payload");
   let encoded = cached.json.clone();
 
   c.bench_function("json_decode_activity", |b| {
@@ -77,7 +95,7 @@ fn benchmark_msgpack_decode(c: &mut Criterion) {
   let mut cmd = sample_command();
   cmd.fix();
   let fp = activity_fingerprint(&mut cmd);
-  let cached = cached_activity(&mut cmd, fp).expect("payload");
+  let cached = cached_activity(cmd, fp).expect("payload");
   let encoded = cached.msgpack.clone();
 
   c.bench_function("msgpack_decode_activity", |b| {
@@ -125,7 +143,7 @@ fn benchmark_message_size(c: &mut Criterion) {
   let mut cmd = sample_command();
   cmd.fix();
   let fp = activity_fingerprint(&mut cmd);
-  let cached = cached_activity(&mut cmd, fp).expect("payload");
+  let cached = cached_activity(cmd, fp).expect("payload");
 
   let json_size = cached.json.len();
   let msgpack_size = cached.msgpack.len();

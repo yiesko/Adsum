@@ -121,27 +121,34 @@ pub fn activity_fingerprint(cmd: &mut ActivityCmd) -> Option<Vec<u8>> {
 /// detection. A missing fingerprint degrades to always-changed, never to
 /// a dropped broadcast.
 ///
+/// Consumes `cmd`: the activity moves into the payload instead of being
+/// cloned for it. Callers that still need the command afterwards (logs,
+/// the SDK handoff, clear resume) read those facts before handing it over —
+/// this function is the last thing that runs before the fan-out.
+///
 /// Returns `None` when the command cannot be converted into a valid payload
 /// (e.g. it is missing its arguments entirely).
 #[must_use]
 pub fn cached_activity(
-  cmd: &mut ActivityCmd,
+  mut cmd: ActivityCmd,
   fingerprint: Option<Vec<u8>>,
 ) -> Option<Arc<CachedActivity>> {
   cmd.fix();
 
-  let args = cmd.args.as_mut()?;
+  // Owned command: take the activity out instead of cloning it. The
+  // application id moves too — nothing else reads it afterwards.
+  let mut args = cmd.args.take()?;
 
   if args.activity.is_none() {
     let pid = args.pid.unwrap_or_default();
     return empty_cached(pid, SocketId::from(pid.to_string()));
   }
 
-  let activity = args.activity.as_mut()?;
-  activity.application_id = cmd.application_id.clone();
+  let mut activity = args.activity.take()?;
+  activity.application_id = cmd.application_id;
 
   let payload = ActivityPayload {
-    activity: Some(activity.clone()),
+    activity: Some(activity),
     pid: args.pid,
     socket_id: Some(args.pid.unwrap_or(0).to_string()),
   };

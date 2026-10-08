@@ -131,7 +131,7 @@ fn rich_activity_roundtrips_every_field_through_cached_activity() {
       "mystery_field_xyz":"must-survive"}}}"#,
   );
   let fp = activity_fingerprint(&mut cmd);
-  let payload = cached_activity(&mut cmd, fp).expect("rich activity encodes");
+  let payload = cached_activity(cmd, fp).expect("rich activity encodes");
   let body: Value = serde_json::from_str(&payload.json).expect("valid json");
   let activity = &body["activity"];
   assert_eq!(activity["details"], "Battle Creek");
@@ -300,18 +300,18 @@ fn cached_payload_knows_whether_it_clears() {
   }))
   .unwrap();
   let fp = activity_fingerprint(&mut cmd);
-  let payload = cached_activity(&mut cmd, fp).expect("builds");
+  let payload = cached_activity(cmd, fp).expect("builds");
   assert!(!payload.is_clear);
 
   // Null-activity commands build clears.
-  let mut clear: ActivityCmd = serde_json::from_value(serde_json::json!({
+  let clear: ActivityCmd = serde_json::from_value(serde_json::json!({
     "cmd": "SET_ACTIVITY",
     "application_id": "app",
     "args": {"pid": 7, "activity": null},
     "nonce": "n",
   }))
   .unwrap();
-  let payload = cached_activity(&mut clear, None).expect("builds");
+  let payload = cached_activity(clear, None).expect("builds");
   assert!(payload.is_clear);
 }
 
@@ -359,9 +359,24 @@ fn cached_activity_carries_fingerprint_bytes() {
 
   let mut cmd = set_activity_cmd();
   let fp = activity_fingerprint(&mut cmd).expect("fingerprint");
-  let cached = cached_activity(&mut cmd, Some(fp.clone())).expect("payload");
+  let cached = cached_activity(cmd, Some(fp.clone())).expect("payload");
   assert_eq!(cached.activity_json.as_ref(), fp.as_slice());
   assert!(!cached.is_clear);
+}
+
+/// The outer `application_id` is stamped into the activity of the built
+/// payload, so the card a consumer replays carries the app that published
+/// it. Called without `activity_fingerprint` first: that function stamps it
+/// too, so skipping it here is what makes this a test of the by-value path
+/// in `cached_activity` itself (where the id is moved, not cloned).
+#[test]
+fn cached_activity_stamps_outer_application_id() {
+  let mut cmd = set_activity_cmd();
+  cmd.application_id = Some("424242".to_string());
+  let payload = cached_activity(cmd, None).expect("payload");
+
+  let body: Value = serde_json::from_str(&payload.json).expect("valid json");
+  assert_eq!(body["activity"]["application_id"], "424242");
 }
 
 /// Outer application ids feed the fingerprint (no cross-app aliasing).

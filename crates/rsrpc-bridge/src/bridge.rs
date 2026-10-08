@@ -941,7 +941,7 @@ mod tests {
       allowed_origins: Vec::new(),
     };
     for i in 0..(crate::config::MAX_CACHED_ACTIVITIES * 2) {
-      let mut cmd: ActivityCmd = serde_json::from_value(serde_json::json!({
+      let cmd: ActivityCmd = serde_json::from_value(serde_json::json!({
         "cmd": "SET_ACTIVITY",
         "application_id": format!("app-{i}"),
         "args": {"pid": i, "activity": {"name": "G", "type": 0}},
@@ -949,7 +949,7 @@ mod tests {
       }))
       .expect("test command builds");
       let payload =
-        rsrpc_protocol::commands::cached_activity(&mut cmd, None).expect("fixed shapes build");
+        rsrpc_protocol::commands::cached_activity(cmd, None).expect("fixed shapes build");
       shared.broadcast_activity(payload, SocketId::from(i.to_string()));
     }
     let len = shared.cache.lock().unwrap_or_else(|e| e.into_inner()).len();
