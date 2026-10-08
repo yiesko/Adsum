@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use serde_json::Value;
 
 use rsrpc_protocol::commands::{
@@ -219,42 +220,71 @@ fn set_activity_response_clear_carries_null_data() {
 fn dedup_drops_exact_duplicate_inside_window() {
   let mut recent = RecentActivities::new(Duration::from_secs(5), 8);
   let t0 = Instant::now();
+  let payload = Bytes::from_static(b"{}");
 
-  assert!(!recent.should_drop("app", 1, Some(b"{}"), t0));
-  assert!(recent.should_drop("app", 1, Some(b"{}"), t0 + Duration::from_secs(1)));
+  assert!(!recent.should_drop("app", 1, Some(&payload), t0));
+  assert!(recent.should_drop("app", 1, Some(&payload), t0 + Duration::from_secs(1)));
   // ...but the same bytes from another pid/app are a different slot.
-  assert!(!recent.should_drop("app", 2, Some(b"{}"), t0 + Duration::from_secs(1)));
-  assert!(!recent.should_drop("other", 1, Some(b"{}"), t0 + Duration::from_secs(1)));
+  assert!(!recent.should_drop("app", 2, Some(&payload), t0 + Duration::from_secs(1)));
+  assert!(!recent.should_drop("other", 1, Some(&payload), t0 + Duration::from_secs(1)));
 }
 
 #[test]
 fn dedup_passes_changes_clears_and_expiry() {
   let mut recent = RecentActivities::new(Duration::from_secs(5), 8);
   let t0 = Instant::now();
+  let a = Bytes::from_static(b"a");
+  let b = Bytes::from_static(b"b");
 
-  assert!(!recent.should_drop("app", 1, Some(b"a"), t0));
+  assert!(!recent.should_drop("app", 1, Some(&a), t0));
   // Any changed byte passes and becomes the new reference.
-  assert!(!recent.should_drop("app", 1, Some(b"b"), t0 + Duration::from_secs(1)));
-  assert!(recent.should_drop("app", 1, Some(b"b"), t0 + Duration::from_secs(2)));
+  assert!(!recent.should_drop("app", 1, Some(&b), t0 + Duration::from_secs(1)));
+  assert!(recent.should_drop("app", 1, Some(&b), t0 + Duration::from_secs(2)));
   // A clear always passes and re-arms the slot: the pre-clear payload
   // passes again right after it.
   assert!(!recent.should_drop("app", 1, None, t0 + Duration::from_secs(3)));
-  assert!(!recent.should_drop("app", 1, Some(b"b"), t0 + Duration::from_secs(3)));
+  assert!(!recent.should_drop("app", 1, Some(&b), t0 + Duration::from_secs(3)));
   // Past the window, even identical bytes pass.
-  assert!(!recent.should_drop("app", 1, Some(b"b"), t0 + Duration::from_secs(9)));
+  assert!(!recent.should_drop("app", 1, Some(&b), t0 + Duration::from_secs(9)));
 }
 
 #[test]
 fn dedup_table_stays_bounded() {
   let mut recent = RecentActivities::new(Duration::from_secs(5), 4);
   let t0 = Instant::now();
+  let payload = Bytes::from_static(b"x");
 
   for pid in 0..20u64 {
-    recent.should_drop("app", pid, Some(b"x"), t0);
+    recent.should_drop("app", pid, Some(&payload), t0);
   }
 
   assert!(recent.len() <= 4);
   assert!(!recent.is_empty());
+}
+
+/// The flood guard tracks a fingerprint without copying it: `should_drop`
+/// borrows the caller's `Bytes` and the table keeps its own strong
+/// reference to the same buffer, so recording a publish adds no
+/// allocation on top of the fingerprint itself. A table that re-copied
+/// the payload (a second `to_vec`) would fail here.
+#[test]
+fn dedup_records_the_buffer_it_was_given() {
+  use rsrpc_protocol::commands::activity_fingerprint;
+
+  let mut recent = RecentActivities::new(Duration::from_secs(5), 8);
+  let t0 = Instant::now();
+  let mut cmd = set_activity_cmd();
+  let fp = activity_fingerprint(&mut cmd).expect("fingerprint");
+  let fp_ptr = fp.as_ptr();
+
+  assert!(!recent.should_drop("123", 42, Some(&fp), t0));
+
+  let stored = recent.recorded("123", 42).expect("slot was recorded");
+  assert!(
+    std::ptr::eq(stored.as_ptr(), fp_ptr),
+    "the table must hold the caller's buffer, not a copy of it"
+  );
+  assert_eq!(stored, &fp);
 }
 
 /// Cloned payloads share one allocation (`Arc` + refcounted encodings).
@@ -360,7 +390,7 @@ fn cached_activity_carries_fingerprint_bytes() {
   let mut cmd = set_activity_cmd();
   let fp = activity_fingerprint(&mut cmd).expect("fingerprint");
   let cached = cached_activity(cmd, Some(fp.clone())).expect("payload");
-  assert_eq!(cached.activity_json.as_ref(), fp.as_slice());
+  assert_eq!(cached.activity_json, fp);
   assert!(!cached.is_clear);
 }
 

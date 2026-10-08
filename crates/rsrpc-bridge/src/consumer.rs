@@ -121,8 +121,9 @@ impl Shared {
   /// Flood guard: byte-identical republishes inside the window are
   /// dropped — before any broadcast, cache write or log line.
   /// Takes the precomputed fingerprint so dropped publishes never pay
-  /// for the envelope build.
-  pub(crate) fn flood_dropped(&self, cmd: &ActivityCmd, fingerprint: Option<&[u8]>) -> bool {
+  /// for the envelope build. Borrows it: the flood guard records a
+  /// strong reference to the same buffer rather than a copy.
+  pub(crate) fn flood_dropped(&self, cmd: &ActivityCmd, fingerprint: Option<&Bytes>) -> bool {
     let args = cmd.args.as_ref();
     let pid = args.and_then(|args| args.pid).unwrap_or_default();
     self

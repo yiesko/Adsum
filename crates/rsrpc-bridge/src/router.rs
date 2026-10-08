@@ -259,7 +259,7 @@ impl Shared {
       .as_ref()
       .and_then(|args| args.pid)
       .unwrap_or_default();
-    if self.flood_dropped(&cmd, fingerprint.as_deref()) {
+    if self.flood_dropped(&cmd, fingerprint.as_ref()) {
       let app_key = cmd.application_id.as_deref().unwrap_or("");
       tracing::debug!("[bridge] Dropping duplicate SET_ACTIVITY (app {app_key}, pid {pid})");
       return;

@@ -129,12 +129,12 @@ fn benchmark_flood_drop_pipeline(c: &mut Criterion) {
   let seeded_at = std::time::Instant::now();
   {
     let fp = activity_fingerprint(&mut cmd).expect("fingerprint");
-    assert!(!guard.should_drop("123", 42, Some(fp.as_slice()), seeded_at));
+    assert!(!guard.should_drop("123", 42, Some(&fp), seeded_at));
   }
   c.bench_function("publish_flood_drop", |b| {
     b.iter(|| {
       let fp = activity_fingerprint(black_box(&mut cmd)).expect("fingerprint");
-      black_box(guard.should_drop("123", 42, Some(fp.as_slice()), seeded_at))
+      black_box(guard.should_drop("123", 42, Some(&fp), seeded_at))
     })
   });
 }

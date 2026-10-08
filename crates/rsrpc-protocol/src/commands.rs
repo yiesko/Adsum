@@ -111,13 +111,17 @@ pub fn empty_cached(pid: u64, socket_id: SocketId) -> Option<Arc<CachedActivity>
 /// the outer id must not share a fingerprint.
 ///
 /// Returns `None` when there is no activity (a clear).
+///
+/// The bytes come back as [`Bytes`] so every later holder — the flood
+/// guard, the cached payload — keeps a strong reference to one buffer
+/// instead of re-copying the serialization.
 #[must_use]
-pub fn activity_fingerprint(cmd: &mut ActivityCmd) -> Option<Vec<u8>> {
+pub fn activity_fingerprint(cmd: &mut ActivityCmd) -> Option<Bytes> {
   cmd.fix();
   let application_id = cmd.application_id.clone();
   let activity = cmd.args.as_mut()?.activity.as_mut()?;
   activity.application_id = application_id;
-  serde_json::to_vec(activity).ok()
+  serde_json::to_vec(activity).ok().map(Bytes::from)
 }
 
 /// Turn a `SET_ACTIVITY` command into the bridge payload in both protocols.
@@ -127,6 +131,9 @@ pub fn activity_fingerprint(cmd: &mut ActivityCmd) -> Option<Vec<u8>> {
 /// envelope build); it is stored on the payload for byte-compare change
 /// detection. A missing fingerprint degrades to always-changed, never to
 /// a dropped broadcast.
+///
+/// Takes the fingerprint as [`Bytes`] and stores it as it is: no copy of
+/// the serialization is made on the way in.
 ///
 /// Consumes `cmd`: the activity moves into the payload instead of being
 /// cloned for it. Callers that still need the command afterwards (logs,
@@ -138,7 +145,7 @@ pub fn activity_fingerprint(cmd: &mut ActivityCmd) -> Option<Vec<u8>> {
 #[must_use]
 pub fn cached_activity(
   mut cmd: ActivityCmd,
-  fingerprint: Option<Vec<u8>>,
+  fingerprint: Option<Bytes>,
 ) -> Option<Arc<CachedActivity>> {
   cmd.fix();
 
@@ -166,7 +173,7 @@ pub fn cached_activity(
     // Reached only when `args.activity` is `Some`: the serialized body
     // carries a real activity object, never null.
     is_clear: false,
-    activity_json: fingerprint.map(Bytes::from).unwrap_or_default(),
+    activity_json: fingerprint.unwrap_or_default(),
     // Provenance is stamped by the bridge caller (generic vs SDK paths
     // know their source); the protocol layer leaves it empty.
     provenance: None,
@@ -460,7 +467,7 @@ pub fn set_activity_response(cmd: &mut ActivityCmd) -> Option<String> {
 pub struct RecentActivities {
   window: std::time::Duration,
   cap: usize,
-  entries: HashMap<(String, u64), (Vec<u8>, std::time::Instant)>,
+  entries: HashMap<(String, u64), (Bytes, std::time::Instant)>,
 }
 
 impl RecentActivities {
@@ -493,16 +500,30 @@ impl RecentActivities {
     self.entries.is_empty()
   }
 
+  /// The payload recorded for `(app_id, pid)`, if any (tests and
+  /// diagnostics). Shares its buffer with the caller that tracked it.
+  #[must_use]
+  pub fn recorded(&self, app_id: &str, pid: u64) -> Option<&Bytes> {
+    self
+      .entries
+      .get(&(app_id.to_string(), pid))
+      .map(|(fp, _)| fp)
+  }
+
   /// `true` when this exact payload was already seen from `(app_id, pid)`
   /// inside the window — the caller should drop it without broadcasting.
   /// Records the payload otherwise. A `None` payload (a clear) always
   /// returns `false` and forgets the slot, so the next publish — even
   /// byte-identical to a pre-clear one — is forwarded.
+  ///
+  /// Borrows the fingerprint: the flood path passes the one it already
+  /// holds, and recording keeps a strong reference to the same buffer
+  /// instead of a second copy.
   pub fn should_drop(
     &mut self,
     app_id: &str,
     pid: u64,
-    payload: Option<&[u8]>,
+    payload: Option<&Bytes>,
     now: std::time::Instant,
   ) -> bool {
     // One allocation per call: build the key once, borrow it for probes,
@@ -514,7 +535,7 @@ impl RecentActivities {
       return false;
     };
     if let Some((last, at)) = self.entries.get(&key)
-      && last.as_slice() == bytes
+      && *last == *bytes
       && now.duration_since(*at) < self.window
     {
       return true;
@@ -532,7 +553,7 @@ impl RecentActivities {
         self.entries.remove(&victim);
       }
     }
-    self.entries.insert(key, (bytes.to_vec(), now));
+    self.entries.insert(key, (bytes.clone(), now));
     false
   }
 }
