@@ -201,7 +201,7 @@ pub(crate) enum Forward {
 /// caller records the slim [`PublishedSlot`] itself, so no second deep
 /// clone happens here.
 pub(crate) async fn handle_set_activity(
-  event: &ActivityCmd,
+  mut event: ActivityCmd,
   query_client_id: Option<&str>,
   responder: &Responder,
   sink: &Sink,
@@ -210,7 +210,6 @@ pub(crate) async fn handle_set_activity(
 ) -> (bool, bool) {
   // Fall back to the client_id provided on connect (query param) when the
   // command itself does not carry an application_id.
-  let mut event = event.clone();
   if event.application_id.is_none() {
     event.application_id = query_client_id.map(str::to_string);
   }
@@ -218,13 +217,17 @@ pub(crate) async fn handle_set_activity(
   // Apply field fixes so the confirmation reply carries labels/urls (fix is
   // idempotent, so a downstream fix pass is harmless).
   event.fix();
+  // Materialize the reply *before* the command moves into the sink: the
+  // ACK is the only part of the command still needed afterwards, and the
+  // command was just parsed so nothing downstream ever saw a shorter life.
+  let response = commands::set_activity_response(&event);
   let delivered = match forward {
-    Forward::Direct => sink.emit(event.clone()).await,
+    Forward::Direct => sink.emit(event).await,
     // Staged publishes stay tracked: the disconnect path flushes them
     // before its own clears, so a never-delivered publish degrades to a
     // harmless clear of an unshown card (ignored downstream).
     Forward::Staged => {
-      sink.stage_clear(pending_clears, event.clone());
+      sink.stage_clear(pending_clears, event);
       sink.flush_pending(pending_clears);
       true
     }
@@ -234,7 +237,7 @@ pub(crate) async fn handle_set_activity(
   // Confirm to the game client; some RPC libraries wait for this before
   // considering the presence set. No confirm to send means the client is
   // still considered alive.
-  let alive = match commands::set_activity_response(&event) {
+  let alive = match response {
     Some(response) => reply(responder, Message::Text(response.into())).await,
     None => true,
   };

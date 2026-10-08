@@ -209,6 +209,42 @@ async fn snapshots_under_flood_never_stall() {
 }
 
 #[tokio::test]
+/// `SET_ACTIVITY` with the feature disabled is silently ignored: no
+/// lock-step reply and nothing forwarded to the sink. It must not degrade
+/// into an "unknown command" reply.
+async fn disabled_set_activity_stays_silent() {
+  let (transport, mut rx) =
+    WsTransport::bind(WsTransportConfig::new(0, 0).set_activity(false), user())
+      .await
+      .unwrap();
+  let port = transport.bound_port();
+
+  let mut ws = connect(port, "?v=1&encoding=json&client_id=test-app").await;
+  let _ready = read_text(&mut ws).await;
+
+  ws.send(tungstenite::Message::Text(SET_ACTIVITY.into()))
+    .await
+    .unwrap();
+
+  // No reply of any kind — not even an unknown-command error.
+  assert!(
+    tokio::time::timeout(Duration::from_millis(300), read_text(&mut ws))
+      .await
+      .is_err(),
+    "disabled SET_ACTIVITY must not earn a reply"
+  );
+  // ... and nothing reaches the sink.
+  assert!(
+    tokio::time::timeout(Duration::from_millis(300), rx.recv())
+      .await
+      .is_err(),
+    "disabled SET_ACTIVITY must not reach the sink"
+  );
+
+  transport.shutdown().await;
+}
+
+#[tokio::test]
 /// Dead sinks shed counted while the pump keeps answering clients.
 async fn closed_sink_counts_drops_and_stays_alive() {
   let (transport, rx) = WsTransport::bind(config(), user()).await.unwrap();

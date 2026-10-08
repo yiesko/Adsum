@@ -798,119 +798,128 @@ async fn on_message(
 
   // Every arm reports liveness: `false` means the game client died without
   // a clean `Disconnect` and its slot must be released now.
-  let alive = match event.cmd.as_str() {
-    "INVITE_BROWSER" | "GUILD_TEMPLATE_BROWSER" | "GIFT_CODE_BROWSER" => {
-      if !secondary_events {
-        return;
+  //
+  // Two passes, because `SET_ACTIVITY` now consumes the command by value
+  // (it owns data the sink needs) while every other arm only borrows it.
+  // Matching directly on `event.cmd.as_str()` would hold a borrow of
+  // `event` for the whole match and forbid the move, so the value-moving
+  // arm is selected first and the rest keeps its borrow path.
+  let consumes_event = event.cmd == "SET_ACTIVITY" && set_activity;
+  let alive = if consumes_event {
+    // Genuine clears are not publications: they never consume history,
+    // always forward (the bridge may hold the card), and free the slot
+    // once delivered so new pids fit again. Applies the same
+    // connect-query client_id fallback the forwarded command carries.
+    let app_id = event
+      .application_id
+      .clone()
+      .or_else(|| slot.query_client_id.clone());
+    let pid = event.args.as_ref().and_then(|a| a.pid).unwrap_or_default();
+    let is_clear = event
+      .args
+      .as_ref()
+      .and_then(|args| args.activity.as_ref())
+      .is_none();
+    // Record first (one short write, no await inside): every forwarded
+    // publication is tracked, so disconnect cleanup stays complete. The
+    // pump is the only map mutator, so admission cannot change before
+    // forwarding below.
+    let admission = if is_clear {
+      None
+    } else if let Some(entry) = clients.write().await.get_mut(&id) {
+      Some(entry.note_published(app_id, pid, event.nonce.clone()))
+    } else {
+      // Slot pruned mid-flight: forward nothing rather than ghost.
+      None
+    };
+    // Refusals still earn their lock-step reply (clients hang without
+    // one) but never reach the sink — recording the publication
+    // regardless also keeps the reply-fails prune below clearing the
+    // pid instead of ghosting it. Publications behind a still-full
+    // staged queue wait their turn instead of overtaking older clears.
+    let backlog = !pending_clears
+      .lock()
+      .unwrap_or_else(|e| e.into_inner())
+      .is_empty();
+    // A still-full staged queue serializes everything behind it —
+    // including genuine clears, so a clear for a staged pid lands after
+    // its publish instead of jumping ahead (same-pid inversion would
+    // show-then-clear out of order downstream).
+    let forward = if is_clear && !backlog {
+      handlers::Forward::Direct
+    } else if is_clear {
+      handlers::Forward::Staged
+    } else {
+      match admission {
+        Some(Admission::Admitted { .. }) if backlog => handlers::Forward::Staged,
+        Some(Admission::Admitted { .. }) => handlers::Forward::Direct,
+        _ => handlers::Forward::Refused,
       }
-      handlers::handle_browser_command(&event, &slot.responder, sink).await
-    }
-    "DEEP_LINK" => {
-      if !secondary_events {
-        return;
+    };
+    let (alive, delivered) = handlers::handle_set_activity(
+      event,
+      slot.query_client_id.as_deref(),
+      &slot.responder,
+      sink,
+      pending_clears,
+      forward,
+    )
+    .await;
+    if delivered {
+      // Landed: genuine clears free their slot for new pids.
+      if is_clear && let Some(entry) = clients.write().await.get_mut(&id) {
+        entry.forget_published(pid);
       }
-      handlers::handle_deep_link(&event, &slot.responder).await
-    }
-    "CONNECTIONS_CALLBACK" => {
-      if !secondary_events {
-        return;
-      }
-      handlers::handle_connections_callback(&event, &slot.responder).await
-    }
-    "SUBSCRIBE" | "UNSUBSCRIBE" => handlers::handle_subscribe(&event, &slot.responder).await,
-    "GET_USER" => {
-      let snapshot = user.lock().unwrap_or_else(|e| e.into_inner()).clone();
-      handlers::handle_get_user(&event, &snapshot, &slot.responder).await
-    }
-    "SET_ACTIVITY" => {
-      if !set_activity {
-        return;
-      }
-      // Genuine clears are not publications: they never consume history,
-      // always forward (the bridge may hold the card), and free the slot
-      // once delivered so new pids fit again. Applies the same
-      // connect-query client_id fallback the forwarded command carries.
-      let app_id = event
-        .application_id
-        .clone()
-        .or_else(|| slot.query_client_id.clone());
-      let pid = event.args.as_ref().and_then(|a| a.pid).unwrap_or_default();
-      let is_clear = event
-        .args
-        .as_ref()
-        .and_then(|args| args.activity.as_ref())
-        .is_none();
-      // Record first (one short write, no await inside): every forwarded
-      // publication is tracked, so disconnect cleanup stays complete. The
-      // pump is the only map mutator, so admission cannot change before
-      // forwarding below.
-      let admission = if is_clear {
-        None
-      } else if let Some(entry) = clients.write().await.get_mut(&id) {
-        Some(entry.note_published(app_id, pid, event.nonce.clone()))
-      } else {
-        // Slot pruned mid-flight: forward nothing rather than ghost.
-        None
-      };
-      // Refusals still earn their lock-step reply (clients hang without
-      // one) but never reach the sink — recording the publication
-      // regardless also keeps the reply-fails prune below clearing the
-      // pid instead of ghosting it. Publications behind a still-full
-      // staged queue wait their turn instead of overtaking older clears.
-      let backlog = !pending_clears
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .is_empty();
-      // A still-full staged queue serializes everything behind it —
-      // including genuine clears, so a clear for a staged pid lands after
-      // its publish instead of jumping ahead (same-pid inversion would
-      // show-then-clear out of order downstream).
-      let forward = if is_clear && !backlog {
-        handlers::Forward::Direct
-      } else if is_clear {
-        handlers::Forward::Staged
-      } else {
-        match admission {
-          Some(Admission::Admitted { .. }) if backlog => handlers::Forward::Staged,
-          Some(Admission::Admitted { .. }) => handlers::Forward::Direct,
-          _ => handlers::Forward::Refused,
-        }
-      };
-      let (alive, delivered) = handlers::handle_set_activity(
-        &event,
-        slot.query_client_id.as_deref(),
-        &slot.responder,
-        sink,
-        pending_clears,
-        forward,
-      )
-      .await;
-      if delivered {
-        // Landed: genuine clears free their slot for new pids.
-        if is_clear && let Some(entry) = clients.write().await.get_mut(&id) {
-          entry.forget_published(pid);
-        }
-      } else {
-        match admission {
-          // Shed publish: roll back (a refresh restores its prior slot so
-          // shown cards stay tracked; first-time publishes leave nothing).
-          Some(Admission::Admitted { displaced }) => {
-            if let Some(entry) = clients.write().await.get_mut(&id) {
-              entry.rollback_publish(pid, displaced);
-            }
+    } else {
+      match admission {
+        // Shed publish: roll back (a refresh restores its prior slot so
+        // shown cards stay tracked; first-time publishes leave nothing).
+        Some(Admission::Admitted { displaced }) => {
+          if let Some(entry) = clients.write().await.get_mut(&id) {
+            entry.rollback_publish(pid, displaced);
           }
-          Some(Admission::RefusedFull) => {
-            tracing::debug!(
-              "[transport-ws] Client {id} past {MAX} tracked pids, refusing pid {pid}",
-              MAX = handlers::MAX_TRACKED_PIDS,
-            );
-          }
-          None => {}
         }
+        Some(Admission::RefusedFull) => {
+          tracing::debug!(
+            "[transport-ws] Client {id} past {MAX} tracked pids, refusing pid {pid}",
+            MAX = handlers::MAX_TRACKED_PIDS,
+          );
+        }
+        None => {}
       }
-      alive
     }
-    other => handlers::handle_unknown(other, &event, &slot.responder).await,
+    alive
+  } else {
+    // `SET_ACTIVITY` with the feature off stays silent, exactly as before.
+    if event.cmd == "SET_ACTIVITY" {
+      return;
+    }
+    match event.cmd.as_str() {
+      "INVITE_BROWSER" | "GUILD_TEMPLATE_BROWSER" | "GIFT_CODE_BROWSER" => {
+        if !secondary_events {
+          return;
+        }
+        handlers::handle_browser_command(&event, &slot.responder, sink).await
+      }
+      "DEEP_LINK" => {
+        if !secondary_events {
+          return;
+        }
+        handlers::handle_deep_link(&event, &slot.responder).await
+      }
+      "CONNECTIONS_CALLBACK" => {
+        if !secondary_events {
+          return;
+        }
+        handlers::handle_connections_callback(&event, &slot.responder).await
+      }
+      "SUBSCRIBE" | "UNSUBSCRIBE" => handlers::handle_subscribe(&event, &slot.responder).await,
+      "GET_USER" => {
+        let snapshot = user.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        handlers::handle_get_user(&event, &snapshot, &slot.responder).await
+      }
+      other => handlers::handle_unknown(other, &event, &slot.responder).await,
+    }
   };
   if !alive {
     tracing::info!("[transport-ws] Client {id} send failed, pruning");
