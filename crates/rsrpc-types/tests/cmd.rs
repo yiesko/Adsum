@@ -41,3 +41,118 @@ fn hostile_timestamps_saturate_instead_of_overflowing() {
     "must saturate at the floor, got {rendered}"
   );
 }
+
+/// `fix_buttons` must preserve an existing `Metadata`: the old code rebuilt
+/// the whole struct from a clone of itself to change one field, so any
+/// future edit that drops the in-place merge silently loses metadata.
+#[test]
+fn fix_buttons_preserves_existing_metadata() {
+  let mut cmd: ActivityCmd = serde_json::from_value(serde_json::json!({
+    "cmd": "SET_ACTIVITY",
+    "args": { "pid": 1, "activity": {
+      "name": "G",
+      "type": 0,
+      "buttons": [{"label": "Play", "url": "https://example.com/play"}],
+      "metadata": {
+        "artist_ids": ["a1", "a2"],
+        "album_id": "alb",
+        "context_uri": "spotify:album:alb"
+      }
+    }},
+    "nonce": "n"
+  }))
+  .expect("fixture parses");
+
+  cmd.fix_buttons();
+
+  let activity = cmd
+    .args
+    .as_ref()
+    .and_then(|a| a.activity.as_ref())
+    .expect("activity");
+  let metadata = activity.metadata.as_ref().expect("metadata");
+  // The derived field...
+  assert_eq!(
+    metadata.button_urls.as_deref(),
+    Some(&["https://example.com/play".to_string()][..])
+  );
+  // ...and every pre-existing field, untouched.
+  assert_eq!(
+    metadata.artist_ids.as_deref(),
+    Some(&["a1".to_string(), "a2".to_string()][..])
+  );
+  assert_eq!(metadata.album_id.as_deref(), Some("alb"));
+  assert_eq!(metadata.context_uri.as_deref(), Some("spotify:album:alb"));
+}
+
+/// A button list with no urls must leave `metadata` exactly as it was
+/// (absent stays absent): attaching an empty metadata object would change
+/// what strict clients see.
+#[test]
+fn fix_buttons_without_urls_leaves_metadata_absent() {
+  let mut cmd: ActivityCmd = serde_json::from_value(serde_json::json!({
+    "cmd": "SET_ACTIVITY",
+    "args": { "pid": 1, "activity": {"name": "G", "type": 0, "buttons": ["Just a label"]}},
+    "nonce": "n"
+  }))
+  .expect("fixture parses");
+
+  cmd.fix_buttons();
+
+  let activity = cmd
+    .args
+    .as_ref()
+    .and_then(|a| a.activity.as_ref())
+    .expect("activity");
+  assert!(
+    activity.metadata.is_none(),
+    "no urls means no metadata object"
+  );
+  assert_eq!(
+    activity.buttons.as_ref().map(|b| b.len()),
+    Some(1),
+    "the label survives"
+  );
+}
+
+/// Object buttons and plain-string buttons can coexist, and a non-string
+/// `url` is skipped rather than fatal.
+#[test]
+fn fix_buttons_mixes_shapes_and_ignores_non_string_urls() {
+  let mut cmd: ActivityCmd = serde_json::from_value(serde_json::json!({
+    "cmd": "SET_ACTIVITY",
+    "args": { "pid": 1, "activity": {
+      "name": "G", "type": 0,
+      "buttons": [
+        "Plain",
+        {"label": "Obj", "url": "https://ok.test"},
+        {"label": "NoUrl"},
+        {"label": "BadUrl", "url": 7}
+      ]
+    }},
+    "nonce": "n"
+  }))
+  .expect("fixture parses");
+
+  cmd.fix_buttons();
+
+  let activity = cmd
+    .args
+    .as_ref()
+    .and_then(|a| a.activity.as_ref())
+    .expect("activity");
+  let labels = activity.buttons.as_ref().expect("buttons");
+  assert_eq!(labels.len(), 4, "every label kept: {labels:?}");
+  assert_eq!(labels[0], serde_json::json!("Plain"));
+  assert_eq!(labels[1], serde_json::json!("Obj"));
+  assert_eq!(labels[2], serde_json::json!("NoUrl"));
+  assert_eq!(labels[3], serde_json::json!("BadUrl"));
+  assert_eq!(
+    activity
+      .metadata
+      .as_ref()
+      .and_then(|m| m.button_urls.as_deref()),
+    Some(&["https://ok.test".to_string()][..]),
+    "only the string url is kept"
+  );
+}
