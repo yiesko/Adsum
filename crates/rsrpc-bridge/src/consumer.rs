@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use rsrpc_protocol::commands::CachedActivity;
-use rsrpc_protocol::query::query_params;
+use rsrpc_protocol::query::query_param;
 use rsrpc_types::cmd::ActivityCmd;
 use rsrpc_ws::{ClientId, Message, Responder, TextBytes};
 use rustc_hash::FxHashMap;
@@ -31,7 +31,7 @@ impl BridgeProtocol {
   /// The protocol requested by the consumer's `format=` query parameter,
   /// falling back to the per-port default when absent.
   pub(crate) fn from_query(uri: &str, default: BridgeProtocol) -> BridgeProtocol {
-    match query_params(uri).get("format").map(String::as_str) {
+    match query_param(uri, "format") {
       Some("msgpack") | Some("messagepack") => BridgeProtocol::MsgPack,
       Some("json") => BridgeProtocol::Json,
       _ => default,

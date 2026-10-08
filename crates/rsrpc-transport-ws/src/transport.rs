@@ -17,7 +17,7 @@ use std::{
 };
 
 use rsrpc_protocol::error::{Result, RsrpcError};
-use rsrpc_protocol::query::query_params;
+use rsrpc_protocol::query::query_param;
 use rsrpc_types::cmd::{ActivityCmd, ActivityCmdArgs};
 use rsrpc_types::user::RpcUser;
 use rsrpc_ws::{ClientId, CloseCode, Event, EventHub, Message, Responder};
@@ -737,10 +737,13 @@ async fn on_connect(
   user: &Arc<Mutex<RpcUser>>,
 ) {
   // Parse + validate before any reply or insert.
-  let query = query_params(responder.details().uri.as_ref());
-  let version = query.get("v").map(String::as_str).unwrap_or("0");
-  let encoding = query.get("encoding").map(String::as_str).unwrap_or("json");
-  let query_client_id = query.get("client_id").cloned();
+  let uri = responder.details().uri.as_ref();
+  let version = query_param(uri, "v").unwrap_or("0");
+  let encoding = query_param(uri, "encoding").unwrap_or("json");
+  // The connection's fallback id outlives this function, so it is the one
+  // value that must be owned — a single allocation instead of a parsed
+  // `HashMap` holding a `String` per query key.
+  let query_client_id = query_param(uri, "client_id").map(str::to_string);
   if version != "1" || encoding != "json" {
     tracing::warn!("[transport-ws] Rejecting client {id} (v={version}, encoding={encoding})");
     responder.close(CloseCode::Normal).await;
@@ -1315,8 +1318,8 @@ mod tests {
   fn query_params_match_legacy_semantics() {
     // Canonical parser lives in rsrpc-protocol (tested there); this pins
     // the import still resolves to the same behavior here.
-    let params = query_params("/?v=1&client_id=abc");
-    assert_eq!(params.get("v").map(String::as_str), Some("1"));
-    assert_eq!(params.get("client_id").map(String::as_str), Some("abc"));
+    let uri = "/?v=1&client_id=abc";
+    assert_eq!(query_param(uri, "v"), Some("1"));
+    assert_eq!(query_param(uri, "client_id"), Some("abc"));
   }
 }
