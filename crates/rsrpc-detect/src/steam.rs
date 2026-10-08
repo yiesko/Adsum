@@ -23,12 +23,31 @@ impl ProcessServer {
   /// Canonicalization (lowercase, `/` separators) happens inside
   /// [`SteamLibraries::match_prefix`]; callers pass native paths.
   /// Cloned out of the lock; tiny strings.
+  ///
+  /// Allocates for the canonical form: prefer
+  /// [`steam_prefix_app_id_into`](Self::steam_prefix_app_id_into) on the
+  /// scan loop, which passes a reusable buffer.
   pub fn steam_prefix_app_id(&self, normalized_path: &str) -> Option<String> {
     self
       .steam_libraries
       .read()
       .unwrap_or_else(|e| e.into_inner())
       .match_prefix(normalized_path)
+      .map(str::to_string)
+  }
+
+  /// Same, canonicalizing into a caller-owned buffer: the scan loop passes
+  /// a scratch it reuses across processes, so a miss costs no allocation.
+  pub fn steam_prefix_app_id_into(
+    &self,
+    normalized_path: &str,
+    scratch: &mut String,
+  ) -> Option<String> {
+    self
+      .steam_libraries
+      .read()
+      .unwrap_or_else(|e| e.into_inner())
+      .match_prefix_into(normalized_path, scratch)
       .map(str::to_string)
   }
 

@@ -277,6 +277,10 @@ const FORBIDDEN_NAME_CHARS: [char; 9] = ['<', '>', ':', '"', '/', '\\', '|', '?'
 pub struct MatchScratch {
   pub lowered: String,
   pub norm_out: String,
+  /// Canonical Steam path for the prefix check (lowercase, `/`
+  /// separators, leading `/`): reused across processes so a miss costs
+  /// no allocation. Only touched on the Steam-library tail.
+  pub steam_path: String,
 }
 
 /// Refill `out` with the normalized form of `name`, reusing both
@@ -851,7 +855,8 @@ impl ProcessServer {
         // Steam's own word: the process runs under a known install dir,
         // so it inherits that entry's AppId. Beats name guessing below,
         // loses to a DB-declared path above.
-        if let Some(library_appid) = self.steam_prefix_app_id(lowered)
+        if let Some(library_appid) =
+          self.steam_prefix_app_id_into(lowered, &mut match_scratch.steam_path)
           && let Some(hit) = match_steam_id(
             Some(&library_appid),
             process.pid,

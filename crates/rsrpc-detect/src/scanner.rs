@@ -14,6 +14,26 @@ use super::scan::read_exec_into;
 use super::server::ProcessServer;
 use super::types::{Exec, ProcessScanState, ScannedHit};
 
+/// Parse a `/proc` entry name into its pid: ASCII digits only, so a
+/// non-UTF-8 or non-numeric name never panics and never allocates.
+///
+/// `OsStr::as_encoded_bytes` (stable since 1.74) hands back the bytes
+/// directly; the previous `to_string_lossy().parse()` allocated a `String`
+/// and `entry.path().file_name()` allocated a `PathBuf`, both per entry.
+fn parse_proc_pid(name: &[u8]) -> Option<u64> {
+  if name.is_empty() {
+    return None;
+  }
+  let mut pid: u64 = 0;
+  for &byte in name {
+    if !byte.is_ascii_digit() {
+      return None;
+    }
+    pid = pid.checked_mul(10)?.checked_add(u64::from(byte - b'0'))?;
+  }
+  Some(pid)
+}
+
 impl ProcessServer {
   /// Whether a tracked game's EXIT should wake the scan loop early.
   /// Untracked exits never wake (one HashSet lookup, consumed either
@@ -98,11 +118,13 @@ impl ProcessServer {
   ) -> rsrpc_protocol::error::Result<usize> {
     use std::fs;
 
+    // `/proc/<pid>` names are ASCII digits. Reading them as raw bytes
+    // avoids two allocations per entry (`to_string_lossy`'s String and
+    // `entry.path()`'s PathBuf) on a path that runs ~1k times per tick.
+    // Anything non-numeric is skipped, never fatal.
     let proc_list = fs::read_dir("/proc")?.filter(|e| {
       if let Ok(entry) = e {
-        // Only if we can parse this as a number (lossy: /proc names are
-        // always ASCII pids; anything else is skipped, never fatal).
-        return entry.file_name().to_string_lossy().parse::<u64>().is_ok();
+        return parse_proc_pid(entry.file_name().as_encoded_bytes()).is_some();
       }
 
       false
@@ -126,14 +148,7 @@ impl ProcessServer {
       let Ok(entry) = entry else {
         continue;
       };
-      let path = entry.path();
-
-      let Ok(pid) = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default()
-        .parse::<u64>()
-      else {
+      let Some(pid) = parse_proc_pid(entry.file_name().as_encoded_bytes()) else {
         continue;
       };
       // Same single-pid reader as the EXEC fast path, refilling a reused
@@ -252,5 +267,42 @@ impl ProcessServer {
     tracing::debug!("[Process Scanner] Process scan complete");
 
     Ok(detected_list)
+  }
+}
+
+#[cfg(test)]
+mod proc_pid_tests {
+  use super::*;
+
+  /// Digits parse, including a long pid, without allocating a String or
+  /// a PathBuf per entry.
+  #[test]
+  fn proc_pid_parses_digits() {
+    assert_eq!(parse_proc_pid(b"1"), Some(1));
+    assert_eq!(parse_proc_pid(b"12345"), Some(12_345));
+    assert_eq!(parse_proc_pid(b"4294967294"), Some(u32::MAX as u64 - 1));
+    assert_eq!(parse_proc_pid(b""), None);
+  }
+
+  /// Non-numeric names are skipped, not fatal: `/proc` also holds
+  /// non-pid entries and this must never panic.
+  #[test]
+  fn proc_pid_rejects_non_numeric() {
+    assert_eq!(parse_proc_pid(b"self"), None);
+    assert_eq!(parse_proc_pid(b"cpuinfo"), None);
+    assert_eq!(parse_proc_pid(b"12a"), None);
+    assert_eq!(parse_proc_pid(b"a12"), None);
+    assert_eq!(parse_proc_pid(b"-1"), None);
+    assert_eq!(parse_proc_pid(b" 12"), None);
+    // Non-UTF-8 bytes are just non-digits.
+    assert_eq!(parse_proc_pid(&[0xff, 0xfe]), None);
+  }
+
+  /// An overflowing pid is rejected rather than wrapped: a wrapped value
+  /// would silently point at another process.
+  #[test]
+  fn proc_pid_rejects_overflow() {
+    assert_eq!(parse_proc_pid(b"18446744073709551616"), None);
+    assert_eq!(parse_proc_pid(b"99999999999999999999999"), None);
   }
 }
