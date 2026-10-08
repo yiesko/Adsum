@@ -177,14 +177,14 @@ impl Shared {
   /// publishes, real changes and effective clears still log once.
   /// Byte compare: both sides come from the same serializer and the
   /// stored bytes travel with the build — no re-serialize, no re-parse.
-  pub(crate) fn activity_changed(&self, pid: u64, fingerprint: Option<&[u8]>) -> bool {
+  pub(crate) fn activity_changed(&self, socket_id: &SocketId, fingerprint: Option<&[u8]>) -> bool {
     // Clone the two small shape facts we need (flag + bytes) and let the
     // guard drop at the semicolon: nothing below holds the map lock.
     let cached = self
       .cache
       .lock()
       .unwrap_or_else(|e| e.into_inner())
-      .get(&SocketId::from(pid.to_string()))
+      .get(socket_id)
       .map(|(entry, _)| (entry.is_clear, entry.activity_json.clone()));
     match (cached, fingerprint) {
       (None, None) => false,
@@ -208,12 +208,13 @@ impl Shared {
       .as_ref()
       .and_then(|args| args.pid)
       .unwrap_or_default();
+    // Borrowed once and shared by both arms: the handoff takes `&str`, and
+    // the log arm only formats it, so no owned copy is needed anywhere here.
+    let app = cmd.application_id.as_deref();
     let resume: Vec<ScannedGame> = {
       let mut handoff = self.handoff.lock().unwrap_or_else(|e| e.into_inner());
-      match cmd.application_id.clone() {
-        Some(app) if handoff.note_clear(&app, pid) => {
-          handoff.resume_for(app.as_ref()).into_iter().collect()
-        }
+      match app {
+        Some(app) if handoff.note_clear(app, pid) => handoff.resume_for(app).into_iter().collect(),
         Some(_) => Vec::new(),
         // No app id: abrupt close (socket died without CLEAR).
         // Release every slot this pid owned, or their generics stay
@@ -231,7 +232,7 @@ impl Shared {
       resumed += 1;
     }
     if changed {
-      match cmd.application_id.clone() {
+      match app {
         Some(app) => tracing::info!(
           "[bridge] Source cleared for {app} (pid {pid}), resuming {resumed} slot(s)"
         ),
@@ -273,7 +274,11 @@ impl Shared {
     // without borrowing `cmd` past the move below.
     let app_key = cmd.application_id.as_deref().unwrap_or("");
     let activity = cmd.args.as_ref().and_then(|args| args.activity.as_ref());
-    let changed = self.activity_changed(pid, fingerprint.as_deref());
+    // One socket id per publish, shared by the change check below and the
+    // fan-out: the decimal used to be rendered twice, each time through a
+    // heap-allocated `String`.
+    let socket_id = SocketId::from(pid);
+    let changed = self.activity_changed(&socket_id, fingerprint.as_deref());
     // Freshly built (sole owner): SDK provenance is stamped on the payload
     // below, so snapshots tell client cards apart from detected generics.
     self.note_sdk_publish(&cmd);
@@ -329,7 +334,7 @@ impl Shared {
           latency_ms: None,
         });
       }
-      self.broadcast_activity(payload, SocketId::from(pid.to_string()));
+      self.broadcast_activity(payload, socket_id);
     } else {
       // Identical republishes change nothing observable: the replay cache
       // already holds these exact bytes (late joiners replay them) and the

@@ -118,6 +118,31 @@ impl From<AppId> for SocketId {
   }
 }
 
+/// A numeric pid renders straight into the refcounted string, with no
+/// heap-allocated `String` in between (pids are the socket on the SDK
+/// path, and the decimal used to be built twice per publish).
+impl From<u64> for SocketId {
+  /// Format the pid as decimal without a temporary `String`.
+  fn from(pid: u64) -> Self {
+    // Widest decimal a u64 renders to: u64::MAX has 20 digits.
+    const DECIMAL_CAP: usize = 20;
+    let mut buf = [0u8; DECIMAL_CAP];
+    let mut cursor = buf.len();
+    let mut rest = pid;
+    loop {
+      cursor -= 1;
+      buf[cursor] = b'0' + (rest % 10) as u8;
+      rest /= 10;
+      if rest == 0 {
+        break;
+      }
+    }
+    // Only ASCII digits ever reach the buffer, so this cannot fail.
+    let digits = std::str::from_utf8(&buf[cursor..]).expect("ascii digits");
+    Self(Arc::from(digits))
+  }
+}
+
 /// Borrow an app id as its socket without touching the inner string.
 impl From<&AppId> for SocketId {
   /// Share the allocation (refcount bump, no string copy).
@@ -172,6 +197,21 @@ mod tests {
       sock.as_ref().as_ptr(),
       sock_cloned.as_ref().as_ptr()
     ));
+  }
+
+  /// A pid renders into the same decimal the old `pid.to_string()` path
+  /// produced, or every cached socket key would silently change identity.
+  #[test]
+  fn socket_id_from_u64_matches_the_decimal_string() {
+    for pid in [0u64, 1, 7, 42, 999, 65_535, 4_294_967_295, u64::MAX] {
+      let from_pid = SocketId::from(pid);
+      assert_eq!(
+        from_pid.as_ref(),
+        pid.to_string(),
+        "pid {pid} must render identically"
+      );
+      assert_eq!(from_pid, SocketId::from(pid.to_string().as_str()));
+    }
   }
 
   /// `Borrow<str>` lets maps answer `&str` lookups with no owned key.
