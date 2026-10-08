@@ -206,22 +206,25 @@ pub fn app_id_from_args(arguments: Option<&str>) -> Option<&str> {
 /// are not being played, so matches on them are discarded and the scan
 /// treats them as absent (clears). Checked lazily, only for matched
 /// processes: one tiny `stat` read per hit, never per scan.
+///
+/// `stat` is the caller's reuse buffer (see [`MatchScratch::stat`]):
+/// cleared and refilled here, so a hit costs no allocation of its own.
 #[cfg(target_os = "linux")]
-pub fn is_suspended(pid: u64) -> bool {
+pub fn is_suspended(pid: u64, stat: &mut String) -> bool {
   // Capped like every other `/proc` read (`stat` is tiny, but the cap
   // documents the rule has no exceptions).
   use std::io::Read;
-  let mut stat = String::new();
+  stat.clear();
   std::fs::File::open(format!("/proc/{pid}/stat"))
-    .and_then(|file| file.take(8 * 1024).read_to_string(&mut stat).map(|_| stat))
+    .and_then(|file| file.take(8 * 1024).read_to_string(stat).map(|_| ()))
     .ok()
-    .and_then(|stat| parse_stat_state(&stat))
+    .and_then(|()| parse_stat_state(stat))
     .is_some_and(|state| state == 'T' || state == 't')
 }
 
 /// Stubbed on non-Linux (Steam matching there is already limited).
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn is_suspended(_pid: u64) -> bool {
+pub(crate) fn is_suspended(_pid: u64, _stat: &mut String) -> bool {
   false
 }
 
@@ -281,6 +284,11 @@ pub struct MatchScratch {
   /// separators, leading `/`): reused across processes so a miss costs
   /// no allocation. Only touched on the Steam-library tail.
   pub steam_path: String,
+  /// `/proc/<pid>/stat` body for the suspended check: tiny, but read for
+  /// every aux hit (0-3 per tick), so it pays to reuse the buffer rather
+  /// than build a fresh `String` (plus the path) per hit. Cleared before
+  /// every read so a failed one can never leave a stale line to parse.
+  pub stat: String,
 }
 
 /// Refill `out` with the normalized form of `name`, reusing both
@@ -359,8 +367,15 @@ pub fn exe_stem(normalized_path: &str) -> &str {
 /// choke point for every aux hit (appid/stem/folder), mirroring the scan
 /// loop's post-match check for AC hits. Stamps the observation onto the
 /// shared slim entry (no clone).
-fn live_or_none(obj: &Arc<ScannedEntry>, pid: u64, source: DetectSource) -> Option<ScannedHit> {
-  if is_suspended(pid) {
+///
+/// `stat` is the shared reuse buffer for the suspension read.
+fn live_or_none(
+  obj: &Arc<ScannedEntry>,
+  pid: u64,
+  source: DetectSource,
+  stat: &mut String,
+) -> Option<ScannedHit> {
+  if is_suspended(pid, stat) {
     tracing::debug!("[Process Scanner] Ignoring suspended process (pid {pid})");
     return None;
   }
@@ -428,11 +443,14 @@ pub fn apply_ignore_list(
 /// line must contain them (parity with arrpc/pog5-rsrpc, e.g. TF2
 /// `-game tf`); then the suspended check + timestamp stamp via
 /// `live_or_none`.
+///
+/// `stat` is the shared reuse buffer for the suspension read.
 fn finish_direct_hit(
   obj: &Arc<ScannedEntry>,
   exe_index: usize,
   process: &Exec,
   source: DetectSource,
+  stat: &mut String,
 ) -> Option<ScannedHit> {
   // A hit without executables (or a stale index) is corrupt input, not a
   // game: skip the process instead of panicking the scan.
@@ -452,7 +470,7 @@ fn finish_direct_hit(
     }
   }
 
-  live_or_none(obj, process.pid, source)
+  live_or_none(obj, process.pid, source, stat)
 }
 
 /// Steam's non-Steam shortcut range: ids Steam itself assigns when a
@@ -478,6 +496,7 @@ pub fn match_steam_id(
   detectable_list: &[Arc<ScannedEntry>],
   custom: &[Arc<ScannedEntry>],
   source: DetectSource,
+  stat: &mut String,
 ) -> Option<ScannedHit> {
   let appid = steam_app_id?;
   if let Some(&idx) = steam_map.get(appid) {
@@ -487,7 +506,7 @@ pub fn match_steam_id(
       obj.name,
       appid
     );
-    return live_or_none(obj, pid, source);
+    return live_or_none(obj, pid, source, stat);
   }
   // Custom override with a bare steam SKU (no executables to index):
   // the provenance travels through — a library-inherited app id matched
@@ -503,7 +522,7 @@ pub fn match_steam_id(
         obj.name,
         appid
       );
-      return live_or_none(obj, pid, source);
+      return live_or_none(obj, pid, source, stat);
     }
   }
   None
@@ -519,6 +538,7 @@ pub fn match_name_or_folder(
   name_map_nodot: &SortedIndex,
   detectable_list: &[Arc<ScannedEntry>],
   norm_out: &mut String,
+  stat: &mut String,
 ) -> Option<ScannedHit> {
   let stem = exe_stem(process_path);
   if name_matchable(stem)
@@ -530,7 +550,7 @@ pub fn match_name_or_folder(
       obj.name,
       stem
     );
-    return live_or_none(obj, pid, DetectSource::ExeStem);
+    return live_or_none(obj, pid, DetectSource::ExeStem, stat);
   }
 
   // Install-folder fallback (Hydra / non-Steam shortcuts / renamed exes):
@@ -557,7 +577,7 @@ pub fn match_name_or_folder(
         obj.name,
         folder
       );
-      return live_or_none(obj, pid, DetectSource::Folder);
+      return live_or_none(obj, pid, DetectSource::Folder, stat);
     }
   }
 
@@ -584,7 +604,7 @@ pub fn match_name_or_folder(
         obj.name,
         folder
       );
-      return live_or_none(obj, pid, DetectSource::Folder);
+      return live_or_none(obj, pid, DetectSource::Folder, stat);
     }
   }
 
@@ -821,6 +841,7 @@ impl ProcessServer {
           &bundle.list,
           &bundle.custom,
           DetectSource::SteamAppId,
+          &mut match_scratch.stat,
         ) {
           return Some(hit);
         }
@@ -840,6 +861,7 @@ impl ProcessServer {
             &bundle.name_map_nodot,
             &bundle.list,
             &mut match_scratch.norm_out,
+            &mut match_scratch.stat,
           )
         {
           return Some(hit);
@@ -850,7 +872,13 @@ impl ProcessServer {
         if let Some((obj, exe_index)) =
           self.probe_variants(&process_path, variant_bufs, reversed_path, bundle, true)
         {
-          return finish_direct_hit(&obj, exe_index, process, DetectSource::ProtonAutomaton);
+          return finish_direct_hit(
+            &obj,
+            exe_index,
+            process,
+            DetectSource::ProtonAutomaton,
+            &mut match_scratch.stat,
+          );
         }
         // Steam's own word: the process runs under a known install dir,
         // so it inherits that entry's AppId. Beats name guessing below,
@@ -864,6 +892,7 @@ impl ProcessServer {
             &bundle.list,
             &bundle.custom,
             DetectSource::SteamLibrary,
+            &mut match_scratch.stat,
           )
         {
           tracing::debug!(
@@ -885,11 +914,18 @@ impl ProcessServer {
           &bundle.name_map_nodot,
           &bundle.list,
           &mut match_scratch.norm_out,
+          &mut match_scratch.stat,
         );
       }
     };
 
-    finish_direct_hit(&obj, exe_index, process, found_source)
+    finish_direct_hit(
+      &obj,
+      exe_index,
+      process,
+      found_source,
+      &mut match_scratch.stat,
+    )
   }
 
   /// Single reversed-path AC probe (main DB, then custom overrides).
@@ -1123,6 +1159,7 @@ mod tick2_tests {
       &[entry],
       &[],
       DetectSource::SteamAppId,
+      &mut String::new(),
     )
     .expect("appid hits");
     assert_eq!(hit.source, DetectSource::SteamAppId);
@@ -1155,6 +1192,7 @@ mod tick2_tests {
       &empty,
       &list,
       &mut norm_out,
+      &mut String::new(),
     )
     .expect("stem hits");
     assert_eq!(stem_hit.source, DetectSource::ExeStem);
@@ -1166,6 +1204,7 @@ mod tick2_tests {
       &empty,
       &list,
       &mut norm_out,
+      &mut String::new(),
     )
     .expect("folder hits");
     assert_eq!(folder_hit.source, DetectSource::Folder);
@@ -1194,6 +1233,7 @@ mod tick2_tests {
       &[],
       &[entry],
       DetectSource::SteamLibrary,
+      &mut String::new(),
     )
     .expect("custom sku hits");
     assert_eq!(hit.source, DetectSource::SteamLibrary);
@@ -1218,6 +1258,54 @@ mod tick2_tests {
     );
     assert!(std::ptr::eq(lower_ptr, lower.as_ptr()), "lower moved");
     assert!(scratch.norm_out.capacity() >= out_cap);
+  }
+
+  /// D6: the suspended check parses `/proc/<pid>/stat` into the scratch's
+  /// own buffer instead of building a fresh `String` per hit.
+  ///
+  /// The read is tiny (`stat` is a few hundred bytes) but it runs for
+  /// every aux hit — 0 to 3 per tick — and the previous code paid two
+  /// allocations each time: a `String::new()` plus the `format!` of the
+  /// path. Letting the scratch own the buffer makes repeat checks free.
+  ///
+  /// The empty-buffer case matters as much as the steady state: a check
+  /// that fails to fill the scratch (unreadable pid) must leave it clear,
+  /// not leave last tick's bytes behind for the next parse to misread.
+  #[cfg(target_os = "linux")]
+  #[test]
+  fn stat_scratch_is_reused_across_suspension_checks() {
+    let pid = u64::from(std::process::id());
+    let mut scratch = MatchScratch::default();
+
+    // A readable pid fills the scratch; that is the reuse target.
+    let _ = is_suspended(pid, &mut scratch.stat);
+    assert!(
+      !scratch.stat.is_empty(),
+      "the check must parse into the scratch buffer"
+    );
+    let stat_ptr = scratch.stat.as_ptr();
+    let stat_cap = scratch.stat.capacity();
+
+    for _ in 0..3 {
+      let _ = is_suspended(pid, &mut scratch.stat);
+      assert!(
+        std::ptr::eq(stat_ptr, scratch.stat.as_ptr()),
+        "stat buffer moved"
+      );
+      assert!(scratch.stat.capacity() >= stat_cap, "stat buffer shrank");
+    }
+
+    // An unreadable pid reuses the same buffer and clears it, so a later
+    // check can never parse the previous pid's line.
+    let _ = is_suspended(u64::MAX, &mut scratch.stat);
+    assert!(
+      std::ptr::eq(stat_ptr, scratch.stat.as_ptr()),
+      "failed checks must not reallocate"
+    );
+    assert!(
+      scratch.stat.is_empty(),
+      "a failed read must clear the scratch, not leave stale bytes"
+    );
   }
 }
 
