@@ -379,6 +379,74 @@ fn cached_activity_stamps_outer_application_id() {
   assert_eq!(body["activity"]["application_id"], "424242");
 }
 
+/// The reply is held against the DOM algorithm it replaced: `to_value` +
+/// `insert` + `json!`. The envelope is serialized by reference now, so a
+/// shape drift (a dropped key, a changed `evt`/`nonce` null, a different
+/// `data` for a clear) must fail here rather than in a game client.
+#[test]
+fn set_activity_response_matches_the_dom_reference() {
+  // Rich activity: every optional field set, so the echo covers them all.
+  let cmd = parse_cmd(
+    r#"{"cmd":"SET_ACTIVITY","application_id":"123","args":{"pid":42,"activity":{
+      "name":"N","type":2,"url":"https://x.test","created_at":1,"session_id":"s",
+      "platform":"desktop","supported_platforms":["desktop"],
+      "timestamps":{"start":1789148307000},"application_id":"inner",
+      "details":"d","details_url":"https://d.test","state":"st",
+      "state_url":"https://s.test","sync_id":"sy","instance":true,
+      "status_display_type":1,"flags":1,"emoji":{"name":"😀","id":"1","animated":false},
+      "party":{"id":"p","size":[2,4],"privacy":1},
+      "secrets":{"join":"J","spectate":"S","match":"M"},
+      "buttons":[{"label":"L","url":"https://b.test"}],
+      "mystery_field_xyz":"must-survive"}},"nonce":"n9"}"#,
+  );
+
+  let got: Value =
+    serde_json::from_str(&set_activity_response(&cmd).expect("reply")).expect("json");
+
+  // Reference: the exact DOM path this replaced.
+  let args = cmd.args.as_ref().expect("args");
+  let mut data = serde_json::to_value(args.activity.as_ref().expect("activity")).expect("value");
+  data.as_object_mut().expect("object").insert(
+    "application_id".to_string(),
+    cmd
+      .application_id
+      .clone()
+      .map(Value::String)
+      .unwrap_or(Value::Null),
+  );
+  let reference = serde_json::json!({
+    "cmd": cmd.cmd,
+    "data": data,
+    "evt": null,
+    "nonce": cmd.nonce,
+  });
+
+  assert_eq!(got, reference);
+  // The outer id overrides the activity's own, not the other way round.
+  assert_eq!(got["data"]["application_id"], "123");
+  // Unknown keys still ride along.
+  assert_eq!(got["data"]["mystery_field_xyz"], "must-survive");
+}
+
+/// A clear echoes `data: null` with the same envelope shape.
+#[test]
+fn set_activity_response_echoes_clear_as_null_data() {
+  let cmd = parse_cmd(
+    r#"{"cmd":"SET_ACTIVITY","application_id":"123","args":{"pid":9,"activity":null},"nonce":"c1"}"#,
+  );
+  let got: Value =
+    serde_json::from_str(&set_activity_response(&cmd).expect("reply")).expect("json");
+
+  let reference = serde_json::json!({
+    "cmd": cmd.cmd,
+    "data": null,
+    "evt": null,
+    "nonce": cmd.nonce,
+  });
+  assert_eq!(got, reference);
+  assert!(got["data"].is_null());
+}
+
 /// Outer application ids feed the fingerprint (no cross-app aliasing).
 #[test]
 fn fingerprint_includes_outer_application_id() {

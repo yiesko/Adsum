@@ -361,12 +361,25 @@ pub fn set_activity_response(cmd: &ActivityCmd) -> Option<String> {
     None => Value::Null,
   };
 
-  serde_json::to_string(&serde_json::json!({
-    "cmd": cmd.cmd,
-    "data": data,
-    "evt": null,
-    "nonce": cmd.nonce,
-  }))
+  // The envelope is serialized by reference. A `json!` here built a second
+  // `Value` tree (four keys, one of them moving `data`) on top of the
+  // activity tree, on every publish. Key order inside `data` stays as the
+  // activity sent it, which the echo contract already allows ("byte
+  /// equivalent modulo key order").
+  #[derive(Serialize)]
+  struct Reply<'a> {
+    cmd: &'a str,
+    data: Value,
+    evt: Option<&'a str>,
+    nonce: &'a Value,
+  }
+
+  serde_json::to_string(&Reply {
+    cmd: &cmd.cmd,
+    data,
+    evt: None,
+    nonce: &cmd.nonce,
+  })
   .ok()
 }
 
