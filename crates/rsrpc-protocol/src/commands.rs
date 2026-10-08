@@ -7,7 +7,7 @@ use serde_json::Value;
 use serde_with::skip_serializing_none;
 use tungstenite::Utf8Bytes;
 
-use rsrpc_types::cmd::{ActivityCmd, ActivityPayload};
+use rsrpc_types::cmd::{Activity, ActivityCmd, ActivityPayload};
 use rsrpc_types::user::RpcUser;
 use rsrpc_types::{AppId, SocketId};
 
@@ -369,6 +369,25 @@ pub fn generic_ack(cmd: &ActivityCmd) -> String {
   })
   .unwrap_or_else(|_| error_fallback_json(&cmd.cmd, None))
 }
+
+/// The `data` object of a `SET_ACTIVITY` echo: the activity's own fields
+/// followed by the command's `application_id`.
+///
+/// The id is emitted from the command rather than from the activity, so
+/// [`set_activity_response`] clears the activity's copy first — otherwise
+/// `flatten` writes the activity's `application_id` and this field writes
+/// the command's, and the reply contains the key twice.
+///
+/// No `skip_serializing_if` on the id: when the command carries none the
+/// echo must say `"application_id": null`, which `None` gives for free,
+/// not omit the key.
+#[derive(Serialize)]
+struct ActivityEcho<'a> {
+  #[serde(flatten)]
+  activity: &'a Activity,
+  application_id: Option<&'a str>,
+}
+
 /// Build the official-shaped confirmation reply for a `SET_ACTIVITY` command.
 ///
 /// The reply echoes `cmd`/`nonce` and carries `data` with the (fixed)
@@ -381,37 +400,38 @@ pub fn generic_ack(cmd: &ActivityCmd) -> String {
 /// `application_id` (known from the handshake, absent from what the game
 /// sent) is attached as a routing enrichment; unknown keys tolerate it.
 /// Returns `None` when the command has no arguments.
+///
+/// Takes `&mut` because the echo's `application_id` is the command's, not
+/// the activity's: the activity's own copy is dropped first so the field
+/// below is the only one emitted (see [`ActivityEcho`]).
 #[must_use]
-pub fn set_activity_response(cmd: &ActivityCmd) -> Option<String> {
+pub fn set_activity_response(cmd: &mut ActivityCmd) -> Option<String> {
+  // The echo's `application_id` is the outer command's id, verbatim —
+  // `null` when the command carries none — overriding whatever the
+  // activity itself sent. Take the activity's own copy out so the DTO
+  // field below is the only source: left in, `flatten` would write the
+  // key a second time and the game would see two `application_id`s.
+  // Dropping it also costs nothing: the string is discarded, not cloned.
+  if let Some(activity) = cmd.args.as_mut().and_then(|args| args.activity.as_mut()) {
+    activity.application_id = None;
+  }
+
   let args = cmd.args.as_ref()?;
+  let data = args.activity.as_ref().map(|activity| ActivityEcho {
+    activity,
+    application_id: cmd.application_id.as_deref(),
+  });
 
-  let data = match args.activity.as_ref() {
-    Some(activity) => {
-      let mut data = serde_json::to_value(activity).ok()?;
-      if let Some(obj) = data.as_object_mut() {
-        obj.insert(
-          "application_id".to_string(),
-          cmd
-            .application_id
-            .clone()
-            .map(Value::String)
-            .unwrap_or(Value::Null),
-        );
-      }
-      data
-    }
-    None => Value::Null,
-  };
-
-  // The envelope is serialized by reference. A `json!` here built a second
-  // `Value` tree (four keys, one of them moving `data`) on top of the
-  // activity tree, on every publish. Key order inside `data` stays as the
-  // activity sent it, which the echo contract already allows ("byte
-  /// equivalent modulo key order").
+  // Envelope and activity are serialized by reference, straight into the
+  // reply. The previous build round-tripped the activity through a
+  // `serde_json::Value` (a whole `Map`) just to overwrite one key, then
+  // serialized that tree — on every publish. Keys inside `data` now
+  // follow declaration order instead of the alphabet, which the echo
+  // contract allows ("byte equivalent modulo key order").
   #[derive(Serialize)]
   struct Reply<'a> {
     cmd: &'a str,
-    data: Value,
+    data: Option<ActivityEcho<'a>>,
     evt: Option<&'a str>,
     nonce: &'a Value,
   }

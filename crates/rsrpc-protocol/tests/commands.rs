@@ -167,7 +167,7 @@ fn set_activity_response_echoes_activity_intact() {
   cmd.application_id = Some("123".to_string());
 
   let reply: Value =
-    serde_json::from_str(&set_activity_response(&cmd).expect("response")).expect("valid json");
+    serde_json::from_str(&set_activity_response(&mut cmd).expect("response")).expect("valid json");
 
   assert_eq!(reply["cmd"], "SET_ACTIVITY");
   assert_eq!(reply["data"]["name"], "My Game");
@@ -192,7 +192,7 @@ fn set_activity_response_keeps_extra_and_derived_metadata() {
   cmd.fix();
 
   let reply: Value =
-    serde_json::from_str(&set_activity_response(&cmd).expect("response")).expect("valid json");
+    serde_json::from_str(&set_activity_response(&mut cmd).expect("response")).expect("valid json");
 
   assert_eq!(
     reply["data"]["metadata"]["button_urls"],
@@ -208,7 +208,7 @@ fn set_activity_response_clear_carries_null_data() {
   cmd.application_id = Some("123".to_string());
 
   let reply: Value =
-    serde_json::from_str(&set_activity_response(&cmd).expect("response")).expect("valid json");
+    serde_json::from_str(&set_activity_response(&mut cmd).expect("response")).expect("valid json");
 
   assert_eq!(reply["cmd"], "SET_ACTIVITY");
   assert!(reply["data"].is_null());
@@ -386,7 +386,7 @@ fn cached_activity_stamps_outer_application_id() {
 #[test]
 fn set_activity_response_matches_the_dom_reference() {
   // Rich activity: every optional field set, so the echo covers them all.
-  let cmd = parse_cmd(
+  let mut cmd = parse_cmd(
     r#"{"cmd":"SET_ACTIVITY","application_id":"123","args":{"pid":42,"activity":{
       "name":"N","type":2,"url":"https://x.test","created_at":1,"session_id":"s",
       "platform":"desktop","supported_platforms":["desktop"],
@@ -401,7 +401,7 @@ fn set_activity_response_matches_the_dom_reference() {
   );
 
   let got: Value =
-    serde_json::from_str(&set_activity_response(&cmd).expect("reply")).expect("json");
+    serde_json::from_str(&set_activity_response(&mut cmd).expect("reply")).expect("json");
 
   // Reference: the exact DOM path this replaced.
   let args = cmd.args.as_ref().expect("args");
@@ -431,11 +431,11 @@ fn set_activity_response_matches_the_dom_reference() {
 /// A clear echoes `data: null` with the same envelope shape.
 #[test]
 fn set_activity_response_echoes_clear_as_null_data() {
-  let cmd = parse_cmd(
+  let mut cmd = parse_cmd(
     r#"{"cmd":"SET_ACTIVITY","application_id":"123","args":{"pid":9,"activity":null},"nonce":"c1"}"#,
   );
   let got: Value =
-    serde_json::from_str(&set_activity_response(&cmd).expect("reply")).expect("json");
+    serde_json::from_str(&set_activity_response(&mut cmd).expect("reply")).expect("json");
 
   let reference = serde_json::json!({
     "cmd": cmd.cmd,
@@ -445,6 +445,103 @@ fn set_activity_response_echoes_clear_as_null_data() {
   });
   assert_eq!(got, reference);
   assert!(got["data"].is_null());
+}
+
+/// A `SET_ACTIVITY` command whose outer `application_id` and the
+/// activity's own may diverge.
+fn echo_cmd(outer: Option<&str>, inner: Option<&str>) -> ActivityCmd {
+  let mut activity = serde_json::json!({ "name": "G", "type": 0 });
+  if let Some(v) = inner {
+    activity["application_id"] = v.into();
+  }
+  let mut cmd_json = serde_json::json!({
+    "cmd": "SET_ACTIVITY",
+    "args": { "pid": 1, "activity": activity },
+    "nonce": "n1",
+  });
+  if let Some(v) = outer {
+    cmd_json["application_id"] = v.into();
+  }
+  serde_json::from_value(cmd_json).expect("failed to parse echo command")
+}
+
+fn echo_value(outer: Option<&str>, inner: Option<&str>) -> Value {
+  let raw = echo_raw(outer, inner);
+  serde_json::from_str(&raw).expect("valid json")
+}
+
+fn echo_raw(outer: Option<&str>, inner: Option<&str>) -> String {
+  let mut cmd = echo_cmd(outer, inner);
+  set_activity_response(&mut cmd).expect("response")
+}
+
+/// The N8 contract: the echoed `application_id` is the outer command's id,
+/// verbatim — `null` when the command carries none — and it overrides
+/// whatever the activity itself sent. This single rule is why the activity
+/// cannot be echoed by a plain borrow.
+#[test]
+fn echo_application_id_is_the_outer_command_id_verbatim() {
+  for (outer, inner, want) in [
+    (Some("outer"), Some("inner"), Some("outer")),
+    (Some("outer"), None, Some("outer")),
+    (None, Some("inner"), None),
+    (None, None, None),
+  ] {
+    let got = echo_value(outer, inner);
+    // Indexing a missing key also yields `null`, so the raw-string check in
+    // `echo_carries_exactly_one_application_id_key` is what proves the key
+    // is really present here.
+    assert_eq!(
+      got["data"]["application_id"],
+      want.map(Value::from).unwrap_or(Value::Null),
+      "outer={outer:?} inner={inner:?}"
+    );
+  }
+}
+
+/// Exactly one `application_id` key per echo, always present. Echoing the
+/// activity through `flatten` while *also* emitting the command's id would
+/// write the key twice whenever the activity carries one of its own.
+#[test]
+fn echo_carries_exactly_one_application_id_key() {
+  for (outer, inner) in [
+    (Some("outer"), Some("inner")),
+    (Some("outer"), None),
+    (None, Some("inner")),
+    (None, None),
+  ] {
+    let raw = echo_raw(outer, inner);
+    assert_eq!(
+      raw.matches("\"application_id\"").count(),
+      1,
+      "outer={outer:?} inner={inner:?} wrote the key more than once: {raw}"
+    );
+    assert!(
+      raw.contains("\"application_id\":"),
+      "outer={outer:?} inner={inner:?} dropped the key: {raw}"
+    );
+  }
+}
+
+/// The activity is written straight into the envelope instead of passing
+/// through an intermediate `serde_json::Value`: `application_id`, the one
+/// key the echo takes from the command rather than the activity, lands
+/// where the DTO declares it — last inside `data`. A `Value`-based build
+/// would instead sort the keys alphabetically (a `BTreeMap`), putting
+/// `application_id` first.
+#[test]
+fn echo_serializes_the_activity_without_an_intermediate_value() {
+  let mut cmd = parse_cmd(
+    r#"{"cmd":"SET_ACTIVITY","application_id":"123","args":{"pid":42,"activity":{
+      "name":"N","type":2,"url":"https://x.test","created_at":1}},"nonce":"n9"}"#,
+  );
+
+  let raw = set_activity_response(&mut cmd).expect("reply");
+
+  assert!(
+    raw.contains(r#""application_id":"123"},"evt":null"#),
+    "expected the command id as the final key of `data` (no DOM), got: {raw}"
+  );
 }
 
 /// Outer application ids feed the fingerprint (no cross-app aliasing).

@@ -220,7 +220,7 @@ pub(crate) async fn handle_set_activity(
   // Materialize the reply *before* the command moves into the sink: the
   // ACK is the only part of the command still needed afterwards, and the
   // command was just parsed so nothing downstream ever saw a shorter life.
-  let response = commands::set_activity_response(&event);
+  let response = commands::set_activity_response(&mut event);
   let delivered = match forward {
     Forward::Direct => sink.emit(event).await,
     // Staged publishes stay tracked: the disconnect path flushes them

@@ -111,7 +111,7 @@ fn benchmark_set_activity_response(c: &mut Criterion) {
   cmd.fix();
 
   c.bench_function("set_activity_response_build", |b| {
-    b.iter(|| black_box(set_activity_response(black_box(&cmd)).expect("response")))
+    b.iter(|| black_box(set_activity_response(black_box(&mut cmd)).expect("response")))
   });
 }
 

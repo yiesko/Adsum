@@ -553,7 +553,8 @@ fn handle_set_activity(
   // call it), so the serialized payload and the fingerprint are identical
   // to what an unfixed forward would have produced.
   activity_cmd.fix();
-  let response = commands::set_activity_response(&activity_cmd).unwrap_or_else(|| raw.to_string());
+  let response =
+    commands::set_activity_response(&mut activity_cmd).unwrap_or_else(|| raw.to_string());
 
   // Refused pids never reach the sink (echo below still flows, so
   // lock-step clients never hang); recording stays limited to forwarded
