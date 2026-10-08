@@ -200,6 +200,39 @@ fn error_fallback_json(cmd: &str, evt: Option<&str>) -> String {
   }
 }
 
+/// Borrowed reply envelope: `{cmd, data, evt, nonce}`, the shape every
+/// reply on this path shares.
+///
+/// Serializing by reference avoids the intermediate `Value` tree a
+/// `json!` macro builds for each reply — one tree and one final String
+/// instead of two trees and a String. `data` is generic so each caller
+/// passes either a borrowed value, a fixed-shape struct, or `&Value::NULL`
+/// for a literal null.
+#[derive(Serialize)]
+struct Reply<'a, D> {
+  cmd: &'a str,
+  data: D,
+  evt: Option<&'a str>,
+  nonce: &'a Value,
+}
+
+/// JSON null, for replies whose `data` is literally null.
+static NULL_DATA: Value = Value::Null;
+
+/// `data` for the subscribe acknowledgement: the event the client asked
+/// for, echoed, or null when it named none.
+#[derive(Serialize)]
+struct SubscribeData<'a> {
+  evt: Option<&'a str>,
+}
+
+/// `data` for an error reply: the code and human message.
+#[derive(Serialize)]
+struct ErrorData<'a> {
+  code: u16,
+  message: &'a str,
+}
+
 /// Events this server can actually dispatch: `READY` (on connect),
 /// `ERROR` (command failures) and `CURRENT_USER_UPDATE` (bridge identity
 /// changes via `SET_USER`/`RESET_USER`). Everything else in the official
@@ -212,12 +245,14 @@ fn error_fallback_json(cmd: &str, evt: Option<&str>) -> String {
 /// (`ENTITLEMENT_CREATE`, `ENTITLEMENT_DELETE`).
 #[must_use]
 pub fn subscribe_ack(cmd: &ActivityCmd) -> String {
-  serde_json::to_string(&serde_json::json!({
-    "cmd": cmd.cmd,
-    "data": { "evt": cmd.evt },
-    "evt": null,
-    "nonce": cmd.nonce,
-  }))
+  serde_json::to_string(&Reply {
+    cmd: &cmd.cmd,
+    data: SubscribeData {
+      evt: cmd.evt.as_deref(),
+    },
+    evt: None,
+    nonce: &cmd.nonce,
+  })
   .unwrap_or_else(|_| error_fallback_json(&cmd.cmd, Some("ERROR")))
 }
 
@@ -226,15 +261,15 @@ pub fn subscribe_ack(cmd: &ActivityCmd) -> String {
 /// response is "an RPC user object or null").
 #[must_use]
 pub fn user_response(cmd: &ActivityCmd, user: Option<&RpcUser>) -> String {
-  let data = user
-    .and_then(|user| serde_json::to_value(user).ok())
-    .unwrap_or(Value::Null);
-  serde_json::to_string(&serde_json::json!({
-    "cmd": cmd.cmd,
-    "data": data,
-    "evt": null,
-    "nonce": cmd.nonce,
-  }))
+  // `data` is the user object itself or null; borrowing the server's own
+  // value avoids rebuilding the envelope around it.
+  let data = user.and_then(|user| serde_json::to_value(user).ok());
+  serde_json::to_string(&Reply {
+    cmd: &cmd.cmd,
+    data: data.as_ref().unwrap_or(&NULL_DATA),
+    evt: None,
+    nonce: &cmd.nonce,
+  })
   .unwrap_or_else(|_| error_fallback_json(&cmd.cmd, Some("ERROR")))
 }
 
@@ -243,14 +278,13 @@ pub fn user_response(cmd: &ActivityCmd, user: Option<&RpcUser>) -> String {
 /// user object itself, per the official event shape.
 #[must_use]
 pub fn current_user_update(user: &RpcUser) -> String {
-  let data = serde_json::to_value(user).unwrap_or(Value::Null);
-  serde_json::json!({
-    "cmd": "DISPATCH",
-    "evt": "CURRENT_USER_UPDATE",
-    "data": data,
-    "nonce": null,
+  serde_json::to_string(&Reply {
+    cmd: "DISPATCH",
+    data: user,
+    evt: Some("CURRENT_USER_UPDATE"),
+    nonce: &NULL_DATA,
   })
-  .to_string()
+  .unwrap_or_else(|_| String::from("{}"))
 }
 
 /// Official error for a known command that has no backend here (OAuth,
@@ -311,12 +345,12 @@ pub fn unsupported_command(cmd: &str) -> Option<(u16, &'static str)> {
 /// mirroring arRPC's `{cmd, data: {code, message}, evt: "ERROR", nonce}`.
 #[must_use]
 pub fn rpc_error(cmd: &str, nonce: &Value, code: u16, message: &str) -> String {
-  serde_json::to_string(&serde_json::json!({
-    "cmd": cmd,
-    "data": { "code": code, "message": message },
-    "evt": "ERROR",
-    "nonce": nonce,
-  }))
+  serde_json::to_string(&Reply {
+    cmd,
+    data: ErrorData { code, message },
+    evt: Some("ERROR"),
+    nonce,
+  })
   .unwrap_or_else(|_| error_fallback_json(cmd, Some("ERROR")))
 }
 
@@ -327,12 +361,12 @@ pub fn rpc_error(cmd: &str, nonce: &Value, code: u16, message: &str) -> String {
 /// bridge clients there is nothing more to report).
 #[must_use]
 pub fn generic_ack(cmd: &ActivityCmd) -> String {
-  serde_json::to_string(&serde_json::json!({
-    "cmd": cmd.cmd,
-    "data": null,
-    "evt": null,
-    "nonce": cmd.nonce,
-  }))
+  serde_json::to_string(&Reply {
+    cmd: &cmd.cmd,
+    data: &NULL_DATA,
+    evt: None,
+    nonce: &cmd.nonce,
+  })
   .unwrap_or_else(|_| error_fallback_json(&cmd.cmd, None))
 }
 /// Build the official-shaped confirmation reply for a `SET_ACTIVITY` command.
@@ -508,5 +542,17 @@ mod tests {
       serde_json::from_str(&null_frame).expect("null fallback is valid JSON");
     assert_eq!(null_parsed["cmd"], hostile);
     assert!(null_parsed["evt"].is_null());
+  }
+
+  /// The reply fallback is itself valid JSON: a failure to serialize the
+  /// real reply must never emit a broken frame to a lock-step client.
+  #[test]
+  fn error_fallback_stays_valid_json() {
+    for evt in [None, Some("ERROR")] {
+      let fallback = error_fallback_json("SET_ACTIVITY", evt);
+      let parsed: Value = serde_json::from_str(&fallback).expect("fallback must be valid JSON");
+      assert_eq!(parsed["cmd"], "SET_ACTIVITY");
+      assert_eq!(parsed["evt"], evt.map_or(Value::Null, |e| e.into()));
+    }
   }
 }

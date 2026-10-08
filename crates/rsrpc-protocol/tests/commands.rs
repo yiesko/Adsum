@@ -461,3 +461,69 @@ fn fingerprint_includes_outer_application_id() {
   let fb = activity_fingerprint(&mut b).expect("fingerprint");
   assert_ne!(fa, fb);
 }
+
+/// Every reply builder on the borrowed-envelope path must produce exactly
+/// the shape the old `json!` envelope produced: the wire format is what
+/// strict clients (and the IPC echo) parse, so a dropped or renamed key
+/// must fail here rather than in a game.
+#[test]
+fn borrowed_envelope_matches_the_previous_shape() {
+  let cmd = parse_cmd(
+    r#"{"cmd":"SET_ACTIVITY","args":{"pid":1,"activity":null},"nonce":"n1","evt":"VOICE_STATE_UPDATE"}"#,
+  );
+
+  // subscribe_ack: {cmd, data:{evt}, evt:null, nonce} — echoing the
+  // command's own name, not a hardcoded one.
+  let got: Value = serde_json::from_str(&subscribe_ack(&cmd)).expect("json");
+  assert_eq!(
+    got,
+    serde_json::json!({
+      "cmd": "SET_ACTIVITY",
+      "data": {"evt": "VOICE_STATE_UPDATE"},
+      "evt": null,
+      "nonce": "n1"
+    })
+  );
+
+  // generic_ack: data is null, evt is null.
+  let got: Value = serde_json::from_str(&generic_ack(&cmd)).expect("json");
+  assert_eq!(
+    got,
+    serde_json::json!({
+      "cmd": "SET_ACTIVITY",
+      "data": null,
+      "evt": null,
+      "nonce": "n1"
+    })
+  );
+
+  // A command that named no event still echoes `{"evt":null}`.
+  let no_evt = parse_cmd(r#"{"cmd":"DEEP_LINK","args":null,"nonce":"n2"}"#);
+  let got: Value = serde_json::from_str(&subscribe_ack(&no_evt)).expect("json");
+  assert_eq!(got["data"]["evt"], serde_json::json!(null));
+
+  // rpc_error: fixed error body, evt ERROR.
+  let got: Value = serde_json::from_str(&rpc_error(
+    "INVITE_BROWSER",
+    &Value::String("n3".into()),
+    4011,
+    "Invalid invite id",
+  ))
+  .expect("json");
+  assert_eq!(
+    got,
+    serde_json::json!({
+      "cmd": "INVITE_BROWSER",
+      "data": {"code": 4011, "message": "Invalid invite id"},
+      "evt": "ERROR",
+      "nonce": "n3"
+    })
+  );
+
+  // current_user_update: DISPATCH with the user inside and nonce null.
+  let got: Value = serde_json::from_str(&current_user_update(&RpcUser::default())).expect("json");
+  assert_eq!(got["cmd"], "DISPATCH");
+  assert_eq!(got["evt"], "CURRENT_USER_UPDATE");
+  assert_eq!(got["nonce"], serde_json::json!(null));
+  assert_eq!(got["data"]["username"], "arRPC");
+}
