@@ -60,7 +60,11 @@ pub(crate) fn state_activities(cache: &ReplayCache) -> Vec<StateActivity> {
         .and_then(|item| item.get("application_id"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_string),
-      pid: body.get("pid").and_then(serde_json::Value::as_u64),
+      // Recorded at build time, not parsed back out of the body. The other
+      // three fields still come from the JSON: they live only there, and
+      // duplicating them per cache entry to spare a parse on a
+      // 5-second-cadence diagnostic would trade memory for trivia.
+      pid: (payload.pid != 0).then_some(payload.pid),
       start_time: activity
         .and_then(|item| item.get("timestamps"))
         .and_then(|item| item.get("start"))

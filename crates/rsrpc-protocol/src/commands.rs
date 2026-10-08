@@ -64,6 +64,12 @@ pub struct CachedActivity {
   /// (in-memory only — never serialized onto the wire). `None` for
   /// clears and unclassified payloads.
   pub provenance: Option<ActivityProvenance>,
+  /// The pid this card belongs to, recorded at construction.
+  ///
+  /// The replay cache needs it for ghost reaping, and the snapshot needs
+  /// it for its listing; both used to parse it back out of the serialized
+  /// JSON to learn something the builder already knew.
+  pub pid: u64,
 }
 
 /// Where a published card came from: detection matcher or SDK client,
@@ -95,6 +101,7 @@ pub fn empty_cached(pid: u64, socket_id: SocketId) -> Option<Arc<CachedActivity>
     is_clear: true,
     activity_json: Bytes::new(),
     provenance: None,
+    pid,
   }))
 }
 
@@ -163,6 +170,7 @@ pub fn cached_activity(
     // Provenance is stamped by the bridge caller (generic vs SDK paths
     // know their source); the protocol layer leaves it empty.
     provenance: None,
+    pid: args.pid.unwrap_or_default(),
   }))
 }
 

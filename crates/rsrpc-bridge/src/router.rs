@@ -93,6 +93,7 @@ pub(crate) fn generic_payload(game: &ScannedGame) -> Option<Arc<CachedActivity>>
     is_clear: false,
     activity_json: bytes::Bytes::from(activity_json),
     provenance,
+    pid: game.pid,
   }))
 }
 
