@@ -18,6 +18,7 @@ use std::{
 
 use rsrpc_protocol::error::{Result, RsrpcError};
 use rsrpc_protocol::query::query_param;
+use rsrpc_types::AppId;
 use rsrpc_types::cmd::{ActivityCmd, ActivityCmdArgs};
 use rsrpc_types::user::RpcUser;
 use rsrpc_ws::{ClientId, CloseCode, Event, EventHub, Message, Responder};
@@ -151,7 +152,10 @@ struct ClientSlot {
   /// so this history is always complete and disconnect cleanup clears
   /// every forwarded card.
   published: Vec<handlers::PublishedSlot>,
-  query_client_id: Option<String>,
+  /// `client_id` from the connect query, shared with the fallback the
+  /// forwarded commands carry. Refcounted, so the per-message snapshot
+  /// clone is a counter bump and never a heap copy.
+  query_client_id: Option<AppId>,
 }
 
 /// Whether a publication was admitted to the bounded per-connection history.
@@ -230,7 +234,23 @@ pub(crate) enum TryEmit {
 /// write guards.
 struct SlotSnapshot {
   responder: Responder,
-  query_client_id: Option<String>,
+  query_client_id: Option<AppId>,
+}
+
+impl SlotSnapshot {
+  /// Cheap per-message snapshot of one stored slot.
+  ///
+  /// The client id is shared, never copied: this runs for **every**
+  /// message — `SUBSCRIBE` and `GET_USER` included, which never use the
+  /// id — so a deep copy here charged the whole message path. Publication
+  /// history is deliberately left behind (read only on disconnect, under
+  /// a short guard) and the read guard is dropped before any await.
+  fn from_slot(slot: &ClientSlot) -> Self {
+    Self {
+      responder: slot.responder.clone(),
+      query_client_id: slot.query_client_id.clone(),
+    }
+  }
 }
 
 /// Bounded event sink with a shed counter.
@@ -740,10 +760,11 @@ async fn on_connect(
   let uri = responder.details().uri.as_ref();
   let version = query_param(uri, "v").unwrap_or("0");
   let encoding = query_param(uri, "encoding").unwrap_or("json");
-  // The connection's fallback id outlives this function, so it is the one
-  // value that must be owned — a single allocation instead of a parsed
-  // `HashMap` holding a `String` per query key.
-  let query_client_id = query_param(uri, "client_id").map(str::to_string);
+  // The connection's fallback id is the one value that must outlive the
+  // handshake, so it enters shared ownership once here — one copy into
+  // the refcounted layout per connection, and every later clone (the
+  // per-message snapshot included) is free.
+  let query_client_id = query_param(uri, "client_id").map(AppId::from);
   if version != "1" || encoding != "json" {
     tracing::warn!("[transport-ws] Rejecting client {id} (v={version}, encoding={encoding})");
     responder.close(CloseCode::Normal).await;
@@ -879,10 +900,7 @@ async fn on_message(
   // Snapshot the cheap fields; the read guard drops before any await
   // below (and the deep `last_cmd` is never cloned here).
   let slot = match clients.read().await.get(&id) {
-    Some(slot) => SlotSnapshot {
-      responder: slot.responder.clone(),
-      query_client_id: slot.query_client_id.clone(),
-    },
+    Some(slot) => SlotSnapshot::from_slot(slot),
     None => {
       // Stale message for a removed slot (pruned or rejected client).
       return;
@@ -914,10 +932,12 @@ async fn on_message(
     // always forward (the bridge may hold the card), and free the slot
     // once delivered so new pids fit again. Applies the same
     // connect-query client_id fallback the forwarded command carries.
-    let app_id = event
-      .application_id
-      .clone()
-      .or_else(|| slot.query_client_id.clone());
+    let app_id = event.application_id.clone().or_else(|| {
+      slot
+        .query_client_id
+        .as_ref()
+        .map(|id| id.as_ref().to_string())
+    });
     let pid = event.args.as_ref().and_then(|a| a.pid).unwrap_or_default();
     let is_clear = event
       .args
@@ -962,7 +982,7 @@ async fn on_message(
     };
     let (alive, delivered) = handlers::handle_set_activity(
       event,
-      slot.query_client_id.as_deref(),
+      slot.query_client_id.as_ref().map(|id| id.as_ref()),
       &slot.responder,
       sink,
       pending_clears,
@@ -1321,5 +1341,38 @@ mod tests {
     let uri = "/?v=1&client_id=abc";
     assert_eq!(query_param(uri, "v"), Some("1"));
     assert_eq!(query_param(uri, "client_id"), Some("abc"));
+  }
+
+  /// A4: the per-message snapshot shares the connection's client id
+  /// instead of copying it.
+  ///
+  /// The snapshot is rebuilt for **every** message — `SUBSCRIBE` and
+  /// `GET_USER` included, which never use the id at all — so an owned
+  /// `String` here paid a deep copy on the whole message path. With the
+  /// id refcounted the clone is a counter bump and the buffer is shared.
+  /// Goes through [`SlotSnapshot::from_slot`] on purpose: building the
+  /// struct by hand here would leave the real clone site untested, and
+  /// a copy reintroduced there would pass.
+  #[test]
+  fn slot_snapshot_shares_the_connection_client_id() {
+    let slot = ClientSlot {
+      responder: Responder::for_test(),
+      published: Vec::new(),
+      query_client_id: Some(AppId::from("123456789012345678")),
+    };
+    let stored_ptr = slot
+      .query_client_id
+      .as_ref()
+      .expect("client id")
+      .as_ref()
+      .as_ptr();
+
+    let snapshot = SlotSnapshot::from_slot(&slot);
+
+    let shared = snapshot.query_client_id.expect("client id");
+    assert!(
+      std::ptr::eq(shared.as_ref().as_ptr(), stored_ptr),
+      "the per-message snapshot must share the connection id, never copy it"
+    );
   }
 }

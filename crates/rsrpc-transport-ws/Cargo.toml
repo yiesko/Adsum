@@ -28,3 +28,4 @@ tokio-tungstenite.workspace = true
 tungstenite.workspace = true
 futures-util.workspace = true
 serde_json.workspace = true
+rsrpc-ws = { path = "../rsrpc-ws", features = ["test-util"] }
