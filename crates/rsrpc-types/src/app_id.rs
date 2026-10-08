@@ -43,6 +43,20 @@ impl AsRef<str> for AppId {
   }
 }
 
+/// Borrow the id as its `str`: the newtype is a transparent wrapper over
+/// `Arc<str>`, so deref costs a pointer hop and never a copy.
+///
+/// This is what lets `AppId` stand in for `&str` everywhere the pipeline
+/// already expects one — `Option<AppId>::as_deref()`, `id.starts_with(…)`
+/// — instead of every call site spelling out a conversion.
+impl std::ops::Deref for AppId {
+  type Target = str;
+
+  fn deref(&self) -> &Self::Target {
+    &self.0
+  }
+}
+
 /// Borrow as `str` so `HashMap<AppId, _>` lookups accept `&str` without
 /// allocating an owned key on the hot path.
 impl std::borrow::Borrow<str> for AppId {
@@ -63,6 +77,16 @@ impl std::borrow::Borrow<str> for SocketId {
 impl AsRef<str> for SocketId {
   /// Borrow the inner id as `str` (no allocation, no copy).
   fn as_ref(&self) -> &str {
+    &self.0
+  }
+}
+
+/// Same as [`AppId`](AppId::Deref): the socket id is a transparent
+/// wrapper over `Arc<str>`, so it stands in for `&str` the same way.
+impl std::ops::Deref for SocketId {
+  type Target = str;
+
+  fn deref(&self) -> &Self::Target {
     &self.0
   }
 }
@@ -257,5 +281,36 @@ mod tests {
     assert_eq!(json, r#""123""#);
     let back: AppId = serde_json::from_str(&json).unwrap();
     assert_eq!(back, AppId::from("123"));
+  }
+
+  /// `Deref<Target = str>` lets the ids stand in for `&str` wherever the
+  /// pipeline already expects one.
+  ///
+  /// This is the missing piece that makes D7 and C3 mechanical instead of
+  /// invasive: `Option<AppId>::as_deref()` is the call shape used at ~8
+  /// production sites today, and without the impl every one of them has
+  /// to spell out a conversion by hand.
+  #[test]
+  fn ids_deref_to_str_and_as_deref_works() {
+    let id = AppId::from("12345");
+    // Coercion: `&AppId` where `&str` is expected.
+    let s: &str = &id;
+    assert_eq!(s, "12345");
+    // `str` methods resolve through the deref, no import needed.
+    assert_eq!(id.len(), 5);
+    assert!(id.starts_with("123"));
+
+    // The pipeline's shape.
+    let some: Option<AppId> = Some(AppId::from("12345"));
+    assert_eq!(some.as_deref(), Some("12345"));
+    let none: Option<AppId> = None;
+    assert_eq!(none.as_deref(), None);
+
+    // `SocketId` mirrors `AppId` (see `Borrow<str>` above).
+    let sock = SocketId::from("sock-1");
+    let s2: &str = &sock;
+    assert_eq!(s2, "sock-1");
+    let some_sock: Option<SocketId> = Some(SocketId::from("sock-1"));
+    assert_eq!(some_sock.as_deref(), Some("sock-1"));
   }
 }
