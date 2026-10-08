@@ -26,14 +26,14 @@ use rsrpc_protocol::error::{Result, RsrpcError};
 use rsrpc_types::cmd::ActivityCmd;
 use rsrpc_types::user::RpcUser;
 use rsrpc_types::{AppId, SocketId};
-use rsrpc_ws::{ClientId, CloseCode, Event, EventHub, Message, Responder};
+use rsrpc_ws::{ClientId, CloseCode, Event, EventHub, Message};
 use rustc_hash::FxHashMap;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::BridgeConfig;
-use crate::consumer::{BridgeProtocol, send_cached, send_message};
+use crate::consumer::{BridgeProtocol, Consumer, ConsumerMap, send_cached, send_message};
 use crate::control::handle_bridge_control;
 use crate::handoff::{
   ClearReason, HandoffState, ProcInput, is_process_alive, track_process_publication,
@@ -75,11 +75,12 @@ pub struct BridgeInputs {
 /// crate-visible so the consumer/router/snapshot units in sibling modules
 /// can implement on it; all mutation still funnels through short guards.
 pub(crate) struct Shared {
-  pub(crate) json_clients: Mutex<FxHashMap<ClientId, Responder>>,
-  pub(crate) msgpack_clients: Mutex<FxHashMap<ClientId, Responder>>,
-  /// Resolved encoding per consumer (the `format=` override wins over the
-  /// port default): every later lookup keys off this, never the default.
-  pub(crate) consumer_protocol: Mutex<FxHashMap<ClientId, BridgeProtocol>>,
+  /// Every consumer on this server, with its responder and its encoding.
+  ///
+  /// One map instead of one per encoding plus a protocol table: a message
+  /// then takes a single lock, and a prune cannot leave a protocol entry
+  /// pinned by a responder it no longer has.
+  pub(crate) consumers: ConsumerMap,
   pub(crate) cache: Mutex<ReplayCache>,
   pub(crate) activity_seq: Mutex<u64>,
   pub(crate) last_process: Mutex<HashMap<AppId, u64>>,
@@ -188,9 +189,7 @@ impl Bridge {
     let token = CancellationToken::new();
     let tasks = Arc::new(tokio::sync::Mutex::new(JoinSet::new()));
     let shared = Arc::new(Shared {
-      json_clients: Mutex::new(FxHashMap::default()),
-      msgpack_clients: Mutex::new(FxHashMap::default()),
-      consumer_protocol: Mutex::new(FxHashMap::default()),
+      consumers: Mutex::new(FxHashMap::default()),
       cache: Mutex::new(HashMap::new()),
       activity_seq: Mutex::new(0),
       last_process: Mutex::new(HashMap::new()),
@@ -415,42 +414,26 @@ async fn bridge_pump(hub: EventHub, shared: Arc<Shared>, default_protocol: Bridg
           send_cached(&responder, payload, protocol);
         }
         shared
-          .consumer_protocol
+          .consumers
           .lock()
           .unwrap_or_else(|e| e.into_inner())
-          .insert(id, protocol);
-        shared
-          .clients_for(protocol)
-          .lock()
-          .unwrap_or_else(|e| e.into_inner())
-          .insert(id, responder);
+          .insert(
+            id,
+            Consumer {
+              responder,
+              protocol,
+            },
+          );
       }
       Event::Disconnect(id, _) => {
         tracing::info!("[bridge] Consumer {id} disconnected");
-        let known = shared
-          .consumer_protocol
+        // One map, so one remove: the old code needed a protocol lookup
+        // plus a per-encoding remove (or a sweep of both when untracked).
+        shared
+          .consumers
           .lock()
           .unwrap_or_else(|e| e.into_inner())
           .remove(&id);
-        match known {
-          Some(protocol) => {
-            shared
-              .clients_for(protocol)
-              .lock()
-              .unwrap_or_else(|e| e.into_inner())
-              .remove(&id);
-          }
-          // Untracked (cannot happen): sweep both maps so no slot leaks.
-          None => {
-            for protocol in [BridgeProtocol::Json, BridgeProtocol::MsgPack] {
-              shared
-                .clients_for(protocol)
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&id);
-            }
-          }
-        }
       }
       Event::Message(id, message) => {
         // Unregistered senders drive nothing: refused origins never
@@ -468,59 +451,56 @@ async fn bridge_pump(hub: EventHub, shared: Arc<Shared>, default_protocol: Bridg
             Some((ack, changed)) => {
               let protocol = shared.protocol_for(id, default_protocol);
               if let Some(responder) = shared
-                .clients_for(protocol)
+                .consumers
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(&id)
+                .map(|consumer| consumer.responder.clone())
               {
-                send_message(responder, &ack, protocol);
+                send_message(&responder, &ack, protocol);
               }
               if let Some(user) = changed {
                 let dispatch = commands::current_user_update(&user);
-                for protocol in [BridgeProtocol::Json, BridgeProtocol::MsgPack] {
-                  let clients = shared.clients_for(protocol);
-                  let mut clients = clients.lock().unwrap_or_else(|e| e.into_inner());
-                  let dead: Vec<ClientId> = clients
-                    .iter()
-                    .filter_map(|(id, responder)| {
-                      (!send_message(responder, &dispatch, protocol)).then_some(*id)
-                    })
-                    .collect();
-                  for id in dead {
-                    tracing::warn!("[bridge] Pruning dead consumer {id}");
-                    clients.remove(&id);
-                    // Paired table: prune both or dead ids pin protocol
-                    // entries forever (same as the broadcast prunes).
-                    shared
-                      .consumer_protocol
-                      .lock()
-                      .unwrap_or_else(|e| e.into_inner())
-                      .remove(&id);
-                  }
+                // One pass over one map, each consumer answered in its own
+                // encoding — the two-map version walked both for a combined
+                // total that equals this single walk.
+                let mut consumers = shared.consumers.lock().unwrap_or_else(|e| e.into_inner());
+                let dead: Vec<ClientId> = consumers
+                  .iter()
+                  .filter_map(|(id, consumer)| {
+                    (!send_message(&consumer.responder, &dispatch, consumer.protocol))
+                      .then_some(*id)
+                  })
+                  .collect();
+                for id in dead {
+                  tracing::warn!("[bridge] Pruning dead consumer {id}");
+                  consumers.remove(&id);
                 }
               }
             }
             None => {
-              let protocol = shared.protocol_for(id, default_protocol);
-              if let Some(responder) = shared
-                .clients_for(protocol)
+              // Echo anything that is not bridge control straight back to
+              // the sender, in its own encoding.
+              if let Some(consumer) = shared
+                .consumers
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(&id)
+                .cloned()
               {
-                let _ = responder.try_send(Message::Text(text));
+                let _ = consumer.responder.try_send(Message::Text(text.clone()));
               }
             }
           },
           other => {
-            let protocol = shared.protocol_for(id, default_protocol);
-            if let Some(responder) = shared
-              .clients_for(protocol)
+            if let Some(consumer) = shared
+              .consumers
               .lock()
               .unwrap_or_else(|e| e.into_inner())
               .get(&id)
+              .cloned()
             {
-              let _ = responder.try_send(other);
+              let _ = consumer.responder.try_send(other);
             }
           }
         }
@@ -561,15 +541,21 @@ impl Shared {
   /// Assemble the resource census from live state: client counts, input
   /// queue depths and self-RSS. Short guards only, never `.await`.
   fn census_snapshot(&self) -> rsrpc_telemetry::StatsSnapshot {
-    let json_clients = self.json_clients.lock().unwrap_or_else(|e| e.into_inner());
-    let msgpack_clients = self
-      .msgpack_clients
-      .lock()
-      .unwrap_or_else(|e| e.into_inner());
+    // Counted by encoding in one pass over one map.
+    let consumers = self.consumers.lock().unwrap_or_else(|e| e.into_inner());
+    let mut json_clients = 0usize;
+    let mut msgpack_clients = 0usize;
+    for consumer in consumers.values() {
+      match consumer.protocol {
+        BridgeProtocol::Json => json_clients += 1,
+        BridgeProtocol::MsgPack => msgpack_clients += 1,
+      }
+    }
+    drop(consumers);
     rsrpc_telemetry::StatsSnapshot {
       rss_bytes: rsrpc_telemetry::rss_bytes(),
-      bridge_json: json_clients.len(),
-      bridge_msgpack: msgpack_clients.len(),
+      bridge_json: json_clients,
+      bridge_msgpack: msgpack_clients,
       ws: self
         .game_clients
         .as_ref()
@@ -877,9 +863,7 @@ mod tests {
   #[test]
   fn registration_means_protocol_table_presence() {
     let shared = Shared {
-      json_clients: Mutex::new(FxHashMap::default()),
-      msgpack_clients: Mutex::new(FxHashMap::default()),
-      consumer_protocol: Mutex::new(FxHashMap::default()),
+      consumers: Mutex::new(FxHashMap::default()),
       cache: Mutex::new(HashMap::new()),
       activity_seq: Mutex::new(0),
       last_process: Mutex::new(HashMap::new()),
@@ -901,13 +885,27 @@ mod tests {
       allowed_origins: Vec::new(),
     };
     assert!(!shared.is_registered(7));
-    shared
-      .consumer_protocol
-      .lock()
-      .unwrap()
-      .insert(7, BridgeProtocol::Json);
+    // A responder over a dropped receiver: registration is presence in the
+    // one consumer map, so an unknown id answers false even if a frame for
+    // it ever arrives (the `is_registered` gate in the message pump).
+    shared.consumers.lock().unwrap().insert(
+      7,
+      Consumer {
+        responder: rsrpc_ws::Responder::for_test(),
+        protocol: BridgeProtocol::Json,
+      },
+    );
     assert!(shared.is_registered(7));
     assert!(!shared.is_registered(8));
+    // Protocol resolution reads the same map.
+    assert_eq!(
+      shared.protocol_for(7, BridgeProtocol::MsgPack),
+      BridgeProtocol::Json
+    );
+    assert_eq!(
+      shared.protocol_for(8, BridgeProtocol::MsgPack),
+      BridgeProtocol::MsgPack
+    );
   }
 
   /// Publishing past the replay bound keeps the cache within it: steady
@@ -917,9 +915,7 @@ mod tests {
   #[test]
   fn broadcast_keeps_replay_cache_bounded() {
     let shared = Shared {
-      json_clients: Mutex::new(FxHashMap::default()),
-      msgpack_clients: Mutex::new(FxHashMap::default()),
-      consumer_protocol: Mutex::new(FxHashMap::default()),
+      consumers: Mutex::new(FxHashMap::default()),
       cache: Mutex::new(HashMap::new()),
       activity_seq: Mutex::new(0),
       last_process: Mutex::new(HashMap::new()),

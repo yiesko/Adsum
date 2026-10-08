@@ -10,6 +10,11 @@ repository.workspace = true
 keywords = ["websocket", "server", "async"]
 categories = ["network-programming", "asynchronous"]
 
+[features]
+# Test-only helpers, notably `Responder::for_test`. Off by default: nothing
+# in production needs a responder with no connection behind it.
+test-util = []
+
 [lints]
 workspace = true
 

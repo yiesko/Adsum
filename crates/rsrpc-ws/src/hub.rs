@@ -91,6 +91,30 @@ pub struct Responder {
 
 impl Responder {
   /// Handle for one accepted connection (crate-internal: hubs hand these out on `Connect`).
+  ///
+  /// Test-only responder: one whose outbox leads nowhere.
+  ///
+  /// Sibling crates need to put a responder into a consumer map to exercise
+  /// registration and fan-out without binding a socket. The receiver is
+  /// dropped, so `try_send` reports `Closed` rather than queuing — which is
+  /// exactly the "dead consumer" the fan-out prunes. Never used in
+  /// production; the hub is the only real source.
+  #[cfg(feature = "test-util")]
+  #[doc(hidden)]
+  pub fn for_test() -> Self {
+    // The channel's type is inferred from `tx`'s field, so `Cmd` never
+    // appears in this signature and stays private.
+    let (tx, _rx) = mpsc::channel(1);
+    Self {
+      tx,
+      id: 0,
+      details: Arc::new(ConnectionDetails {
+        peer: "127.0.0.1:1".parse().unwrap(),
+        headers: Arc::new(HeaderMap::new()),
+        uri: Arc::from("/"),
+      }),
+    }
+  }
   pub(crate) fn new(tx: mpsc::Sender<Cmd>, id: ClientId, details: Arc<ConnectionDetails>) -> Self {
     Self { tx, id, details }
   }

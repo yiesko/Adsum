@@ -76,6 +76,22 @@ pub(crate) fn send_cached(
   }
 }
 
+/// One registered consumer: its responder plus the encoding it speaks.
+///
+/// These three facts used to live in three maps keyed by the same id, so
+/// every message took three locks to answer "who is this and what do they
+/// speak", and a prune had to touch two more maps or leave protocol entries
+/// pinned forever. One map means one lock.
+#[derive(Clone, Debug)]
+pub(crate) struct Consumer {
+  pub(crate) responder: Responder,
+  pub(crate) protocol: BridgeProtocol,
+}
+
+/// Locked view of the consumer map: one guard for everything a message
+/// needs.
+pub(crate) type ConsumerMap = Mutex<FxHashMap<ClientId, Consumer>>;
+
 impl Shared {
   /// Whether this id completed a Connect registration. Refused origins
   /// are closed without registering, but a pipelined frame can still
@@ -83,33 +99,22 @@ impl Shared {
   /// so control paths must check this instead of trusting arrival order.
   pub(crate) fn is_registered(&self, id: ClientId) -> bool {
     self
-      .consumer_protocol
+      .consumers
       .lock()
       .unwrap_or_else(|e| e.into_inner())
       .contains_key(&id)
   }
 
-  /// Client map for one bridge encoding.
-  pub(crate) fn clients_for(
-    &self,
-    protocol: BridgeProtocol,
-  ) -> &Mutex<FxHashMap<ClientId, Responder>> {
-    match protocol {
-      BridgeProtocol::Json => &self.json_clients,
-      BridgeProtocol::MsgPack => &self.msgpack_clients,
-    }
-  }
-
   /// Encoding a consumer speaks: the resolved `format=` override recorded
   /// at connect, falling back to the port default for unknown ids (which
-  /// cannot happen: every insert is paired with a table entry).
+  /// cannot happen: every insert is paired with an entry).
   pub(crate) fn protocol_for(&self, id: ClientId, default: BridgeProtocol) -> BridgeProtocol {
     self
-      .consumer_protocol
+      .consumers
       .lock()
       .unwrap_or_else(|e| e.into_inner())
       .get(&id)
-      .copied()
+      .map(|consumer| consumer.protocol)
       .unwrap_or(default)
   }
 
@@ -135,42 +140,30 @@ impl Shared {
   /// Send one payload to every connected consumer, pruning dead ones so a
   /// stuck client cannot pin memory (its queued frames) forever.
   pub(crate) fn send_to_all(&self, payload: &CachedActivity) {
-    let mut json_clients = self.json_clients.lock().unwrap_or_else(|e| e.into_inner());
-    let mut msgpack_clients = self
-      .msgpack_clients
-      .lock()
-      .unwrap_or_else(|e| e.into_inner());
-    if json_clients.is_empty() && msgpack_clients.is_empty() {
+    let mut consumers = self.consumers.lock().unwrap_or_else(|e| e.into_inner());
+    if consumers.is_empty() {
       tracing::debug!("[bridge] No consumers connected, skipping");
       return;
     }
-    for (clients, payload) in [
-      (&mut json_clients, Message::Text(payload.json.clone())),
-      (
-        &mut msgpack_clients,
-        Message::Binary(payload.msgpack.clone()),
-      ),
-    ] {
-      // try_send never blocks: a full outbox reports Full here and the
-      // slot is released now, not pinned until a lagging Disconnect.
-      let dead: Vec<ClientId> = clients
-        .iter()
-        .filter_map(|(id, responder)| responder.try_send(payload.clone()).err().map(|_| *id))
-        .collect();
-      self
-        .dropped_broadcasts
-        .fetch_add(dead.len() as u64, Ordering::Relaxed);
-      for id in dead {
-        tracing::warn!("[bridge] Pruning dead consumer {id}");
-        clients.remove(&id);
-        // Paired table: every insert writes both, so every prune clears
-        // both — otherwise dead ids pin protocol entries forever.
-        self
-          .consumer_protocol
-          .lock()
-          .unwrap_or_else(|e| e.into_inner())
-          .remove(&id);
-      }
+    // try_send never blocks: a full outbox reports Full here and the slot is
+    // released now, not pinned until a lagging Disconnect. The failed send
+    // is what marks the consumer dead.
+    let dead: Vec<ClientId> = consumers
+      .iter()
+      .filter_map(|(id, consumer)| {
+        let message = match consumer.protocol {
+          BridgeProtocol::Json => Message::Text(payload.json.clone()),
+          BridgeProtocol::MsgPack => Message::Binary(payload.msgpack.clone()),
+        };
+        consumer.responder.try_send(message).err().map(|_| *id)
+      })
+      .collect();
+    self
+      .dropped_broadcasts
+      .fetch_add(dead.len() as u64, Ordering::Relaxed);
+    for id in dead {
+      tracing::warn!("[bridge] Pruning dead consumer {id}");
+      consumers.remove(&id);
     }
   }
 
@@ -181,18 +174,21 @@ impl Shared {
   /// payload, so the per-consumer clone is an O(1) refcount bump instead of
   /// a deep copy of the whole frame (`mem-zero-copy`).
   pub(crate) fn broadcast_raw(&self, cmd: &ActivityCmd) {
-    let mut json_clients = self.json_clients.lock().unwrap_or_else(|e| e.into_inner());
-    let mut msgpack_clients = self
-      .msgpack_clients
-      .lock()
-      .unwrap_or_else(|e| e.into_inner());
-    if json_clients.is_empty() && msgpack_clients.is_empty() {
+    let mut consumers = self.consumers.lock().unwrap_or_else(|e| e.into_inner());
+    if consumers.is_empty() {
       tracing::debug!("[bridge] No consumers connected, skipping");
       return;
     }
-    let json_payload: Option<TextBytes> = if json_clients.is_empty() {
-      None
-    } else {
+    // Serialized once per encoding, and only when a consumer actually
+    // speaks it: the check is "does anyone speak this" rather than "is this
+    // map empty", which is what one map makes natural.
+    let wants_json = consumers
+      .values()
+      .any(|c| c.protocol == BridgeProtocol::Json);
+    let wants_msgpack = consumers
+      .values()
+      .any(|c| c.protocol == BridgeProtocol::MsgPack);
+    let json_payload: Option<TextBytes> = if wants_json {
       match serde_json::to_string(cmd) {
         Ok(payload) => Some(TextBytes::from(payload)),
         Err(err) => {
@@ -200,10 +196,10 @@ impl Shared {
           None
         }
       }
-    };
-    let msgpack_payload: Option<Bytes> = if msgpack_clients.is_empty() {
-      None
     } else {
+      None
+    };
+    let msgpack_payload: Option<Bytes> = if wants_msgpack {
       match rmp_serde::to_vec_named(cmd) {
         Ok(payload) => Some(Bytes::from(payload)),
         Err(err) => {
@@ -211,13 +207,24 @@ impl Shared {
           None
         }
       }
+    } else {
+      None
     };
-    if let Some(payload) = json_payload {
-      let dead: Vec<ClientId> = json_clients
+    for (protocol, payload) in [
+      (BridgeProtocol::Json, json_payload.map(Message::Text)),
+      (
+        BridgeProtocol::MsgPack,
+        msgpack_payload.map(Message::Binary),
+      ),
+    ] {
+      let Some(payload) = payload else { continue };
+      let dead: Vec<ClientId> = consumers
         .iter()
-        .filter_map(|(id, responder)| {
-          responder
-            .try_send(Message::Text(payload.clone()))
+        .filter(|(_, consumer)| consumer.protocol == protocol)
+        .filter_map(|(id, consumer)| {
+          consumer
+            .responder
+            .try_send(payload.clone())
             .err()
             .map(|_| *id)
         })
@@ -227,39 +234,7 @@ impl Shared {
         .fetch_add(dead.len() as u64, Ordering::Relaxed);
       for id in dead {
         tracing::warn!("[bridge] Pruning dead consumer {id}");
-        json_clients.remove(&id);
-        // Paired table (see `send_to_all`): prune both or dead ids pin
-        // protocol entries forever.
-        self
-          .consumer_protocol
-          .lock()
-          .unwrap_or_else(|e| e.into_inner())
-          .remove(&id);
-      }
-    }
-    if let Some(payload) = msgpack_payload {
-      let dead: Vec<ClientId> = msgpack_clients
-        .iter()
-        .filter_map(|(id, responder)| {
-          responder
-            .try_send(Message::Binary(payload.clone()))
-            .err()
-            .map(|_| *id)
-        })
-        .collect();
-      self
-        .dropped_broadcasts
-        .fetch_add(dead.len() as u64, Ordering::Relaxed);
-      for id in dead {
-        tracing::warn!("[bridge] Pruning dead consumer {id}");
-        msgpack_clients.remove(&id);
-        // Paired table (see `send_to_all`): prune both or dead ids pin
-        // protocol entries forever.
-        self
-          .consumer_protocol
-          .lock()
-          .unwrap_or_else(|e| e.into_inner())
-          .remove(&id);
+        consumers.remove(&id);
       }
     }
   }

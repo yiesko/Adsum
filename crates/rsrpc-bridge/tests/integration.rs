@@ -750,3 +750,43 @@ async fn refused_origin_pipelined_set_user_changes_nothing() {
   }
   fx.bridge.shutdown().await;
 }
+
+/// Consumers that keep reading survive round after round of fan-out.
+///
+/// A live consumer must never be pruned: the send succeeded, so the
+/// dead-detection must key on the *failed* send. Collecting on success
+/// instead passes the "no consumers" early return and every existing test
+/// that checks delivery, and only shows up as an empty consumer map after
+/// the first broadcast — which is what this pins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn healthy_consumers_survive_repeated_broadcasts() {
+  let fx = fixture().await;
+  let mut json = connect(fx.json_port, "?format=json").await;
+  let mut pack = connect(fx.msgpack_port, "?format=msgpack").await;
+  assert_eq!(read_json(&mut json).await["evt"], "READY");
+  assert_eq!(read_msgpack(&mut pack).await["evt"], "READY");
+
+  // Several distinct publishes, each drained as it arrives: every one is a
+  // successful send for both consumers, so neither may be pruned.
+  for i in 0..3u64 {
+    fx.ipc_tx
+      .send(set_activity(500 + i, &format!("Round {i}")))
+      .await
+      .unwrap();
+    let got = read_json(&mut json).await;
+    assert_eq!(got["activity"]["name"], format!("Round {i}"));
+    let got_pack = read_msgpack(&mut pack).await;
+    assert_eq!(got_pack["activity"]["name"], format!("Round {i}"));
+  }
+
+  // Still registered after all that traffic (a pruned consumer's next
+  // publish would time out here).
+  fx.ipc_tx
+    .send(set_activity(900, "Still alive"))
+    .await
+    .unwrap();
+  let got = read_json(&mut json).await;
+  assert_eq!(got["activity"]["name"], "Still alive");
+
+  fx.bridge.shutdown().await;
+}
