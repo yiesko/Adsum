@@ -157,14 +157,22 @@ impl Bridge {
       ));
     }
 
-    let (json_server, json_hub, json_port) =
-      bind_range(config.json_port_start, config.json_port_end, None, "json").await?;
+    let bounds = config.server_bounds();
+    let (json_server, json_hub, json_port) = bind_range(
+      config.json_port_start,
+      config.json_port_end,
+      None,
+      "json",
+      bounds,
+    )
+    .await?;
     let skip = (config.msgpack_port_start == json_port).then_some(json_port);
     let (msgpack_server, msgpack_hub, msgpack_port) = bind_range(
       config.msgpack_port_start,
       config.msgpack_port_end,
       skip,
       "msgpack",
+      bounds,
     )
     .await?;
 
@@ -333,16 +341,19 @@ async fn bind_range(
   end: u16,
   skip: Option<u16>,
   name: &'static str,
+  bounds: crate::config::ServerBounds,
 ) -> Result<(rsrpc_ws::Server, EventHub, u16)> {
   let end = end.max(start);
   for port in start..=end {
     if Some(port) == skip {
       continue;
     }
-    let ws_config =
-      rsrpc_ws::ServerConfig::builder(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
-        .build()
-        .map_err(|_| RsrpcError::InvalidConfig("bridge server bounds must be non-zero"))?;
+    let ws_config = bounds
+      .apply(rsrpc_ws::ServerConfig::builder(std::net::SocketAddr::from(
+        ([127, 0, 0, 1], port),
+      )))
+      .build()
+      .map_err(|_| RsrpcError::InvalidConfig("bridge server bounds must be non-zero"))?;
     match rsrpc_ws::Server::bind(ws_config).await {
       Ok((server, hub)) => {
         let actual = server.local_addr().port();
