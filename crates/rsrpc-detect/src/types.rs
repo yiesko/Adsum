@@ -150,9 +150,13 @@ impl OsName {
 pub struct ScannedEntry {
   pub id: Box<str>,
   pub name: Box<str>,
-  pub executables: Vec<ScannedExe>,
-  pub steam_ids: Vec<Box<str>>,
-  pub aliases: Vec<Box<str>>,
+  /// Boxed slices, not `Vec`: the generation is built once and then never
+  /// grows, shrinks or mutates these. `Box<[T]>` drops the excess capacity
+  /// a `Vec` may carry and shrinks each field by a pointer on 64-bit,
+  /// which matters across ~24k entries.
+  pub executables: Box<[ScannedExe]>,
+  pub steam_ids: Box<[Box<str>]>,
+  pub aliases: Box<[Box<str>]>,
 }
 
 impl ScannedEntry {
@@ -175,7 +179,8 @@ impl ScannedEntry {
               is_launcher: exe.is_launcher,
               arguments: exe.arguments.clone(),
             })
-            .collect()
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
         })
         .unwrap_or_default(),
       steam_ids: activity
@@ -188,7 +193,8 @@ impl ScannedEntry {
             .filter_map(|sku| sku.id.clone())
             .filter(|id| !id.is_empty())
             .map(|id| id.into_boxed_str())
-            .collect()
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
         })
         .unwrap_or_default(),
       aliases: activity
@@ -197,7 +203,8 @@ impl ScannedEntry {
         .unwrap_or_default()
         .into_iter()
         .map(|alias| alias.into_boxed_str())
-        .collect(),
+        .collect::<Vec<_>>()
+        .into_boxed_slice(),
     }
   }
 
@@ -218,7 +225,8 @@ impl ScannedEntry {
           is_launcher: exe.is_launcher,
           arguments: exe.arguments,
         })
-        .collect(),
+        .collect::<Vec<_>>()
+        .into_boxed_slice(),
       steam_ids: activity
         .third_party_skus
         .unwrap_or_default()
@@ -227,13 +235,15 @@ impl ScannedEntry {
         .filter_map(|sku| sku.id)
         .filter(|id| !id.is_empty())
         .map(|id| id.into_boxed_str())
-        .collect(),
+        .collect::<Vec<_>>()
+        .into_boxed_slice(),
       aliases: activity
         .aliases
         .unwrap_or_default()
         .into_iter()
         .map(|alias| alias.into_boxed_str())
-        .collect(),
+        .collect::<Vec<_>>()
+        .into_boxed_slice(),
     }
   }
 }
@@ -315,7 +325,8 @@ pub fn epoch_ms() -> u64 {
     .unwrap_or(0)
 }
 
-const _: () = assert!(std::mem::size_of::<ScannedEntry>() <= 104);
+// 3 x Vec (24 B) became 3 x Box<[T]> (16 B): 24 B off per entry.
+const _: () = assert!(std::mem::size_of::<ScannedEntry>() <= 80);
 
 const _: () = assert!(std::mem::size_of::<ScannedExe>() <= 72);
 

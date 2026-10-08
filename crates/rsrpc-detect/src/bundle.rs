@@ -494,8 +494,8 @@ mod tests {
           arguments: None,
         })
         .collect(),
-      steam_ids: Vec::new(),
-      aliases: Vec::new(),
+      steam_ids: Box::new([]),
+      aliases: Box::new([]),
     })
   }
 
@@ -541,14 +541,14 @@ mod tests {
     Arc::new(ScannedEntry {
       id: id.into(),
       name: id.into(),
-      executables: vec![ScannedExe {
+      executables: Box::new([ScannedExe {
         name: "setup.exe".into(),
         os: OsName::Win32,
         is_launcher: true,
         arguments: None,
-      }],
-      steam_ids: Vec::new(),
-      aliases: Vec::new(),
+      }]),
+      steam_ids: Box::new([]),
+      aliases: Box::new([]),
     })
   }
 

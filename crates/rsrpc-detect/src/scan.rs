@@ -1106,9 +1106,9 @@ mod tick2_tests {
     let entry = Arc::new(ScannedEntry {
       id: "12345".into(),
       name: "Source Game".into(),
-      executables: Vec::new(),
-      steam_ids: vec!["12345".into()],
-      aliases: Vec::new(),
+      executables: Box::new([]),
+      steam_ids: Box::new(["12345".into()]),
+      aliases: Box::new([]),
     });
     let steam_map = SortedIndex::build(vec![("12345".into(), 0)]);
     let hit = match_steam_id(
@@ -1133,9 +1133,9 @@ mod tick2_tests {
     let entry = Arc::new(ScannedEntry {
       id: "12345".into(),
       name: "Source Game".into(),
-      executables: Vec::new(),
-      steam_ids: Vec::new(),
-      aliases: Vec::new(),
+      executables: Box::new([]),
+      steam_ids: Box::new([]),
+      aliases: Box::new([]),
     });
     let name_map = SortedIndex::build(vec![("source game".into(), 0)]);
     let empty = SortedIndex::build(Vec::new());
@@ -1177,9 +1177,9 @@ mod tick2_tests {
     let entry = Arc::new(ScannedEntry {
       id: "999".into(),
       name: "Custom Game".into(),
-      executables: Vec::new(),
-      steam_ids: vec!["999".into()],
-      aliases: Vec::new(),
+      executables: Box::new([]),
+      steam_ids: Box::new(["999".into()]),
+      aliases: Box::new([]),
     });
     let empty_map = SortedIndex::build(Vec::new());
     let hit = match_steam_id(
@@ -1226,9 +1226,9 @@ mod first_sightings_tests {
       entry: Arc::new(ScannedEntry {
         id: id.into(),
         name: "Game".into(),
-        executables: Vec::new(),
-        steam_ids: Vec::new(),
-        aliases: Vec::new(),
+        executables: Box::new([]),
+        steam_ids: Box::new([]),
+        aliases: Box::new([]),
       }),
       pid: 1,
       start: 0,
