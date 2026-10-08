@@ -158,6 +158,7 @@ fn format_resource_stats_mentions_reason_and_fields() {
     watch_depth: 3,
     proc_depth: 4,
     ws_depth: 5,
+    shed_watch: 0,
   };
   let line = format_resource_stats("hourly", &snapshot);
   assert!(line.contains("hourly"), "reason missing: {line}");
@@ -171,6 +172,31 @@ fn format_resource_stats_mentions_reason_and_fields() {
   assert!(line.contains("watch:3"), "watch depth missing: {line}");
   assert!(line.contains("proc:4"), "proc depth missing: {line}");
   assert!(line.contains("ws:5"), "ws depth missing: {line}");
+}
+
+/// N23: the census reports how many proc-events the bounded watch queue
+/// shed. Before, `dropped_total()` was written by every capacity-checked
+/// shed and read by nobody in production — bursts past
+/// `MAX_WATCH_BACKLOG` (1024) were invisible, so a scanner under pressure
+/// looked identical to an idle one.
+#[test]
+fn census_reports_shed_proc_events() {
+  let snapshot = StatsSnapshot {
+    rss_bytes: Some(41_943_040),
+    bridge_json: 1,
+    bridge_msgpack: 0,
+    ws: 2,
+    watch_depth: 3,
+    proc_depth: 4,
+    ws_depth: 5,
+    shed_watch: 7,
+  };
+  let line = format_resource_stats("hourly", &snapshot);
+  assert!(
+    line.contains("shed:watch:7"),
+    "shed count missing from the census line: {line}"
+  );
+  assert_eq!(snapshot.shed_watch, 7, "the field must round-trip");
 }
 
 /// `recv_timeout` honors the deadline, counts only real receives, and

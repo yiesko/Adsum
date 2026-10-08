@@ -68,6 +68,11 @@ pub struct BridgeInputs {
   /// Live game-client total, maintained by the game transport.
   /// `None` when the game transport is off.
   pub game_clients: Option<Arc<AtomicU64>>,
+  /// Proc-events shed by the bounded watcher backlog since boot, shared
+  /// with the scanner as a refcounted gauge handle: the bridge only reads
+  /// it, the watcher side owns the counter. `None` when the scanner is
+  /// off — the census reports 0.
+  pub watch_shed: Option<Arc<rsrpc_telemetry::QueueGauge>>,
 }
 
 /// Workhorse state shared by every pump (all guards short, never `.await`
@@ -101,6 +106,9 @@ pub(crate) struct Shared {
   pub(crate) proc_tx: Option<mpsc::Sender<ProcInput>>,
   /// Live game-client total from the game transport.
   pub(crate) game_clients: Option<Arc<AtomicU64>>,
+  /// Proc-events shed by the bounded watcher backlog (read-only here:
+  /// the scanner side owns the counter).
+  pub(crate) watch_shed: Option<Arc<rsrpc_telemetry::QueueGauge>>,
   /// Extra browser origins allowed to drive commands (see `origin`).
   pub(crate) allowed_origins: Vec<String>,
 }
@@ -208,6 +216,7 @@ impl Bridge {
       game_tx: inputs.game_tx,
       proc_tx: inputs.proc_tx,
       game_clients: inputs.game_clients,
+      watch_shed: inputs.watch_shed,
       allowed_origins: config.allowed_origins.clone(),
     });
 
@@ -566,6 +575,10 @@ impl Shared {
       watch_depth: channel_depth(self.proc_tx.as_ref()),
       proc_depth: channel_depth(self.ipc_tx.as_ref()),
       ws_depth: channel_depth(self.game_tx.as_ref()),
+      shed_watch: self
+        .watch_shed
+        .as_ref()
+        .map_or(0, |gauge| gauge.dropped_total()),
     }
   }
 
@@ -882,6 +895,7 @@ mod tests {
       game_tx: None,
       proc_tx: None,
       game_clients: None,
+      watch_shed: None,
       allowed_origins: Vec::new(),
     };
     assert!(!shared.is_registered(7));
@@ -934,6 +948,7 @@ mod tests {
       game_tx: None,
       proc_tx: None,
       game_clients: None,
+      watch_shed: None,
       allowed_origins: Vec::new(),
     };
     for i in 0..(crate::config::MAX_CACHED_ACTIVITIES * 2) {

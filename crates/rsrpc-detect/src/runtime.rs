@@ -19,10 +19,6 @@ use super::scan::{ScanScratch, apply_ignore_list, first_sightings};
 use super::scan::read_exec_into;
 use super::server::{ProcessServer, allocator_numbers, release_parse_arenas};
 use super::types::{Exec, ProcessDetectedEvent, ScannedHit, epoch_ms};
-// Linux-only (`spawn_proc_watcher` return type); the other use below is
-// fully qualified.
-#[cfg(target_os = "linux")]
-use rsrpc_telemetry::QueueGauge;
 
 /// Re-entrancy guard for [`ProcessServer::scan_for_processes`]: acquired
 /// atomically, released on drop (all exit paths, panics included).
@@ -255,19 +251,17 @@ pub(crate) fn exec_hit_ignored(ignored_ids: &HashSet<String>, hit: &ScannedHit) 
   ignored_ids.contains(hit.entry.id.as_ref())
 }
 
-/// Spawn the netlink dispatch (Linux): EXEC classifies one process and
-/// emits hits at once; EXIT of a tracked game unparks the scan loop for
-/// an immediate natural clear. Setup failure (or a dead receiver on
-/// shutdown) ends the thread quietly — polling carries on.
-/// Spawn the netlink watcher + dispatch threads. Returns the shared watch
-/// backlog gauge so the resource census can read it (the pair itself stays
-/// inside: `start` hands the gauge up to the daemon).
+/// Spawn the netlink watcher + dispatch threads. Returns the watcher's
+/// backlog gauge so the caller can store it where the census reads depth
+/// and shed totals (see `ProcessServer::watch_gauge`).
 #[cfg(target_os = "linux")]
-fn spawn_proc_watcher(server: &ProcessServer) -> QueueGauge {
+fn spawn_proc_watcher(server: &ProcessServer) -> rsrpc_telemetry::QueueGauge {
   use rsrpc_proc_events::{ProcEvent, watch};
   use rsrpc_telemetry::QueueGauge;
 
   let (tx, rx) = QueueGauge::pair();
+  // Read the gauge before the sender moves into the watcher thread: it is
+  // a refcounted handle, so this clone still sees every shed.
   let gauge = tx.gauge();
   let dispatch = server.clone();
   spawn_worker(
@@ -445,16 +439,11 @@ fn spawn_proc_watcher(server: &ProcessServer) -> QueueGauge {
 }
 
 impl ProcessServer {
-  /// Start scan/refresh/watch threads. `watch_slot` receives the watch
-  /// backlog gauge once the watcher spawns (stays detached when the
-  /// watcher is disabled/unsupported, or on duplicate start).
-  pub fn start(
-    &self,
-    scan_interval: Duration,
-    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] watch_slot: &Arc<
-      Mutex<rsrpc_telemetry::QueueGauge>,
-    >,
-  ) {
+  /// Start scan/refresh threads.
+  ///
+  /// The watcher's gauge is stored on the server, where the census reads
+  /// depth and shed totals through [`ProcessServer::watch_gauge`].
+  pub fn start(&self, scan_interval: Duration) {
     // Double-start is a caller bug: ignore fail-safe instead of leaking
     // a second scan/dispatch/watch generation.
     if self.started.swap(true, std::sync::atomic::Ordering::AcqRel) {
@@ -842,13 +831,16 @@ impl ProcessServer {
 
     // Event-driven fast path (Linux): EXEC classifies one process at once,
     // EXIT of a tracked game wakes the scan above. Best-effort — setup
-    // failure keeps pure polling, silently.
+    // failure keeps pure polling, silently. The watcher's gauge stays
+    // inside: the census reads it directly, so nothing is plumbed up.
     #[cfg(target_os = "linux")]
     if self.enable_proc_events {
+      // Stored, not returned: the census reads it straight off the server.
       let gauge = spawn_proc_watcher(self);
-      *watch_slot
+      *self
+        .watch_gauge
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = gauge;
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(gauge);
     } else {
       tracing::info!(
         "[Process Scanner] proc-events watcher disabled by configuration, polling only"

@@ -211,10 +211,15 @@ impl Daemon {
     // failures included — tears the scanner down: `serve` owns the bind
     // flow, teardown always runs here.
     let mut cancel_guard = CancelGuard::disarmed();
+    // Gauge handle for the bridge census: the watcher's live shed
+    // counter, read-only on the bridge side.
+    let scanner_gauge = scanner.as_ref().and_then(ProcessServer::watch_gauge);
     if let Some(server) = scanner.as_ref() {
       cancel_guard.arm(server);
     }
-    let result = self.serve(proc_rx, proc_tx, user, shutdown).await;
+    let result = self
+      .serve(proc_rx, proc_tx, scanner_gauge, user, shutdown)
+      .await;
     Self::teardown_scanner(scanner, pump).await;
     cancel_guard.disarm();
     result
@@ -228,6 +233,7 @@ impl Daemon {
     &self,
     proc_rx: mpsc::Receiver<ProcInput>,
     proc_tx: Option<mpsc::Sender<ProcInput>>,
+    watch_gauge: Option<rsrpc_telemetry::QueueGauge>,
     user: Arc<Mutex<RpcUser>>,
     shutdown: impl Future<Output = ()> + Send + 'static,
   ) -> Result<()> {
@@ -279,6 +285,10 @@ impl Daemon {
         game_clients: game_transport
           .as_ref()
           .map(|transport| transport.client_total()),
+        // The watcher's own gauge, shared as a refcounted handle so the
+        // census reads the live shed counter. `None` without a scanner —
+        // no watcher can shed, and the census reports 0.
+        watch_shed: watch_gauge.map(Arc::new),
       },
     )
     .await?;
@@ -390,10 +400,9 @@ impl Daemon {
     })
     .await
     .expect("[bug] scanner build panicked");
-    // Watch-slot gauge fed the old census; retained for the start() shape
-    // until telemetry moves into the core.
-    let watch_slot = Arc::new(Mutex::new(QueueGauge::new()));
-    server.start(scan_interval, &watch_slot);
+    // The watcher's gauge is read directly from the census, so no slot
+    // is plumbed up to the daemon (see `ProcessServer::start`).
+    server.start(scan_interval);
     // Pump: scanner events into the async world. `blocking_send` parks
     // this thread (not a worker) under backpressure, like the legacy
     // bounded queue; a closed channel means shutdown — exit quietly.

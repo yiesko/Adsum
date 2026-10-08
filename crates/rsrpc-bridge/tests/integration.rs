@@ -45,6 +45,7 @@ async fn fixture() -> Fixture {
       game_tx: None,
       proc_tx: None,
       game_clients: None,
+      watch_shed: None,
     },
   )
   .await
@@ -316,6 +317,7 @@ async fn shutdown_removes_state_file() {
       game_tx: None,
       proc_tx: None,
       game_clients: None,
+      watch_shed: None,
     },
   )
   .await
@@ -703,6 +705,7 @@ async fn configured_extra_origin_is_allowed() {
       game_tx: None,
       proc_tx: None,
       game_clients: None,
+      watch_shed: None,
     },
   )
   .await

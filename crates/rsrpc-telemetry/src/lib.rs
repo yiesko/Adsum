@@ -331,13 +331,19 @@ pub struct StatsSnapshot {
   pub proc_depth: usize,
   /// Game-event queue depth.
   pub ws_depth: usize,
+  /// Proc-events the bounded watch queue shed since boot. Diagnostic
+  /// counterpart to `watch_depth`: depth says how deep the backlog is,
+  /// this says how much was dropped — a non-zero value means the watcher
+  /// fell behind, which depth alone can hide (the queue recovers to a
+  /// steady depth while events are silently lost).
+  pub shed_watch: usize,
 }
 
 /// Render the census line. Pure function so tests pin the shape.
 #[must_use]
 pub fn format_resource_stats(reason: &str, snapshot: &StatsSnapshot) -> String {
   format!(
-    "[rsrpc] stats ({reason}): rss={} bridge=json:{}+msgpack:{} ws={} queues=watch:{}+proc:{}+ws:{}",
+    "[rsrpc] stats ({reason}): rss={} bridge=json:{}+msgpack:{} ws={} queues=watch:{}+proc:{}+ws:{} shed:watch:{}",
     snapshot.rss_mb(),
     snapshot.bridge_json,
     snapshot.bridge_msgpack,
@@ -345,6 +351,7 @@ pub fn format_resource_stats(reason: &str, snapshot: &StatsSnapshot) -> String {
     snapshot.watch_depth,
     snapshot.proc_depth,
     snapshot.ws_depth,
+    snapshot.shed_watch,
   )
 }
 
