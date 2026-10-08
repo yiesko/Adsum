@@ -16,7 +16,7 @@ pub mod server;
 pub use config::{ServerConfig, ServerConfigBuilder};
 pub use error::{Error, SendError, TrySendError};
 pub use hub::{CloseCode, ConnectionDetails, DisconnectReason, Event, EventHub, Responder};
-pub use message::Message;
+pub use message::{Message, TextBytes};
 pub use server::{MAX_PENDING_REJECTS, Server};
 
 /// Opaque client identifier, unique within the process lifetime.

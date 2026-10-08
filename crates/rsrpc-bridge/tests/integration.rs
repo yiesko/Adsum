@@ -487,6 +487,42 @@ async fn raw_broadcast_counts_dead_consumers() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+/// A raw broadcast is serialized once and served to every consumer on both
+/// encodings: sharing the refcounted payload must not drop, duplicate or
+/// corrupt a frame for anyone (the pre-fix code deep-copied the payload
+/// per consumer, which this pins as an equality contract).
+async fn raw_broadcast_reaches_every_consumer_identically() {
+  let fx = fixture().await;
+  let mut json_a = connect(fx.json_port, "?format=json").await;
+  let mut json_b = connect(fx.json_port, "?format=json").await;
+  let mut pack = connect(fx.msgpack_port, "?format=msgpack").await;
+  assert_eq!(read_json(&mut json_a).await["evt"], "READY");
+  assert_eq!(read_json(&mut json_b).await["evt"], "READY");
+  assert_eq!(read_msgpack(&mut pack).await["evt"], "READY");
+
+  let deep_link: rsrpc_types::cmd::ActivityCmd = serde_json::from_value(serde_json::json!({
+    "cmd": "DEEP_LINK",
+    "nonce": "shared-frame",
+    "data": { "nonce": "shared-frame" },
+  }))
+  .unwrap();
+  fx.game_tx.send(deep_link).await.unwrap();
+
+  let a = read_json(&mut json_a).await;
+  let b = read_json(&mut json_b).await;
+  let m = read_msgpack(&mut pack).await;
+
+  assert_eq!(a["cmd"], "DEEP_LINK");
+  assert_eq!(a, b, "both JSON consumers must see the identical frame");
+  assert_eq!(
+    a["data"], m["data"],
+    "msgpack consumer must see the same payload"
+  );
+
+  fx.bridge.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 /// The census line reports live consumers, queues and RSS.
 async fn census_line_reports_live_counts() {
   let fx = fixture().await;

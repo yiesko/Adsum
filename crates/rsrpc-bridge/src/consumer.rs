@@ -9,10 +9,11 @@
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
+use bytes::Bytes;
 use rsrpc_protocol::commands::CachedActivity;
 use rsrpc_protocol::query::query_params;
 use rsrpc_types::cmd::ActivityCmd;
-use rsrpc_ws::{ClientId, Message, Responder};
+use rsrpc_ws::{ClientId, Message, Responder, TextBytes};
 use rustc_hash::FxHashMap;
 
 use super::bridge::Shared;
@@ -175,6 +176,10 @@ impl Shared {
 
   /// Broadcast a non-activity event as-is, serializing once per encoding.
   /// A frame that cannot encode is dropped loudly (not silently).
+  ///
+  /// Each encoding is serialized exactly once and handed to a refcounted
+  /// payload, so the per-consumer clone is an O(1) refcount bump instead of
+  /// a deep copy of the whole frame (`mem-zero-copy`).
   pub(crate) fn broadcast_raw(&self, cmd: &ActivityCmd) {
     let mut json_clients = self.json_clients.lock().unwrap_or_else(|e| e.into_inner());
     let mut msgpack_clients = self
@@ -185,22 +190,22 @@ impl Shared {
       tracing::debug!("[bridge] No consumers connected, skipping");
       return;
     }
-    let json_payload = if json_clients.is_empty() {
+    let json_payload: Option<TextBytes> = if json_clients.is_empty() {
       None
     } else {
       match serde_json::to_string(cmd) {
-        Ok(payload) => Some(payload),
+        Ok(payload) => Some(TextBytes::from(payload)),
         Err(err) => {
           tracing::debug!("[bridge] Dropping unserializable fan-out frame: {err}");
           None
         }
       }
     };
-    let msgpack_payload = if msgpack_clients.is_empty() {
+    let msgpack_payload: Option<Bytes> = if msgpack_clients.is_empty() {
       None
     } else {
       match rmp_serde::to_vec_named(cmd) {
-        Ok(payload) => Some(payload),
+        Ok(payload) => Some(Bytes::from(payload)),
         Err(err) => {
           tracing::debug!("[bridge] Dropping unserializable fan-out frame: {err}");
           None
@@ -212,7 +217,7 @@ impl Shared {
         .iter()
         .filter_map(|(id, responder)| {
           responder
-            .try_send(Message::Text(payload.clone().into()))
+            .try_send(Message::Text(payload.clone()))
             .err()
             .map(|_| *id)
         })
@@ -237,7 +242,7 @@ impl Shared {
         .iter()
         .filter_map(|(id, responder)| {
           responder
-            .try_send(Message::Binary(bytes::Bytes::from(payload.clone())))
+            .try_send(Message::Binary(payload.clone()))
             .err()
             .map(|_| *id)
         })
