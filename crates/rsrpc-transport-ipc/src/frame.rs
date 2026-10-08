@@ -437,7 +437,7 @@ fn on_frame(ipc: &mut dyn IpcFacilitator, stream: &mut (impl Read + Write), mess
       }
     }
     "SET_ACTIVITY" => {
-      handle_set_activity(ipc, stream, message, &mut activity_cmd);
+      handle_set_activity(ipc, stream, message, activity_cmd);
     }
     "GET_USER" => {
       // Official response: the user object, or null when the id
@@ -511,7 +511,7 @@ fn handle_set_activity(
   ipc: &mut dyn IpcFacilitator,
   stream: &mut (impl Read + Write),
   raw: &str,
-  activity_cmd: &mut ActivityCmd,
+  mut activity_cmd: ActivityCmd,
 ) {
   let args = match activity_cmd.args {
     Some(ref args) => args,
@@ -542,6 +542,19 @@ fn handle_set_activity(
   activity_cmd.application_id = Some(ipc.client_id());
   let pid = args.pid.unwrap_or_default();
   ipc.set_pid(pid);
+  // Read what the facilitator still needs before the command moves into
+  // the sink: the nonce is remembered for the close-clear echo and patch.
+  let nonce = activity_cmd.nonce.to_string();
+  ipc.set_nonce(nonce);
+
+  // Fix once, up front: the reply echoes the fixed shape and the sink now
+  // receives the very same fixed command. The bridge re-runs `fix()` on
+  // its side anyway (`activity_fingerprint` and `cached_activity` both
+  // call it), so the serialized payload and the fingerprint are identical
+  // to what an unfixed forward would have produced.
+  activity_cmd.fix();
+  let response = commands::set_activity_response(&activity_cmd).unwrap_or_else(|| raw.to_string());
+
   // Refused pids never reach the sink (echo below still flows, so
   // lock-step clients never hang); recording stays limited to forwarded
   // commands, keeping disconnect cleanup complete by construction.
@@ -549,17 +562,15 @@ fn handle_set_activity(
     tracing::debug!("[ipc] Past {MAX_TRACKED_PIDS} tracked pids, refusing pid {pid}");
   } else {
     ipc.note_published_pid(pid);
-    ipc.send_event(activity_cmd.clone());
+    // Moved, not cloned: nothing downstream needs the command again.
+    ipc.send_event(activity_cmd);
   }
-  ipc.set_nonce(activity_cmd.nonce.to_string());
 
   // "IPC will echo back every command you send as a response.
   //  Use this as a lock-step feature to avoid flooding messages.
   //  Can be used to validate messages such as the Presence or Subscribes."
   // Echo the activity back intact (official echo semantics): the
   // lock-step guarantee is the reply itself, not a rewritten body.
-  activity_cmd.fix();
-  let response = commands::set_activity_response(activity_cmd).unwrap_or_else(|| raw.to_string());
   if let Err(err) = stream.write_all(&encode(PacketType::Frame, &response)) {
     tracing::warn!("[ipc] Error sending connection response: {err}");
   }

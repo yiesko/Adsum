@@ -157,6 +157,80 @@ fn handshake_set_activity_close_flow() {
   server.join().expect("server thread");
 }
 
+/// The forwarded command and the echo agree on the *fixed* shape.
+///
+/// `fix_buttons` moves button entries into `metadata.button_urls`; the echo
+/// has always serialized the fixed shape, and the forward now carries the
+/// very same command instead of a pre-fix copy. The bridge re-runs `fix()`
+/// on its side (`activity_fingerprint` and `cached_activity` both call it),
+/// so this is a byte-identical payload either way — the test just makes
+/// the agreement explicit so a future reordering cannot silently split them.
+#[test]
+fn set_activity_forwards_the_fixed_shape() {
+  let (server_stream, mut client) = UnixStream::pair().expect("socketpair");
+  client
+    .set_read_timeout(Some(Duration::from_secs(5)))
+    .expect("timeout");
+  let (sink, mut rx) = EventSink::bounded(16);
+
+  let mut facil = TestFacilitator {
+    handshake: false,
+    client_id: String::new(),
+    pid: 0,
+    nonce: String::new(),
+    sink,
+    published_pids: Vec::new(),
+  };
+  let mut server_stream = server_stream;
+  let server = std::thread::spawn(move || handle_stream(&mut facil, &mut server_stream));
+
+  // Handshake first: the forward stamps the handshake client id.
+  write_frame(
+    &mut client,
+    PacketType::Handshake,
+    r#"{"v":1,"client_id":"test-app"}"#,
+  );
+  let (_, ready) = read_frame(&mut client);
+  assert!(ready.contains("READY"), "expected READY, got: {ready}");
+
+  write_frame(
+    &mut client,
+    PacketType::Frame,
+    r#"{"cmd":"SET_ACTIVITY","args":{"pid":7,"activity":{"name":"G","type":0,"buttons":[{"label":"Docs","url":"https://example.test/docs"}]}},"nonce":"n1"}"#,
+  );
+  let (_, echo) = read_frame(&mut client);
+  let cmd = recv_cmd(&mut rx);
+
+  let urls = cmd
+    .args
+    .as_ref()
+    .and_then(|a| a.activity.as_ref())
+    .and_then(|act| act.metadata.as_ref())
+    .and_then(|m| m.button_urls.as_ref())
+    .expect("forwarded command carries the fixed button_urls");
+  assert_eq!(urls, &vec!["https://example.test/docs".to_string()]);
+  // Same command on both sides, so the echo cannot drift from the payload.
+  assert_eq!(cmd.application_id.as_deref(), Some("test-app"));
+  assert_eq!(cmd.args.as_ref().and_then(|a| a.pid), Some(7));
+  assert!(
+    echo.contains("https://example.test/docs"),
+    "echo carries the same fixed shape: {echo}"
+  );
+
+  // Close clears the published pid.
+  write_frame(&mut client, PacketType::Close, "{}");
+  let clear = recv_cmd(&mut rx);
+  assert!(
+    clear
+      .args
+      .as_ref()
+      .and_then(|a| a.activity.as_ref())
+      .is_none()
+  );
+
+  server.join().expect("server thread");
+}
+
 /// Garbage bytes kill the pump but must still clear the published pid.
 #[test]
 fn invalid_utf8_body_clears_published_pid() {
