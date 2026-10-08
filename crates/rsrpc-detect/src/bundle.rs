@@ -127,7 +127,10 @@ fn pattern_index(activity_index: usize, exe_index: usize) -> PatternIndex {
 /// event) and can only ever observe a self-consistent snapshot; the
 /// writer builds the next generation off-thread and swaps the pointer.
 pub struct DetectablesBundle {
-  pub(crate) list: Vec<Arc<ScannedEntry>>,
+  /// Refcounted, not `Vec`: a rebuild clones this once (an Arc bump) instead
+  /// of bumping every entry's refcount individually — ~24k of them on each
+  /// database refresh or override append.
+  pub(crate) list: Arc<[Arc<ScannedEntry>]>,
   pub(crate) ac: AhoCorasick,
   pub(crate) indexes: Vec<PatternIndex>,
   /// Proton fallback automaton (Linux only): `win32` executables from the
@@ -148,7 +151,7 @@ pub struct DetectablesBundle {
   /// `Q.U.B.E.`), which the exact walk skips as versions. Built by
   /// [`undotted_names`], same canonical-first ties.
   pub(crate) name_map_nodot: SortedIndex,
-  pub(crate) custom: Vec<Arc<ScannedEntry>>,
+  pub(crate) custom: Arc<[Arc<ScannedEntry>]>,
   pub(crate) custom_ac: Option<AhoCorasick>,
   pub(crate) custom_indexes: Vec<PatternIndex>,
 }
@@ -159,7 +162,7 @@ impl DetectablesBundle {
   /// misses everything instead of panicking the daemon.
   fn empty() -> Self {
     Self {
-      list: Vec::new(),
+      list: Arc::from(Vec::new()),
       ac: build_ac_automaton(&[]).expect("[bug] empty automaton always builds"),
       indexes: Vec::new(),
       proton_ac: None,
@@ -167,7 +170,7 @@ impl DetectablesBundle {
       steam_map: SortedIndex::default(),
       name_map: SortedIndex::default(),
       name_map_nodot: SortedIndex::default(),
-      custom: Vec::new(),
+      custom: Arc::from(Vec::new()),
       custom_ac: None,
       custom_indexes: Vec::new(),
     }
@@ -366,8 +369,8 @@ fn build_ac_patterns_allow_all_os(
 /// lands. Callers convert full [`DetectableActivity`] inputs once via
 /// [`ScannedEntry::from_activity`] before calling.
 pub(crate) fn build_bundle(
-  detectable: Vec<Arc<ScannedEntry>>,
-  custom: Vec<Arc<ScannedEntry>>,
+  detectable: Arc<[Arc<ScannedEntry>]>,
+  custom: Arc<[Arc<ScannedEntry>]>,
 ) -> Result<DetectablesBundle, aho_corasick::BuildError> {
   // One walk feeds both automata (see `collect_split_patterns`); each
   // source vector is dropped right after its automaton compiles, so the
@@ -508,7 +511,12 @@ pub(crate) fn initial_bundle(
     .into_iter()
     .map(|entry| Arc::new(ScannedEntry::from_owned(entry)))
     .collect();
-  let bundle = Arc::new(build_bundle(slim(detectable), custom).unwrap_or_else(|e| {
+  // Boxed once, here: everything downstream (the stored bundle plus every
+  // rebuild that carries the main list unchanged) clones a refcount
+  // instead of walking ~24k entries.
+  let detectable: Arc<[Arc<ScannedEntry>]> = slim(detectable).into();
+  let custom: Arc<[Arc<ScannedEntry>]> = custom.into();
+  let bundle = Arc::new(build_bundle(detectable, custom).unwrap_or_else(|e| {
     tracing::warn!(
       "[Process Scanner] Bundled database failed to build ({}), starting blind",
       e
@@ -548,12 +556,12 @@ mod tests {
   #[test]
   fn empty_exe_names_build_no_patterns() {
     let bundle = build_bundle(
-      vec![entry_with_exes(
+      Arc::from(vec![entry_with_exes(
         "1",
         OsName::Empty,
         &["", "\\", ">", "/", "game.exe"],
-      )],
-      vec![],
+      )]),
+      Arc::from(Vec::new()),
     )
     .expect("builds");
     // Only the real exe survives, with its index intact (every name that
@@ -568,8 +576,11 @@ mod tests {
   /// see an unused binding under `-D warnings`.)
   #[test]
   fn proton_builder_ignores_empty_names() {
-    let _bundle =
-      build_bundle(vec![entry_with_exes("1", OsName::Win32, &[""])], vec![]).expect("builds");
+    let _bundle = build_bundle(
+      Arc::from(vec![entry_with_exes("1", OsName::Win32, &[""])]),
+      Arc::from(Vec::new()),
+    )
+    .expect("builds");
     #[cfg(target_os = "linux")]
     assert!(
       _bundle.proton_ac.is_none(),
