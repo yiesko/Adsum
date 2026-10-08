@@ -47,3 +47,48 @@ fn scanned_entry_arrays_are_boxed_not_vec() {
   assert_eq!(entry.steam_ids[0].as_ref(), "42");
   assert_eq!(entry.aliases[0].as_ref(), "Alt");
 }
+
+/// `ScannedExe.arguments` is boxed like the rest of the build-once text:
+/// `Option<String>` is 24 B with a spare capacity field, `Option<Box<str>>`
+/// is 16 B. Only ~15 of the ~11k executables carry arguments, so this is a
+/// per-entry structural saving rather than a heap one.
+#[test]
+fn scanned_exe_arguments_are_boxed() {
+  let with_args = ScannedExe {
+    name: "g.exe".into(),
+    os: rsrpc_detect::types::OsName::Win32,
+    is_launcher: false,
+    arguments: Some("--flag".into()),
+  };
+  let without = ScannedExe {
+    arguments: None,
+    ..with_args.clone()
+  };
+  assert_eq!(with_args.arguments.as_deref(), Some("--flag"));
+  assert!(without.arguments.is_none());
+  assert_eq!(
+    std::mem::size_of_val(&with_args.arguments),
+    std::mem::size_of::<Option<Box<str>>>()
+  );
+  assert!(
+    std::mem::size_of::<ScannedExe>() <= 64,
+    "ScannedExe grew to {} bytes",
+    std::mem::size_of::<ScannedExe>()
+  );
+}
+
+/// The matcher's argument check reads the boxed field unchanged: a boxed
+/// `str` derefs to `&str`, so `contains` still takes it as a pattern.
+#[test]
+fn boxed_arguments_still_match_as_a_pattern() {
+  let exe = ScannedExe {
+    name: "g.exe".into(),
+    os: rsrpc_detect::types::OsName::Win32,
+    is_launcher: false,
+    arguments: Some("--windowed".into()),
+  };
+  let cmdline = "game.exe --windowed --verbose".to_string();
+  assert!(cmdline.contains(&**exe.arguments.as_ref().expect("args")));
+  let other = "game.exe".to_string();
+  assert!(!other.contains(&**exe.arguments.as_ref().expect("args")));
+}

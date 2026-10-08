@@ -74,12 +74,16 @@ impl ProcessDetectedEvent {
 /// code reads unchanged. Text rides as `Box<str>` (16B, no capacity
 /// field) instead of `String` (24B): ~11k executables × 2 string fields
 /// is real money, and these never grow after the build.
+///
+/// `Exec.arguments` (the scan tick's per-process slot) stays a `String`:
+/// `read_exec_into` recycles that buffer with `mem::take`, which a
+/// `Box<str>` cannot take part in. Only this build-once field boxes.
 #[derive(Clone, Debug)]
 pub struct ScannedExe {
   pub name: Box<str>,
   pub os: OsName,
   pub is_launcher: bool,
-  pub arguments: Option<String>,
+  pub arguments: Option<Box<str>>,
 }
 
 /// Executable OS: the database only ever carries three values (`win32`
@@ -177,7 +181,7 @@ impl ScannedEntry {
               name: exe.name.clone().into_boxed_str(),
               os: OsName::from_os(&exe.os),
               is_launcher: exe.is_launcher,
-              arguments: exe.arguments.clone(),
+              arguments: exe.arguments.as_deref().map(Box::<str>::from),
             })
             .collect::<Vec<_>>()
             .into_boxed_slice()
@@ -223,7 +227,7 @@ impl ScannedEntry {
           name: exe.name.into_boxed_str(),
           os: OsName::from_string(exe.os),
           is_launcher: exe.is_launcher,
-          arguments: exe.arguments,
+          arguments: exe.arguments.map(String::into_boxed_str),
         })
         .collect::<Vec<_>>()
         .into_boxed_slice(),
@@ -328,7 +332,8 @@ pub fn epoch_ms() -> u64 {
 // 3 x Vec (24 B) became 3 x Box<[T]> (16 B): 24 B off per entry.
 const _: () = assert!(std::mem::size_of::<ScannedEntry>() <= 80);
 
-const _: () = assert!(std::mem::size_of::<ScannedExe>() <= 72);
+// `Option<String>` (24 B) became `Option<Box<str>>` (16 B).
+const _: () = assert!(std::mem::size_of::<ScannedExe>() <= 64);
 
 /// Callback invoked with the scan state after every scan tick (e.g. the
 /// OBS-open flag for streamer-mode tooling).

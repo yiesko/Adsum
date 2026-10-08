@@ -438,7 +438,7 @@ fn finish_direct_hit(
     let has_args = process
       .arguments
       .as_ref()
-      .is_some_and(|args| args.contains(exec_args));
+      .is_some_and(|args| args.contains(&**exec_args));
     if !has_args {
       tracing::debug!(
         "[Process Scanner] Argument mismatch for pid {}, skipping",
@@ -613,8 +613,8 @@ impl ProcessServer {
     bundle: &DetectablesBundle,
   ) -> Option<(Arc<ScannedEntry>, usize)> {
     let mat = bundle.ac.find(reversed_path)?;
-    let exe_index = bundle.indexes[mat.pattern().as_usize()];
-    Some((bundle.list[exe_index[0]].clone(), exe_index[1]))
+    let pair = bundle.indexes[mat.pattern().as_usize()].resolve();
+    Some((bundle.list[pair.0].clone(), pair.1))
   }
 
   /// Custom-overrides half of [`ProcessServer::ac_probe`].
@@ -625,8 +625,8 @@ impl ProcessServer {
   ) -> Option<(Arc<ScannedEntry>, usize)> {
     let custom_ac = bundle.custom_ac.as_ref()?;
     let mat = custom_ac.find(reversed_path)?;
-    let exe_index = bundle.custom_indexes[mat.pattern().as_usize()];
-    Some((bundle.custom[exe_index[0]].clone(), exe_index[1]))
+    let pair = bundle.custom_indexes[mat.pattern().as_usize()].resolve();
+    Some((bundle.custom[pair.0].clone(), pair.1))
   }
 
   /// Proton fallback probe (main DB `win32` entries on Linux): same shape
@@ -640,8 +640,8 @@ impl ProcessServer {
   ) -> Option<(Arc<ScannedEntry>, usize)> {
     let automaton = bundle.proton_ac.as_ref()?;
     let mat = automaton.find(reversed_path)?;
-    let exe_index = bundle.proton_indexes[mat.pattern().as_usize()];
-    Some((bundle.list[exe_index[0]].clone(), exe_index[1]))
+    let pair = bundle.proton_indexes[mat.pattern().as_usize()].resolve();
+    Some((bundle.list[pair.0].clone(), pair.1))
   }
 
   /// Shared variant loop: try `path` plus its 64-bit-stripped variants

@@ -81,6 +81,46 @@ impl SortedIndex {
 /// Rationale: the scanner used to hold the automaton, the index table,
 /// the activity list and the aux maps under SEPARATE locks, replaced one
 /// at a time by the hourly refresh. A scan landing mid-swap then probed a
+/// Index pair into the generation: `[activity index, executable index]`.
+///
+/// Newtype, not a bare `[u32; 2]` alias, so the widening back to `usize`
+/// lives in one place ([`resolve`](PatternIndex::resolve)) rather than
+/// being repeated at every lookup — a type alias could not carry that
+/// method.
+///
+/// `u32` halves: the pair is a dense table over tens of thousands of
+/// entries, so 8 B instead of 16 B halves the table. The database is
+/// bounded far below `u32::MAX` (`refresh` caps the body at 64 MiB and
+/// the entry count is bounded), so a build that overflowed would already
+/// have failed earlier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PatternIndex([u32; 2]);
+
+impl PatternIndex {
+  /// The pair as `usize` indices, ready to index a slice with.
+  #[inline]
+  pub(crate) fn resolve(self) -> (usize, usize) {
+    (self.0[0] as usize, self.0[1] as usize)
+  }
+}
+
+/// Convert a (activity, executable) pair to the compact index form.
+///
+/// Truncating an index would mis-attribute a game or panic the scan
+/// thread, so it saturates and asserts instead: the database is bounded
+/// far below `u32::MAX` (body capped at 64 MiB, entry count bounded above
+/// ~50k), which makes this a build-time invariant, not a runtime path.
+/// A correct build therefore never asserts.
+fn pattern_index(activity_index: usize, exe_index: usize) -> PatternIndex {
+  let activity = u32::try_from(activity_index).unwrap_or(u32::MAX);
+  let exe = u32::try_from(exe_index).unwrap_or(u32::MAX);
+  debug_assert!(
+    activity < u32::MAX && exe < u32::MAX,
+    "database too large for u32 index pairs: activity {activity_index}, exe {exe_index}"
+  );
+  PatternIndex([activity, exe])
+}
+
 /// NEW automaton against OLD indexes: index-out-of-bounds panic (dead
 /// scan thread) or, worse, a silently mis-attributed game. With the whole
 /// generation behind ONE Arc, readers clone it once per tick (or per
@@ -89,12 +129,12 @@ impl SortedIndex {
 pub struct DetectablesBundle {
   pub(crate) list: Vec<Arc<ScannedEntry>>,
   pub(crate) ac: AhoCorasick,
-  pub(crate) indexes: Vec<[usize; 2]>,
+  pub(crate) indexes: Vec<PatternIndex>,
   /// Proton fallback automaton (Linux only): `win32` executables from the
   /// main DB, probed after the native patterns and the authoritative Steam
   /// AppId, but before the stem/folder heuristics. Empty on other platforms.
   pub(crate) proton_ac: Option<AhoCorasick>,
-  pub(crate) proton_indexes: Vec<[usize; 2]>,
+  pub(crate) proton_indexes: Vec<PatternIndex>,
   /// Steam AppId (steam-distributor SKUs only) -> activity index.
   /// Lets us detect store games whose DB entry ships empty `executables`.
   /// Sorted vec, not a map: lookups only happen on match misses.
@@ -110,7 +150,7 @@ pub struct DetectablesBundle {
   pub(crate) name_map_nodot: SortedIndex,
   pub(crate) custom: Vec<Arc<ScannedEntry>>,
   pub(crate) custom_ac: Option<AhoCorasick>,
-  pub(crate) custom_indexes: Vec<[usize; 2]>,
+  pub(crate) custom_indexes: Vec<PatternIndex>,
 }
 
 impl DetectablesBundle {
@@ -250,9 +290,9 @@ pub fn bare_exe(normalized_path: &str) -> Option<&str> {
 /// the two separate walks this replaces — one normalization per exe.
 struct SplitPatterns {
   native_patterns: Vec<String>,
-  native_idx: Vec<[usize; 2]>,
+  native_idx: Vec<PatternIndex>,
   proton_patterns: Vec<String>,
-  proton_idx: Vec<[usize; 2]>,
+  proton_idx: Vec<PatternIndex>,
 }
 
 /// Walk the entries once, partitioning executables into the native set
@@ -297,11 +337,15 @@ fn collect_split_patterns(detectables: &[Arc<ScannedEntry>]) -> SplitPatterns {
       }
       if native {
         split.native_patterns.push(pattern.clone());
-        split.native_idx.push([activity_index, exe_index]);
+        split
+          .native_idx
+          .push(pattern_index(activity_index, exe_index));
       }
       if proton {
         split.proton_patterns.push(pattern);
-        split.proton_idx.push([activity_index, exe_index]);
+        split
+          .proton_idx
+          .push(pattern_index(activity_index, exe_index));
       }
     }
   }
@@ -311,7 +355,7 @@ fn collect_split_patterns(detectables: &[Arc<ScannedEntry>]) -> SplitPatterns {
 /// Custom-override patterns with no OS filter (user entries match anywhere).
 fn build_ac_patterns_allow_all_os(
   detectables: &[Arc<ScannedEntry>],
-) -> Result<(AhoCorasick, Vec<[usize; 2]>), aho_corasick::BuildError> {
+) -> Result<(AhoCorasick, Vec<PatternIndex>), aho_corasick::BuildError> {
   build_ac_patterns_with_os_filter(detectables, false)
 }
 
@@ -381,9 +425,9 @@ pub(crate) fn build_bundle(
 fn build_ac_patterns_with_os_filter(
   detectables: &[Arc<ScannedEntry>],
   enforce_os: bool,
-) -> Result<(AhoCorasick, Vec<[usize; 2]>), aho_corasick::BuildError> {
+) -> Result<(AhoCorasick, Vec<PatternIndex>), aho_corasick::BuildError> {
   let mut exe_patterns: Vec<String> = Vec::new();
-  let mut exe_indexes: Vec<[usize; 2]> = Vec::new();
+  let mut exe_indexes: Vec<PatternIndex> = Vec::new();
 
   for (activity_index, activity) in detectables.iter().enumerate() {
     for (exe_index, executable) in activity.executables.iter().enumerate() {
@@ -407,7 +451,7 @@ fn build_ac_patterns_with_os_filter(
         continue;
       }
       exe_patterns.push(pattern);
-      exe_indexes.push([activity_index, exe_index]);
+      exe_indexes.push(pattern_index(activity_index, exe_index));
     }
   }
 
@@ -515,7 +559,7 @@ mod tests {
     // Only the real exe survives, with its index intact (every name that
     // normalizes to the match-all `"/"` contributes neither pattern nor
     // index).
-    assert_eq!(bundle.indexes, vec![[0, 4]]);
+    assert_eq!(bundle.indexes[0].resolve(), (0, 4));
     assert_eq!(bundle.ac.patterns_len(), 1);
   }
 
@@ -569,7 +613,8 @@ mod tests {
     // normalized patterns below (raw names can differ from what the
     // automaton stores).
     for pair in split.native_idx.iter().chain(split.proton_idx.iter()) {
-      let exe = &entries[pair[0]].executables[pair[1]];
+      let (activity, exe) = pair.resolve();
+      let exe = &entries[activity].executables[exe];
       assert!(!exe.is_launcher, "launcher leaked into patterns");
     }
     assert!(
@@ -583,7 +628,10 @@ mod tests {
     // Proton (Linux only) carries exactly the win32 non-launcher exes.
     #[cfg(target_os = "linux")]
     {
-      let native_at = |pair: &[usize; 2]| entries[pair[0]].executables[pair[1]].name.to_string();
+      let native_at = |pair: &PatternIndex| {
+        let (activity, exe) = pair.resolve();
+        entries[activity].executables[exe].name.to_string()
+      };
       assert_eq!(split.proton_idx.len(), 1);
       assert_eq!(native_at(&split.proton_idx[0]), "win.exe");
       // Native keeps linux + empty-OS, in walk order, excluding `/` drops.
@@ -602,5 +650,42 @@ mod tests {
     assert_eq!(split.native_patterns.len(), split.native_idx.len());
     #[cfg(target_os = "linux")]
     assert_eq!(split.proton_patterns.len(), split.proton_idx.len());
+  }
+}
+
+#[cfg(test)]
+mod pattern_index_tests {
+  use super::*;
+
+  /// The pair is 8 B, not 16: half the dense table.
+  #[test]
+  fn pattern_index_is_compact() {
+    assert_eq!(std::mem::size_of::<PatternIndex>(), 8);
+    // A pair of zeroes still carries its halves.
+    let pair = PatternIndex([0, 0]);
+    assert_eq!(pair.resolve(), (0, 0));
+  }
+
+  /// `resolve` widens without truncating, including at the extremes: a
+  /// lost high bit would index the wrong entry and mis-attribute a game.
+  #[test]
+  fn resolve_widens_without_truncation() {
+    for (activity, exe) in [
+      (0usize, 0usize),
+      (1, 7),
+      (u16::MAX as usize, u16::MAX as usize),
+      (u32::MAX as usize - 1, u32::MAX as usize - 1),
+    ] {
+      let pair = pattern_index(activity, exe);
+      assert_eq!(pair.resolve(), (activity, exe), "pair lost a high bit");
+    }
+  }
+
+  /// An out-of-range pair saturates and asserts: it must never silently
+  /// truncate to a valid-looking index.
+  #[test]
+  #[should_panic(expected = "database too large")]
+  fn overflow_pair_asserts_instead_of_truncating() {
+    let _ = pattern_index(usize::MAX, usize::MAX);
   }
 }
