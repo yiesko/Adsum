@@ -37,7 +37,18 @@ pub struct ExecScratch {
   path: String,
   cmdline: Vec<u8>,
   args: String,
+  /// Consecutive ticks where the live process count sat well under the
+  /// slot count, so a single transient spike does not pin the extra
+  /// slots (and their string buffers) for the rest of the session.
+  pub(crate) low_ticks: u8,
 }
+
+/// Consecutive low-occupancy ticks before the slot list is compacted.
+///
+/// Long enough that a momentary spike never triggers a realloc, short
+/// enough that a sustained drop (build finished, game exited) releases
+/// the surplus within ~40 s at the base cadence.
+pub(crate) const SLOT_LOW_TICKS: u8 = 8;
 
 // Per-pid allocation reuse for the scan tick: `read_exec` intermediates
 // live in caller-owned `ExecScratch` buffers (one set per thread) and
@@ -1256,5 +1267,87 @@ mod first_sightings_tests {
     assert_eq!(first[1].entry.id.as_ref(), "b");
     // Second pass over the same corpus: nothing is new.
     assert!(first_sightings(&mut seen, &batch).is_empty());
+  }
+}
+
+#[cfg(test)]
+mod slot_compaction_tests {
+  use super::*;
+
+  /// A pre-seeded slot list far past any plausible live process count, so
+  /// every tick is a low-occupancy tick on any machine.
+  fn surplus_list(count: usize) -> Vec<Exec> {
+    (0..count)
+      .map(|i| Exec {
+        pid: i as u64 + 1,
+        path: "p".repeat(64),
+        arguments: Some("a".repeat(32)),
+      })
+      .collect()
+  }
+
+  /// Surplus slots survive below the threshold and are released exactly
+  /// when it is reached: a spike must not be punished for one quiet
+  /// moment, but a sustained drop must not pin slots forever.
+  #[test]
+  fn surplus_slots_are_released_only_after_sustained_low() {
+    // 4x the threshold, and well past a realistic process count: the
+    // premise (`live * 2 < slots`) holds on any machine this runs on.
+    let surplus = SLOT_LOW_TICKS as usize * 512;
+    let mut processes = surplus_list(surplus);
+    let mut scratch = ExecScratch::default();
+
+    let live = ProcessServer::process_list_into(&mut processes, &mut scratch).unwrap_or(0);
+    if live * 2 >= surplus {
+      // More live processes than the surplus (a huge host): the premise
+      // fails, so this test has nothing to say. Never a false failure.
+      return;
+    }
+
+    // Tick 1: the collapse is seen, nothing released yet.
+    assert_eq!(processes.len(), surplus, "tick 1 must not release");
+    assert_eq!(scratch.low_ticks, 1);
+
+    // Ticks 2..threshold: still retained.
+    for expected in 2..SLOT_LOW_TICKS {
+      ProcessServer::process_list_into(&mut processes, &mut scratch).expect("tick lists");
+      assert_eq!(
+        scratch.low_ticks, expected,
+        "counter climbs one per low tick"
+      );
+      assert_eq!(
+        processes.len(),
+        surplus,
+        "surplus must survive under the threshold"
+      );
+    }
+
+    // The threshold tick: released, and the counter resets.
+    ProcessServer::process_list_into(&mut processes, &mut scratch).expect("release tick");
+    assert_eq!(scratch.low_ticks, 0, "counter resets after a release");
+    assert_eq!(
+      processes.len(),
+      live.max(1),
+      "the list should sit at the live count"
+    );
+  }
+
+  /// A healthy tick resets the counter, so spike-calm-spike-calm never
+  /// compacts.
+  #[test]
+  fn low_ticks_reset_on_a_healthy_tick() {
+    // Two pre-seeded slots: the sweep fills them and grows to exactly its
+    // own live count, so occupancy is high by construction.
+    let mut processes = vec![Exec::default(), Exec::default()];
+    let mut scratch = ExecScratch {
+      low_ticks: 5,
+      ..ExecScratch::default()
+    };
+
+    if let Ok(filled) = ProcessServer::process_list_into(&mut processes, &mut scratch) {
+      assert!(filled >= 2, "the sweep must fill its own slots");
+      assert_eq!(processes.len(), filled, "list sits at the live count");
+      assert_eq!(scratch.low_ticks, 0, "high occupancy resets the counter");
+    }
   }
 }

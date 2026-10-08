@@ -111,6 +111,13 @@ impl ProcessServer {
     // slot count. Slots refill in place below, so a warm tick reuses
     // every string buffer; `push` only grows past the high-water mark.
     // Tail slots past `filled` keep their buffers for the next rise.
+    //
+    // The one exception: a *sustained* drop. A build storm's spike would
+    // otherwise leave the slot list (and every tail slot's string buffers)
+    // at high-water for the rest of the session — RSS stable in content
+    // but pinned by one moment. After `SLOT_LOW_TICKS` consecutive ticks
+    // under half occupancy the surplus is released, so the next rise pays
+    // for it again. A single spike never reaches the threshold.
     let mut filled = 0usize;
 
     for entry in proc_list {
@@ -139,6 +146,18 @@ impl ProcessServer {
       if read_exec_into(pid, &mut processes[filled], scratch) {
         filled += 1;
       }
+    }
+    // Adaptive release of surplus slots (see the note at `filled`): only
+    // after a sustained drop, never on a single tick.
+    if filled * 2 < processes.len() {
+      scratch.low_ticks = scratch.low_ticks.saturating_add(1);
+      if scratch.low_ticks >= super::scan::SLOT_LOW_TICKS {
+        processes.truncate(filled);
+        processes.shrink_to(filled);
+        scratch.low_ticks = 0;
+      }
+    } else {
+      scratch.low_ticks = 0;
     }
     Ok(filled)
   }
