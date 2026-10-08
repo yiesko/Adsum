@@ -37,10 +37,30 @@ pub struct ExecScratch {
   path: String,
   cmdline: Vec<u8>,
   args: String,
+  /// `/proc/<pid>/environ` body for the AppId lookup: the only
+  /// multi-kilobyte read of the scan. Reused across pids so the buffer
+  /// keeps its capacity instead of regrowing per newly-seen process.
+  #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+  environ: Vec<u8>,
   /// Consecutive ticks where the live process count sat well under the
   /// slot count, so a single transient spike does not pin the extra
   /// slots (and their string buffers) for the rest of the session.
   pub(crate) low_ticks: u8,
+}
+
+/// Both scratch sets the scan loop owns per thread, grouped so the match
+/// entry point takes one parameter instead of two (and stays under the
+/// clippy argument limit).
+///
+/// They stay separate types (different fields, different readers): this
+/// grouping is a call-shape convenience, not a merge — [`ExecScratch`]
+/// also serves the exec reader on its own.
+#[derive(Default)]
+pub struct ScanScratch {
+  /// Match-path buffers (name/folder normalization, Steam path, stat).
+  pub match_scratch: MatchScratch,
+  /// Exec-path buffers (cmdline, args, environ, `/proc` path).
+  pub exec_scratch: ExecScratch,
 }
 
 /// Consecutive low-occupancy ticks before the slot list is compacted.
@@ -134,23 +154,36 @@ pub(crate) fn os_matches(os: &str) -> bool {
 /// every game process it launches, including non-Steam shortcuts).
 /// Callers read this lazily: environ is the most expensive read of the
 /// scan, so only misses pay for it.
+///
+/// The scratch supplies both buffers — `path` for the `/proc/<pid>` prefix
+/// and `environ` for the body — so a miss (every non-Steam process) costs
+/// no allocation of its own, and a hit keeps the buffer sized for the
+/// next one.
 #[cfg(target_os = "linux")]
-pub(crate) fn read_steam_app_id(pid: u64) -> Option<String> {
+pub(crate) fn read_steam_app_id(pid: u64, scratch: &mut ExecScratch) -> Option<String> {
   // Bounded: 256 KiB covers any legitimate environ (SteamAppId lives
   // near the front); larger means hostile or broken, and reading it
   // whole per new pid would multiply per tick.
   const MAX_ENVIRON_BYTES: u64 = 256 * 1024;
-  let path = format!("/proc/{pid}/environ");
+
   // NOTE: no metadata size check — /proc files report st_size 0 (see above).
-  let file = std::fs::File::open(&path).ok()?;
-  let mut env = Vec::new();
+  use std::fmt::Write as _;
   use std::io::Read;
+
+  // Same buffer the exec reader reuses: cleared and refilled per pid.
+  scratch.path.clear();
+  write!(scratch.path, "/proc/{pid}/environ").ok()?;
+  let file = std::fs::File::open(&scratch.path).ok()?;
+
+  scratch.environ.clear();
   file
     .take(MAX_ENVIRON_BYTES + 1)
-    .read_to_end(&mut env)
+    .read_to_end(&mut scratch.environ)
     .ok()?;
-  env.truncate(usize::try_from(MAX_ENVIRON_BYTES).unwrap_or(usize::MAX));
-  for entry in env.split(|b| *b == 0) {
+  scratch
+    .environ
+    .truncate(usize::try_from(MAX_ENVIRON_BYTES).unwrap_or(usize::MAX));
+  for entry in scratch.environ.split(|b| *b == 0) {
     if let Some(id) = entry.strip_prefix(b"SteamAppId=")
       && let Ok(id) = std::str::from_utf8(id)
     {
@@ -727,7 +760,7 @@ impl ProcessServer {
     variant_bufs: &mut [String; 5],
     reversed_path: &mut String,
     obs_open: &mut bool,
-    match_scratch: &mut MatchScratch,
+    scratch: &mut ScanScratch,
   ) -> Option<ScannedHit> {
     // Process path with consistent slashes (original case: the
     // automata match ASCII case-insensitively). Borrowed until a
@@ -807,15 +840,16 @@ impl ProcessServer {
         // maps, stem/folder heuristics). Paid only on misses — the hot
         // AC path above never allocates it. Reuses the caller's buffer:
         // char-wise ASCII fold, byte-identical to `to_ascii_lowercase`.
-        match_scratch.lowered.clear();
-        match_scratch
+        scratch.match_scratch.lowered.clear();
+        scratch
+          .match_scratch
           .lowered
           .extend(process_path.chars().map(|c| c.to_ascii_lowercase()));
-        let lowered = match_scratch.lowered.as_str();
+        let lowered = scratch.match_scratch.lowered.as_str();
         // The AppId comes memoized (one environ read per process
         // lifetime); cmdline fallback when environ is unreadable
         // (sandboxed Proton runtimes hide it from service contexts).
-        let app_id = self.cached_app_id(process.pid);
+        let app_id = self.cached_app_id(process.pid, &mut scratch.exec_scratch);
         let (app_id, via_cmdline) = match app_id {
           Some(id) => (Some(id), false),
           // Owned copy: only paid when environ is unreadable (sandboxed
@@ -841,7 +875,7 @@ impl ProcessServer {
           &bundle.list,
           &bundle.custom,
           DetectSource::SteamAppId,
-          &mut match_scratch.stat,
+          &mut scratch.match_scratch.stat,
         ) {
           return Some(hit);
         }
@@ -860,8 +894,8 @@ impl ProcessServer {
             &bundle.name_map,
             &bundle.name_map_nodot,
             &bundle.list,
-            &mut match_scratch.norm_out,
-            &mut match_scratch.stat,
+            &mut scratch.match_scratch.norm_out,
+            &mut scratch.match_scratch.stat,
           )
         {
           return Some(hit);
@@ -877,14 +911,14 @@ impl ProcessServer {
             exe_index,
             process,
             DetectSource::ProtonAutomaton,
-            &mut match_scratch.stat,
+            &mut scratch.match_scratch.stat,
           );
         }
         // Steam's own word: the process runs under a known install dir,
         // so it inherits that entry's AppId. Beats name guessing below,
         // loses to a DB-declared path above.
         if let Some(library_appid) =
-          self.steam_prefix_app_id_into(lowered, &mut match_scratch.steam_path)
+          self.steam_prefix_app_id_into(lowered, &mut scratch.match_scratch.steam_path)
           && let Some(hit) = match_steam_id(
             Some(&library_appid),
             process.pid,
@@ -892,7 +926,7 @@ impl ProcessServer {
             &bundle.list,
             &bundle.custom,
             DetectSource::SteamLibrary,
-            &mut match_scratch.stat,
+            &mut scratch.match_scratch.stat,
           )
         {
           tracing::debug!(
@@ -913,8 +947,8 @@ impl ProcessServer {
           &bundle.name_map,
           &bundle.name_map_nodot,
           &bundle.list,
-          &mut match_scratch.norm_out,
-          &mut match_scratch.stat,
+          &mut scratch.match_scratch.norm_out,
+          &mut scratch.match_scratch.stat,
         );
       }
     };
@@ -924,7 +958,7 @@ impl ProcessServer {
       exe_index,
       process,
       found_source,
-      &mut match_scratch.stat,
+      &mut scratch.match_scratch.stat,
     )
   }
 
@@ -1011,6 +1045,61 @@ mod reuse_tests {
     );
     assert!(slot.path.capacity() >= path_cap);
     assert!(scratch.cmdline.capacity() >= cmd_cap);
+  }
+
+  /// D5: `read_steam_app_id` reads environ into the scratch's own buffer
+  /// and builds its path in the scratch's path buffer, so a miss — the
+  /// common case, every non-Steam process — costs no allocation at all
+  /// beyond the returned `Option`.
+  ///
+  /// environ is kilobytes and the only read of the scan that big: it
+  /// runs once per newly-seen pid, but a fresh `Vec` (plus the `format!`
+  /// of the path) was paid every time, with the buffer growing back up
+  /// to its real size each call instead of keeping the capacity.
+  ///
+  /// The reuse check is about capacity, not pointers: `read_to_end`
+  /// legitimately grows the buffer on the first call, so the assertion is
+  /// that the second call neither reallocates nor shrinks it. `path` is
+  /// the stronger half — same `String`, refilled with `write!`.
+  #[test]
+  fn steam_app_id_read_reuses_the_exec_scratch() {
+    // Self pid is deterministic (present, readable) and its own environ
+    // is irrelevant: what matters is that both buffers survive the call.
+    // Whether it carries a SteamAppId is environment-dependent, so the
+    // assertions below are the reuse contract, not the lookup result.
+    let pid = self_pid();
+    let mut scratch = ExecScratch::default();
+
+    let _ = read_steam_app_id(pid, &mut scratch);
+    let path_ptr = scratch.path.as_ptr();
+    let path_cap = scratch.path.capacity();
+    let env_ptr = scratch.environ.as_ptr();
+    let env_cap = scratch.environ.capacity();
+
+    let _ = read_steam_app_id(pid, &mut scratch);
+
+    assert!(
+      std::ptr::eq(path_ptr, scratch.path.as_ptr()),
+      "path buffer moved: the environ read must reuse it"
+    );
+    assert!(
+      std::ptr::eq(env_ptr, scratch.environ.as_ptr()),
+      "environ buffer moved: the read must reuse it"
+    );
+    assert!(scratch.path.capacity() >= path_cap, "path buffer shrank");
+    assert!(scratch.environ.capacity() >= env_cap, "environ shrank");
+    // The reuse target is the scratch, so it must have been touched: an
+    // implementation that falls back to its own buffers leaves these
+    // empty while still passing every pointer check above.
+    assert_eq!(
+      scratch.path,
+      format!("/proc/{pid}/environ"),
+      "the read must build its path in the scratch"
+    );
+    assert!(
+      !scratch.environ.is_empty(),
+      "the read must land its bytes in the scratch"
+    );
   }
 
   /// `process_list_into` reuses the Vec backing and every slot across

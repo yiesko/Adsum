@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use rsrpc_detect::db::DetectableActivity;
 use rsrpc_detect::refresh::RefreshConfig;
-use rsrpc_detect::scan::MatchScratch;
+use rsrpc_detect::scan::ScanScratch;
 use rsrpc_detect::server::ProcessServer;
 use rsrpc_detect::types::{Exec, ProcessEventListeners};
 
@@ -47,7 +47,7 @@ fn append_swaps_in_a_new_classifying_generation() {
   let mut variant_bufs: [String; 5] = Default::default();
   let mut reversed = String::with_capacity(256);
   let mut obs_open = false;
-  let mut match_scratch = MatchScratch::default();
+  let mut scratch = ScanScratch::default();
   let hit = server
     .match_process(
       &Exec {
@@ -59,7 +59,7 @@ fn append_swaps_in_a_new_classifying_generation() {
       &mut variant_bufs,
       &mut reversed,
       &mut obs_open,
-      &mut match_scratch,
+      &mut scratch,
     )
     .expect("fresh generation classifies");
   assert_eq!(&*hit.entry.id, "424242");
@@ -75,7 +75,7 @@ fn remove_by_name_drops_the_generation_entry() {
   let mut variant_bufs: [String; 5] = Default::default();
   let mut reversed = String::with_capacity(256);
   let mut obs_open = false;
-  let mut match_scratch = MatchScratch::default();
+  let mut scratch = ScanScratch::default();
   assert!(
     server
       .match_process(
@@ -88,7 +88,7 @@ fn remove_by_name_drops_the_generation_entry() {
         &mut variant_bufs,
         &mut reversed,
         &mut obs_open,
-        &mut match_scratch,
+        &mut scratch,
       )
       .is_none(),
     "removed entry must not classify"
@@ -113,7 +113,7 @@ fn match_scratch_reuses_lowered_buffer() {
   let mut variant_bufs: [String; 5] = Default::default();
   let mut reversed = String::with_capacity(256);
   let mut obs_open = false;
-  let mut match_scratch = MatchScratch::default();
+  let mut scratch = ScanScratch::default();
   // AC misses (`othergame.exe` ≠ `swapgame.exe`); the folder fallback
   // still classifies via `Swap Game`, so both the miss-path lowering and
   // a real hit are exercised across the two calls below.
@@ -128,16 +128,9 @@ fn match_scratch_reuses_lowered_buffer() {
                   variant_bufs: &mut [String; 5],
                   reversed: &mut String,
                   obs_open: &mut bool,
-                  match_scratch: &mut MatchScratch| {
+                  scratch: &mut ScanScratch| {
     server
-      .match_process(
-        exec,
-        bundle,
-        variant_bufs,
-        reversed,
-        obs_open,
-        match_scratch,
-      )
+      .match_process(exec, bundle, variant_bufs, reversed, obs_open, scratch)
       .is_some()
   };
   assert!(classify(
@@ -147,13 +140,16 @@ fn match_scratch_reuses_lowered_buffer() {
     &mut variant_bufs,
     &mut reversed,
     &mut obs_open,
-    &mut match_scratch
+    &mut scratch
   ));
   // Miss path lowercases the whole path into the scratch buffer before
   // the folder heuristic runs.
-  assert_eq!(match_scratch.lowered, "/games/swap game/othergame.exe");
-  let lowered_ptr = match_scratch.lowered.as_ptr();
-  let lowered_cap = match_scratch.lowered.capacity();
+  assert_eq!(
+    scratch.match_scratch.lowered,
+    "/games/swap game/othergame.exe"
+  );
+  let lowered_ptr = scratch.match_scratch.lowered.as_ptr();
+  let lowered_cap = scratch.match_scratch.lowered.capacity();
   assert!(classify(
     &server,
     &exec,
@@ -161,12 +157,15 @@ fn match_scratch_reuses_lowered_buffer() {
     &mut variant_bufs,
     &mut reversed,
     &mut obs_open,
-    &mut match_scratch
+    &mut scratch
   ));
-  assert_eq!(match_scratch.lowered, "/games/swap game/othergame.exe");
+  assert_eq!(
+    scratch.match_scratch.lowered,
+    "/games/swap game/othergame.exe"
+  );
   assert!(
-    std::ptr::eq(lowered_ptr, match_scratch.lowered.as_ptr()),
+    std::ptr::eq(lowered_ptr, scratch.match_scratch.lowered.as_ptr()),
     "lowered moved"
   );
-  assert!(match_scratch.lowered.capacity() >= lowered_cap);
+  assert!(scratch.match_scratch.lowered.capacity() >= lowered_cap);
 }

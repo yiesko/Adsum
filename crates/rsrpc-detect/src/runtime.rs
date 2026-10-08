@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use super::proc_start::process_start_ms;
 use super::refresh::{FetchOutcome, fetch_detectable_etag};
-use super::scan::{ExecScratch, MatchScratch, apply_ignore_list, first_sightings};
+use super::scan::{ScanScratch, apply_ignore_list, first_sightings};
 // Linux-only: the /proc reader does not exist on other targets.
 #[cfg(target_os = "linux")]
 use super::scan::read_exec_into;
@@ -278,10 +278,9 @@ fn spawn_proc_watcher(server: &ProcessServer) -> QueueGauge {
       let mut reversed_path = String::with_capacity(256);
       // EXEC reuse buffers, owned by this loop: one `Exec` slot plus the
       // read scratch, refilled per event instead of allocated per event.
-      // `match_scratch` same idea for the classification tail.
+      // The classification tail reuses the same grouped scratch.
       let mut exec_slot = Exec::default();
-      let mut exec_scratch = ExecScratch::default();
-      let mut match_scratch = MatchScratch::default();
+      let mut scratch = ScanScratch::default();
       loop {
         // Exit at once when shutdown landed during the previous message
         // handling: the bounded wait below would otherwise park up to a
@@ -304,7 +303,7 @@ fn spawn_proc_watcher(server: &ProcessServer) -> QueueGauge {
         };
         match event {
           ProcEvent::Exec(pid) => {
-            if !read_exec_into(pid, &mut exec_slot, &mut exec_scratch) {
+            if !read_exec_into(pid, &mut exec_slot, &mut scratch.exec_scratch) {
               tracing::debug!("[Process Scanner] exec event: pid {pid} unreadable, skipping");
               continue;
             }
@@ -322,7 +321,7 @@ fn spawn_proc_watcher(server: &ProcessServer) -> QueueGauge {
               &mut variant_bufs,
               &mut reversed_path,
               &mut obs_open,
-              &mut match_scratch,
+              &mut scratch,
             ) {
               // Coexistence parity with the polling path: ignored IDs never
               // publish, even on the event-driven fast path.
@@ -635,13 +634,10 @@ impl ProcessServer {
       // one without a debug build.
       let mut first_tick = true;
       // Tick reuse buffers, owned by this loop: the process list backing,
-      // every `Exec` slot and the read scratch survive across ticks, so a
-      // warm tick allocates nothing per process (see `read_exec_into`).
-      // `match_scratch` follows the same pattern one level down: the lowercased path and
-      // the normalized folder refill per classification.
+      // every `Exec` slot and both read scratches survive across ticks, so
+      // a warm tick allocates nothing per process (see `read_exec_into`).
       let mut tick_processes: Vec<Exec> = Vec::new();
-      let mut tick_scratch = ExecScratch::default();
-      let mut match_scratch = MatchScratch::default();
+      let mut tick_scratch = ScanScratch::default();
       // Run the process scan repeatedly (base cadence, stretched while idle)
       loop {
         // Directed shutdown: the unpark below only shortens the cadence
@@ -651,11 +647,7 @@ impl ProcessServer {
           break;
         }
         *clone.last_scan.lock().unwrap_or_else(|e| e.into_inner()) = std::time::Instant::now();
-        let mut detected = match clone.scan_for_processes(
-          &mut tick_processes,
-          &mut tick_scratch,
-          &mut match_scratch,
-        ) {
+        let mut detected = match clone.scan_for_processes(&mut tick_processes, &mut tick_scratch) {
           Ok(detected) => detected,
           Err(err) => {
             tracing::warn!(

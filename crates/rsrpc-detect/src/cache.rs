@@ -5,7 +5,7 @@
 
 use rustc_hash::FxHashSet;
 
-use crate::scan::read_steam_app_id;
+use crate::scan::{ExecScratch, read_steam_app_id};
 use crate::server::ProcessServer;
 use crate::types::Exec;
 
@@ -38,7 +38,10 @@ impl ProcessServer {
   /// outside the lock; EXEC invalidates via [`ProcessServer::drop_appid`],
   /// whose sequence bump discards a racing stale read below.
   /// (`pub(crate)` for the memo-semantics regression test.)
-  pub fn cached_app_id(&self, pid: u64) -> Option<String> {
+  ///
+  /// `exec_scratch` supplies the environ and path buffers, so a
+  /// `Stale` miss (the common case) costs no allocation of its own.
+  pub fn cached_app_id(&self, pid: u64, exec_scratch: &mut ExecScratch) -> Option<String> {
     // Fast paths: verified memos, cloned once straight into the return.
     // `Absent` is the common case (non-Steam processes) and performs no
     // I/O at all; only `Stale` falls through to the environ read below.
@@ -54,7 +57,7 @@ impl ProcessServer {
       Some(AppIdMemo::Stale(seq)) => seq,
       None => 0,
     };
-    let id = read_steam_app_id(pid);
+    let id = read_steam_app_id(pid, exec_scratch);
     let mut cache = self.appid_cache.lock().unwrap_or_else(|e| e.into_inner());
     // A racing EXEC invalidated this pid mid-read (sequence bumped) or
     // the tick swept it: discard the stale environ instead of pinning

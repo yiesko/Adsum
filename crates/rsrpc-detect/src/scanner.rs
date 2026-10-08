@@ -7,7 +7,7 @@
 //! caller-owned reuse buffers.
 
 use super::runtime::ScanGuard;
-use super::scan::{ExecScratch, MatchScratch};
+use super::scan::{ExecScratch, ScanScratch};
 // Linux-only: the /proc reader does not exist on other targets.
 #[cfg(target_os = "linux")]
 use super::scan::read_exec_into;
@@ -179,9 +179,9 @@ impl ProcessServer {
 
   #[hotpath::measure]
   /// One full process sweep, classifying every process against the current
-  /// generation bundle. `processes` + `exec_scratch` are caller-owned
-  /// reuse buffers (the scan loop keeps them across ticks; one-shot
-  /// callers pass throwaways): a warm tick allocates nothing per process.
+  /// generation bundle. `processes` + `scratch` are caller-owned reuse
+  /// buffers (the scan loop keeps them across ticks; one-shot callers pass
+  /// throwaways): a warm tick allocates nothing per process.
   /// On non-Linux the list still comes from `sysinfo` (scratch unused).
   pub fn scan_for_processes(
     &self,
@@ -189,8 +189,7 @@ impl ProcessServer {
     // fresh and this param is only carried for a uniform signature.
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables, clippy::ptr_arg))]
     processes: &mut Vec<Exec>,
-    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] exec_scratch: &mut ExecScratch,
-    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] match_scratch: &mut MatchScratch,
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] scratch: &mut ScanScratch,
   ) -> rsrpc_protocol::error::Result<Vec<ScannedHit>> {
     #[cfg(not(target_os = "linux"))]
     let processes = self.process_list()?;
@@ -198,7 +197,7 @@ impl ProcessServer {
     let processes = processes.as_slice();
     #[cfg(target_os = "linux")]
     let processes = {
-      let filled = ProcessServer::process_list_into(processes, exec_scratch)?;
+      let filled = ProcessServer::process_list_into(processes, &mut scratch.exec_scratch)?;
       &processes[..filled]
     };
 
@@ -242,7 +241,7 @@ impl ProcessServer {
           &mut variant_bufs,
           &mut reversed_path,
           &mut obs_open,
-          &mut *match_scratch,
+          scratch,
         )
       })
       .collect();
