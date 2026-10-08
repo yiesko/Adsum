@@ -16,7 +16,7 @@ use rsrpc_types::user::RpcUser;
 use rsrpc_ws::{Message, Responder};
 use serde_json::Value;
 
-use crate::transport::{PendingClear, Sink};
+use crate::transport::{PendingQueue, Sink};
 
 /// Upper bound a handler waits for outbox space before treating the client
 /// as stalled (pruned, freeing the pump for everyone else).
@@ -205,7 +205,7 @@ pub(crate) async fn handle_set_activity(
   query_client_id: Option<&str>,
   responder: &Responder,
   sink: &Sink,
-  pending_clears: &Mutex<Vec<PendingClear>>,
+  pending_clears: &Mutex<PendingQueue>,
   forward: Forward,
 ) -> (bool, bool) {
   // Fall back to the client_id provided on connect (query param) when the
@@ -227,7 +227,7 @@ pub(crate) async fn handle_set_activity(
     // before its own clears, so a never-delivered publish degrades to a
     // harmless clear of an unshown card (ignored downstream).
     Forward::Staged => {
-      sink.stage_clear(pending_clears, event);
+      sink.stage_publish(pending_clears, event);
       sink.flush_pending(pending_clears);
       true
     }

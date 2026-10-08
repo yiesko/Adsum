@@ -18,11 +18,13 @@ use std::{
 
 use rsrpc_protocol::error::{Result, RsrpcError};
 use rsrpc_protocol::query::query_params;
-use rsrpc_types::cmd::ActivityCmd;
+use rsrpc_types::cmd::{ActivityCmd, ActivityCmdArgs};
 use rsrpc_types::user::RpcUser;
 use rsrpc_ws::{ClientId, CloseCode, Event, EventHub, Message, Responder};
 use rustc_hash::FxHashMap;
 use serde_json::Value;
+
+use crate::handlers::PublishedSlot;
 use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
 
@@ -38,23 +40,94 @@ const SINK_SEND_TIMEOUT: Duration = Duration::from_millis(250);
 /// disconnect no matter how many pids were tracked.
 const DISCONNECT_CLEAR_BUDGET: Duration = Duration::from_secs(1);
 
-/// Cap on staged disconnect clears transport-wide: ~16 fully-wedged
-/// disconnects. Past it clears shed counted (visible via `dropped_total`).
+/// Cap on staged commands transport-wide: ~16 fully-wedged disconnects.
+/// Past it the oldest entry sheds counted (visible via `dropped_total`).
 /// Unbounded retention would let connection churn grow memory forever while
 /// the bridge is wedged; every handoff/publish table in this workspace
 /// sheds oldest the same way.
-const MAX_PENDING_CLEARS: usize = 256;
+const MAX_PENDING_COMMANDS: usize = 256;
 
-/// A staged disconnect clear with its own expiry: an older retry task
-/// lapsing must never shed a newer entry, so each clear carries the
-/// deadline it was staged with (see `stage_clear`).
+/// What a queued entry carries. Publishes and clears share one FIFO so a
+/// clear can never overtake an older publish of the same pid — only a
+/// publish needs the whole command, while a clear rebuilds its command at
+/// emit time instead of retaining it.
 #[derive(Debug, Clone)]
+pub(crate) enum PendingPayload {
+  /// A `SET_ACTIVITY` parked while the sink was full. Boxed: ~1 KB, and the
+  /// queue can hold 256 of them.
+  Publish(Box<ActivityCmd>),
+  /// A disconnect clear: only the metadata a clear needs, so a stalled
+  /// sink retains ~80 B per entry rather than a full command's ~1 KB.
+  Clear(PendingClear),
+}
+
+impl PendingPayload {
+  /// The command to hand downstream. A clear rebuilds its command here, so
+  /// nothing larger than the slim metadata is ever retained (see
+  /// [`PendingClear::into_cmd`]).
+  fn into_cmd(self) -> ActivityCmd {
+    match self {
+      Self::Publish(cmd) => *cmd,
+      Self::Clear(clear) => clear.into_cmd(),
+    }
+  }
+}
+
+/// Slim clear metadata: everything a disconnect clear carries, without
+/// retaining the command it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingClear {
-  /// The clear command, oldest staged first in the queue.
-  cmd: ActivityCmd,
+  /// Application the published card belonged to.
+  pub(crate) app_id: Option<String>,
+  /// Process whose card is being cleared (pid 0 is never genuine).
+  pub(crate) pid: u64,
+  /// Nonce of the publish this clear answers.
+  pub(crate) nonce: Value,
+}
+
+impl PendingClear {
+  /// Rebuild the clear command from the slim metadata. Byte-identical to
+  /// [`crate::handlers::clear_for_slot`], which the invariant test pins.
+  fn into_cmd(self) -> ActivityCmd {
+    ActivityCmd {
+      application_id: self.app_id,
+      cmd: "SET_ACTIVITY".to_string(),
+      data: None,
+      evt: None,
+      args: Some(ActivityCmdArgs {
+        // pid 0 is never a genuine clear, so it is safely ignored
+        // downstream — same convention as the whole-command clear.
+        pid: Some(self.pid),
+        activity: None,
+        code: None,
+        user_id: None,
+      }),
+      nonce: self.nonce,
+    }
+  }
+
+  /// Slim metadata for one published slot's clear.
+  pub(crate) fn from_slot(published: &crate::handlers::PublishedSlot) -> Self {
+    Self {
+      app_id: published.app_id.clone(),
+      pid: published.pid,
+      nonce: published.nonce.clone(),
+    }
+  }
+}
+
+/// One staged queue entry: the payload plus its own expiry, so an older
+/// retry task lapsing must never shed a newer entry (see `stage_publish`).
+#[derive(Debug, Clone)]
+pub(crate) struct PendingEntry {
+  payload: PendingPayload,
   /// Lapses independently per entry (see `expire_pending`).
   deadline: std::time::Instant,
 }
+
+/// The staged queue: FIFO, so `pop_front`/`push_front` replace the
+/// `remove(0)` memmove that used to run per delivered entry.
+pub(crate) type PendingQueue = std::collections::VecDeque<PendingEntry>;
 
 /// Discord origins allowed to drive game commands. Absent `origin`
 /// (non-browser clients) passes: only a mismatched origin is refused.
@@ -204,41 +277,64 @@ impl Sink {
     }
   }
 
-  /// Stage a disconnect clear for opportunistic flush, stamped with its
-  /// own expiry. Bounded: past `MAX_PENDING_CLEARS` the oldest sheds
+  /// Stage a parked publish for opportunistic flush, stamped with its own
+  /// expiry. Bounded: past `MAX_PENDING_COMMANDS` the oldest sheds
   /// counted instead of growing memory without limit.
-  pub(crate) fn stage_clear(&self, pending: &Mutex<Vec<PendingClear>>, cmd: ActivityCmd) {
+  pub(crate) fn stage_publish(&self, pending: &Mutex<PendingQueue>, cmd: ActivityCmd) {
     let mut pending = pending.lock().unwrap_or_else(|e| e.into_inner());
-    if pending.len() >= MAX_PENDING_CLEARS {
+    if pending.len() >= MAX_PENDING_COMMANDS {
       self.count_shed(1);
-      tracing::warn!("[transport-ws] Pending clears full, shedding oldest");
-      pending.remove(0);
+      tracing::warn!("[transport-ws] Pending commands full, shedding oldest");
+      pending.pop_front();
     }
-    pending.push(PendingClear {
-      cmd,
+    pending.push_back(PendingEntry {
+      payload: PendingPayload::Publish(Box::new(cmd)),
       deadline: std::time::Instant::now() + DISCONNECT_CLEAR_BUDGET,
     });
   }
 
-  /// Flush staged clears oldest-first, stopping at the first full queue
+  /// Stage a disconnect clear for opportunistic flush, stamped with its own
+  /// expiry. Staged slim: only the metadata a clear needs is retained (see
+  /// [`PendingClear`]), so a wedged sink holds ~80 B instead of ~1 KB per
+  /// entry.
+  pub(crate) fn stage_clear(&self, pending: &Mutex<PendingQueue>, published: &PublishedSlot) {
+    let mut pending = pending.lock().unwrap_or_else(|e| e.into_inner());
+    if pending.len() >= MAX_PENDING_COMMANDS {
+      self.count_shed(1);
+      tracing::warn!("[transport-ws] Pending commands full, shedding oldest");
+      pending.pop_front();
+    }
+    pending.push_back(PendingEntry {
+      payload: PendingPayload::Clear(PendingClear::from_slot(published)),
+      deadline: std::time::Instant::now() + DISCONNECT_CLEAR_BUDGET,
+    });
+  }
+
+  /// Flush staged commands oldest-first, stopping at the first full queue
   /// (order preserved for the next flush). Delivery never expires: an
-  /// unexpired clear always deserves its chance, whenever capacity
+  /// unexpired entry always deserves its chance, whenever capacity
   /// returns. A closed sink drops the whole queue counted — no receiver
   /// will ever return. Never waits: safe on every pump path.
-  pub(crate) fn flush_pending(&self, pending: &Mutex<Vec<PendingClear>>) {
+  pub(crate) fn flush_pending(&self, pending: &Mutex<PendingQueue>) {
     let mut pending = pending.lock().unwrap_or_else(|e| e.into_inner());
-    while let Some(first) = pending.first().cloned() {
-      match self.try_emit(first.cmd) {
-        TryEmit::Sent => {
-          pending.remove(0);
+    while let Some(entry) = pending.pop_front() {
+      match self.try_emit(entry.payload.into_cmd()) {
+        TryEmit::Sent => {}
+        TryEmit::Full(cmd) => {
+          // Put it back exactly where it was: order is a hard invariant
+          // (a clear must never overtake an older publish of the same pid).
+          pending.push_front(PendingEntry {
+            payload: PendingPayload::Publish(cmd),
+            deadline: entry.deadline,
+          });
+          break;
         }
-        TryEmit::Full(_) => break,
         TryEmit::Closed => {
           self
             .dropped
             .fetch_add(pending.len() as u64, Ordering::Relaxed);
           tracing::warn!(
-            "[transport-ws] Event sink closed, dropping {} staged clear(s)",
+            "[transport-ws] Event sink closed, dropping {} staged command(s)",
             pending.len()
           );
           pending.clear();
@@ -251,7 +347,7 @@ impl Sink {
   /// Shed only entries whose own deadline elapsed, counting each. An older
   /// retry task lapsing must never discard a newer entry that still owns
   /// a retry window.
-  fn expire_pending(&self, pending: &Mutex<Vec<PendingClear>>) {
+  fn expire_pending(&self, pending: &Mutex<PendingQueue>) {
     let mut pending = pending.lock().unwrap_or_else(|e| e.into_inner());
     let now = std::time::Instant::now();
     let mut expired = 0u64;
@@ -266,7 +362,7 @@ impl Sink {
     if expired > 0 {
       self.count_shed(expired);
       tracing::warn!(
-        "[transport-ws] Clear-retry budget lapsed, dropping {expired} staged clear(s)"
+        "[transport-ws] Clear-retry budget lapsed, dropping {expired} staged command(s)"
       );
     }
   }
@@ -343,9 +439,9 @@ pub struct WsTransport {
   total: Arc<AtomicU64>,
   /// Retained sink sender for census queue-depth sampling.
   sink_tx: mpsc::Sender<ActivityCmd>,
-  /// Staged disconnect clears (see `MAX_PENDING_CLEARS`): flushed
+  /// Staged disconnect clears (see `MAX_PENDING_COMMANDS`): flushed
   /// opportunistically on every pump event and drained on shutdown.
-  pending_clears: Arc<Mutex<Vec<PendingClear>>>,
+  pending_clears: Arc<Mutex<PendingQueue>>,
   bound_port: u16,
 }
 
@@ -445,7 +541,7 @@ impl WsTransport {
     let clients = Arc::new(RwLock::new(FxHashMap::default()));
     let dropped = Arc::new(AtomicU64::new(0));
     let total = Arc::new(AtomicU64::new(0));
-    let pending_clears = Arc::new(Mutex::new(Vec::new()));
+    let pending_clears = Arc::new(Mutex::new(PendingQueue::new()));
     let pump = tokio::spawn(pump_loop(PumpCtx {
       hub,
       clients: Arc::clone(&clients),
@@ -538,7 +634,7 @@ impl WsTransport {
       for (_, slot) in clients.drain() {
         self.total.fetch_sub(1, Ordering::Relaxed);
         for published in &slot.published {
-          sink.stage_clear(&self.pending_clears, handlers::clear_for_slot(published));
+          sink.stage_clear(&self.pending_clears, published);
         }
       }
     }
@@ -556,9 +652,12 @@ impl WsTransport {
         if pending.is_empty() {
           break;
         }
-        pending.remove(0)
+        pending.pop_front()
       };
-      sink.emit_clear_retry(next.cmd, next.deadline).await;
+      let Some(next) = next else { break };
+      sink
+        .emit_clear_retry(next.payload.into_cmd(), next.deadline)
+        .await;
     }
   }
 }
@@ -580,8 +679,8 @@ struct PumpCtx {
   clients: Arc<RwLock<FxHashMap<ClientId, ClientSlot>>>,
   total: Arc<AtomicU64>,
   sink: Sink,
-  /// Staged disconnect clears (see `MAX_PENDING_CLEARS`).
-  pending_clears: Arc<Mutex<Vec<PendingClear>>>,
+  /// Staged disconnect clears (see `MAX_PENDING_COMMANDS`).
+  pending_clears: Arc<Mutex<PendingQueue>>,
   user: Arc<Mutex<RpcUser>>,
   set_activity: bool,
   secondary_events: bool,
@@ -699,7 +798,7 @@ async fn remove_and_clear(
   clients: &Arc<RwLock<FxHashMap<ClientId, ClientSlot>>>,
   total: &Arc<AtomicU64>,
   sink: &Sink,
-  pending_clears: &Arc<Mutex<Vec<PendingClear>>>,
+  pending_clears: &Arc<Mutex<PendingQueue>>,
 ) {
   let slot = clients.write().await.remove(&id);
   let Some(slot) = slot else { return };
@@ -714,8 +813,10 @@ async fn remove_and_clear(
     let cmd = handlers::clear_for_slot(published);
     match sink.try_emit(cmd) {
       TryEmit::Sent => {}
-      TryEmit::Full(cmd) => {
-        sink.stage_clear(pending_clears, *cmd);
+      TryEmit::Full(_) => {
+        // Staged slim from the slot, not from the refused command: only
+        // the metadata is retained while the sink stays full.
+        sink.stage_clear(pending_clears, published);
         staged_any = true;
       }
       TryEmit::Closed => {
@@ -737,7 +838,7 @@ async fn remove_and_clear(
 /// clears, and every task ends on its own — no traffic pattern leaks
 /// tasks. Complements the message-path and shutdown-drain flushes, which
 /// cover traffic and exit.
-fn spawn_clear_retry(sink: Sink, pending_clears: Arc<Mutex<Vec<PendingClear>>>) {
+fn spawn_clear_retry(sink: Sink, pending_clears: Arc<Mutex<PendingQueue>>) {
   tokio::spawn(async move {
     loop {
       sink.flush_pending(&pending_clears);
@@ -763,7 +864,7 @@ async fn on_message(
   clients: &Arc<RwLock<FxHashMap<ClientId, ClientSlot>>>,
   total: &Arc<AtomicU64>,
   sink: &Sink,
-  pending_clears: &Arc<Mutex<Vec<PendingClear>>>,
+  pending_clears: &Arc<Mutex<PendingQueue>>,
   user: &Arc<Mutex<RpcUser>>,
   set_activity: bool,
   secondary_events: bool,
@@ -997,28 +1098,144 @@ mod tests {
     assert_eq!(sink.dropped.load(Ordering::Relaxed), 1);
   }
 
-  /// Staged clears never exceed the bound; every shed is counted.
+  /// An activity with a sizable `details`, so a clear that still carried
+  /// one would dominate the entry's size.
+  fn activity_with_details() -> rsrpc_types::cmd::Activity {
+    rsrpc_types::cmd::Activity {
+      id: None,
+      name: Some("G".to_string()),
+      buttons: None,
+      r#type: 0,
+      url: None,
+      created_at: None,
+      session_id: None,
+      platform: None,
+      supported_platforms: None,
+      timestamps: None,
+      application_id: None,
+      details: Some("d".repeat(1024)),
+      details_url: None,
+      state: None,
+      state_url: None,
+      sync_id: None,
+      instance: None,
+      status_display_type: None,
+      flags: None,
+      emoji: None,
+      party: None,
+      assets: None,
+      secrets: None,
+      metadata: None,
+      extra: Default::default(),
+    }
+  }
+
+  /// One published slot, as a disconnect would stage it.
+  fn slot(pid: u64) -> handlers::PublishedSlot {
+    handlers::PublishedSlot {
+      app_id: Some("app-1".to_string()),
+      pid,
+      nonce: Value::String(format!("n{pid}")),
+    }
+  }
+
+  /// A `SET_ACTIVITY` big enough that a clear holding one would be
+  /// measurable (the point of the slim representation).
+  fn big_publish(pid: u64) -> ActivityCmd {
+    ActivityCmd {
+      application_id: Some("app-1".to_string()),
+      cmd: "SET_ACTIVITY".to_string(),
+      data: None,
+      evt: None,
+      args: Some(ActivityCmdArgs {
+        pid: Some(pid),
+        activity: Some(activity_with_details()),
+        code: None,
+        user_id: None,
+      }),
+      nonce: Value::String(format!("n{pid}")),
+    }
+  }
+
+  /// A staged clear rebuilds the exact command `clear_for_slot` produces.
+  /// This is the invariant that lets the queue stay slim without changing
+  /// what a wedged bridge eventually receives.
   #[test]
-  fn staged_clears_stay_bounded_and_counted() {
+  fn slim_clear_rebuilds_the_same_command() {
+    for pid in [0u64, 7, 42, u64::MAX] {
+      let slot = slot(pid);
+      let slim = PendingClear::from_slot(&slot);
+      // JSON, not a struct compare: a changed field order or a dropped
+      // field on either side shows up here.
+      assert_eq!(
+        serde_json::to_string(&slim.into_cmd()).expect("slim clear"),
+        serde_json::to_string(&handlers::clear_for_slot(&slot)).expect("direct clear"),
+        "pid {pid}: slim clear must rebuild byte-identically"
+      );
+    }
+  }
+
+  /// A staged clear is materially smaller than the command it replaces:
+  /// the whole point of holding slim metadata instead of the full command.
+  #[test]
+  fn slim_clear_is_smaller_than_the_command() {
+    let cmd = big_publish(7);
+    let clear = PendingClear::from_slot(&slot(7)).into_cmd();
+    assert!(
+      std::mem::size_of::<PendingClear>() < std::mem::size_of::<ActivityCmd>(),
+      "metadata ({}) must be smaller than the command ({})",
+      std::mem::size_of::<PendingClear>(),
+      std::mem::size_of::<ActivityCmd>()
+    );
+    // And the activity the publish carried is genuinely gone.
+    assert!(
+      cmd
+        .args
+        .as_ref()
+        .and_then(|a| a.activity.as_ref())
+        .is_some()
+    );
+    assert!(
+      clear
+        .args
+        .as_ref()
+        .and_then(|a| a.activity.as_ref())
+        .is_none()
+    );
+  }
+
+  /// Staged entries never exceed the bound; every shed is counted.
+  #[test]
+  fn staged_entries_stay_bounded_and_counted() {
     let (tx, _rx) = mpsc::channel::<ActivityCmd>(1);
     let sink = Sink {
       tx,
       dropped: Arc::new(AtomicU64::new(0)),
     };
-    let pending = Mutex::new(Vec::new());
-    for pid in 0..(MAX_PENDING_CLEARS + 5) as u64 {
-      sink.stage_clear(
-        &pending,
-        handlers::clear_for_slot(&handlers::PublishedSlot {
-          app_id: None,
-          pid,
-          nonce: Value::Null,
-        }),
-      );
+    let pending = Mutex::new(PendingQueue::new());
+    for pid in 0..(MAX_PENDING_COMMANDS + 5) as u64 {
+      sink.stage_clear(&pending, &slot(pid));
     }
-    // Bounded history, and every shed clear counted (never silent).
-    assert!(pending.lock().unwrap().len() <= MAX_PENDING_CLEARS);
+    // Bounded history, and every shed entry counted (never silent).
+    assert!(pending.lock().unwrap().len() <= MAX_PENDING_COMMANDS);
     assert_eq!(sink.dropped.load(Ordering::Relaxed), 5);
+  }
+
+  /// Publishes stage too, so a wedged sink parks them instead of dropping.
+  #[test]
+  fn staged_publish_keeps_its_command() {
+    let (tx, _rx) = mpsc::channel::<ActivityCmd>(1);
+    let sink = Sink {
+      tx,
+      dropped: Arc::new(AtomicU64::new(0)),
+    };
+    let pending = Mutex::new(PendingQueue::new());
+    sink.stage_publish(&pending, big_publish(5));
+    pending
+      .lock()
+      .unwrap()
+      .retain(|entry| matches!(entry.payload, PendingPayload::Publish(_)));
+    assert_eq!(pending.lock().unwrap().len(), 1);
   }
 
   /// Flush delivers oldest-first and stops at the first full queue.
@@ -1026,41 +1243,27 @@ mod tests {
   async fn flush_preserves_order_and_stops_when_full() {
     // Cap-1 sink held full by a filler: flush delivers nothing, staged intact.
     let (tx, mut rx) = mpsc::channel(1);
-    tx.send_timeout(
-      handlers::clear_for_slot(&handlers::PublishedSlot {
-        app_id: None,
-        pid: 1,
-        nonce: Value::Null,
-      }),
-      SINK_SEND_TIMEOUT,
-    )
-    .await
-    .expect("filler");
+    tx.send_timeout(handlers::clear_for_slot(&slot(1)), SINK_SEND_TIMEOUT)
+      .await
+      .expect("filler");
     let sink = Sink {
       tx,
       dropped: Arc::new(AtomicU64::new(0)),
     };
-    let pending = Mutex::new(Vec::new());
+    let pending = Mutex::new(PendingQueue::new());
     for pid in [7u64, 8, 9] {
-      sink.stage_clear(
-        &pending,
-        handlers::clear_for_slot(&handlers::PublishedSlot {
-          app_id: None,
-          pid,
-          nonce: Value::Null,
-        }),
-      );
+      sink.stage_clear(&pending, &slot(pid));
     }
     sink.flush_pending(&pending);
     assert_eq!(pending.lock().unwrap().len(), 3);
-    // Free slots one by one: staged clears land oldest-first.
+    // Free slots one by one: staged entries land oldest-first.
     for pid in [1u64, 7, 8] {
       let cmd = rx.try_recv().expect("slot frees in order");
       assert_eq!(cmd.args.as_ref().and_then(|a| a.pid), Some(pid));
       sink.flush_pending(&pending);
     }
     assert!(pending.lock().unwrap().is_empty());
-    let last = rx.try_recv().expect("final staged clear");
+    let last = rx.try_recv().expect("final staged entry");
     assert_eq!(last.args.as_ref().and_then(|a| a.pid), Some(9));
     assert_eq!(sink.dropped.load(Ordering::Relaxed), 0);
   }
@@ -1073,18 +1276,14 @@ mod tests {
       tx,
       dropped: Arc::new(AtomicU64::new(0)),
     };
-    let pending = Mutex::new(Vec::new());
+    let pending = Mutex::new(PendingQueue::new());
     // One long-lapsed entry and one fresh entry, built directly (staging
     // always stamps `now + budget`, which no deterministic test can outwait).
     let past = std::time::Instant::now() - Duration::from_secs(1);
     let future = std::time::Instant::now() + DISCONNECT_CLEAR_BUDGET;
     for (pid, deadline) in [(1u64, past), (2u64, future)] {
-      pending.lock().unwrap().push(PendingClear {
-        cmd: handlers::clear_for_slot(&handlers::PublishedSlot {
-          app_id: None,
-          pid,
-          nonce: Value::Null,
-        }),
+      pending.lock().unwrap().push_back(PendingEntry {
+        payload: PendingPayload::Clear(PendingClear::from_slot(&slot(pid))),
         deadline,
       });
     }
@@ -1093,7 +1292,10 @@ mod tests {
     // its own retry window intact.
     let pending = pending.lock().unwrap();
     assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].cmd.args.as_ref().and_then(|a| a.pid), Some(2));
+    let PendingPayload::Clear(clear) = &pending[0].payload else {
+      panic!("expected a clear");
+    };
+    assert_eq!(clear.pid, 2);
     assert_eq!(sink.dropped.load(Ordering::Relaxed), 1);
   }
 
