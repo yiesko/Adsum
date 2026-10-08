@@ -199,7 +199,7 @@ impl ProcessServer {
     // nothing per process at steady state (see path_variants_into).
     let mut variant_bufs: [String; 5] = Default::default();
 
-    let mut detected_list: Vec<ScannedHit> = processes
+    let detected_list: Vec<ScannedHit> = processes
       .iter()
       .filter_map(|process| {
         self.match_process(
@@ -226,8 +226,10 @@ impl ProcessServer {
       })?(ProcessScanState { obs_open });
     }
 
-    detected_list.shrink_to_fit();
-
+    // No `shrink_to_fit` here: the list is transient (built and consumed
+    // within the tick), so forcing a realloc each scan only churns the
+    // allocator. Long-lived tables shrink in their own place (see the
+    // bundle build, which owns its tables for hours).
     tracing::debug!("[Process Scanner] Process scan complete");
 
     Ok(detected_list)
