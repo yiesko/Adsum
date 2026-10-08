@@ -716,15 +716,32 @@ impl ProcessServer {
         }
         // Track live game pids for the proc-events watcher: only THEIR
         // exits wake us early (a build storm's exits never cause a scan).
-        // Wholesale replace (not merge): a watcher insert racing this
-        // write can be dropped, but the next tick re-derives it from the
-        // live table while the game still runs — and a lost EXIT entry
-        // heals the same way. Bounded staleness (≤1 tick), no growth,
-        // no liveness probe per entry.
-        *clone
-          .detected_pids
-          .lock()
-          .unwrap_or_else(|e| e.into_inner()) = detected.iter().map(|game| game.pid).collect();
+        // Clear and refill (not wholesale replace): the set is rebuilt
+        // from the live table every tick anyway, so swapping in a fresh
+        // `HashSet` allocated a new table per tick for identical content.
+        // A watcher insert racing this write can be dropped, but the next
+        // tick re-derives it from the live table while the game still
+        // runs — and a lost EXIT entry heals the same way. Bounded
+        // staleness (≤1 tick), no growth, no liveness probe per entry.
+        //
+        // Capacity is kept honest too: after a process spike the table
+        // would otherwise sit at its high-water bucket count forever.
+        {
+          let mut pids = clone
+            .detected_pids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+          pids.clear();
+          pids.extend(detected.iter().map(|game| game.pid));
+          let target = if pids.capacity() > 64 && pids.len() * 4 < pids.capacity() {
+            (pids.len() * 2).max(16)
+          } else {
+            0
+          };
+          if target != 0 {
+            pids.shrink_to(target);
+          }
+        }
         // Forward on change only (see `last_emitted`): identical tables
         // are already fully represented downstream (`note_scan` entries
         // persist, `last_process` dedups), so skipping them changes

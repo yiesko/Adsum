@@ -78,14 +78,30 @@ impl ProcessServer {
   /// reuse must never serve a stale id. One set build + retain per tick.
   /// Recovers from a poisoned lock like every other cache access (a dead
   /// pid set is still better than no sweep at all).
+  ///
+  /// Capacity is trimmed when the live set collapses (a build storm's
+  /// thousands of pids dropping back to a few hundred): `retain` alone
+  /// keeps the high-water bucket count, so the table would pin that
+  /// memory for the rest of the session. `len`/`capacity` are read before
+  /// the lock so the rehash happens outside it.
   pub(crate) fn sweep_dead_appids(&self, processes: &[Exec]) {
     let mut live = FxHashSet::with_capacity_and_hasher(processes.len(), Default::default());
     live.extend(processes.iter().map(|process| process.pid));
-    self
-      .appid_cache
-      .lock()
-      .unwrap_or_else(|e| e.into_inner())
-      .retain(|pid, _| live.contains(pid));
+
+    let mut cache = self.appid_cache.lock().unwrap_or_else(|e| e.into_inner());
+    cache.retain(|pid, _| live.contains(pid));
+    let (len, capacity) = (cache.len(), cache.capacity());
+    drop(cache);
+
+    if capacity > 64 && len * 4 < capacity {
+      let target = (len * 2).max(16);
+      let mut cache = self.appid_cache.lock().unwrap_or_else(|e| e.into_inner());
+      // Only re-lock when the target is still worth a rehash: another
+      // sweep may have run in between and moved the numbers.
+      if cache.len() * 4 < cache.capacity() {
+        cache.shrink_to(target);
+      }
+    }
   }
 
   /// Drop one pid's memoized AppId (EXEC: same pid, new image, possibly
@@ -106,5 +122,101 @@ impl ProcessServer {
         *entry = AppIdMemo::Stale(seq.wrapping_add(1));
       })
       .or_insert(AppIdMemo::Stale(1));
+  }
+}
+
+#[cfg(test)]
+mod sweep_tests {
+  use super::*;
+
+  use rsrpc_telemetry::QueueGauge;
+
+  /// A bare server: no detectable base, no listeners, no refresh.
+  fn server() -> ProcessServer {
+    let (tx, _rx) = QueueGauge::pair();
+    ProcessServer::new_with_custom(
+      vec![],
+      vec![],
+      tx,
+      crate::types::ProcessEventListeners::default(),
+      crate::refresh::RefreshConfig::default(),
+      vec![],
+    )
+  }
+
+  /// An `Exec` carrying only the pid (the sweep's sole input).
+  fn exec(pid: u64) -> Exec {
+    Exec {
+      pid,
+      path: String::new(),
+      arguments: None,
+    }
+  }
+
+  /// One memoized pid, as a live scan would leave it.
+  fn memoize(server: &ProcessServer, pid: u64) {
+    let mut cache = server.appid_cache.lock().unwrap_or_else(|e| e.into_inner());
+    cache.insert(pid, AppIdMemo::Absent(1));
+  }
+
+  /// A spike then a collapse: the table must not sit at its high-water
+  /// bucket count for the rest of the session (`retain` alone keeps it).
+  #[test]
+  fn sweep_releases_spike_capacity_after_a_collapse() {
+    let server = server();
+
+    // Spike: well past the shrink threshold.
+    let spike: Vec<u64> = (0..500u64).collect();
+    for pid in &spike {
+      memoize(&server, *pid);
+    }
+    let spiked_capacity = server
+      .appid_cache
+      .lock()
+      .unwrap_or_else(|e| e.into_inner())
+      .capacity();
+    assert!(
+      spiked_capacity > 64,
+      "spike should have grown the table, got {spiked_capacity}"
+    );
+
+    // Collapse: most pids die, the sweep keeps only the survivors.
+    let survivors: Vec<u64> = spike[..20].to_vec();
+    server.sweep_dead_appids(&survivors.iter().map(|pid| exec(*pid)).collect::<Vec<_>>());
+
+    let cache = server.appid_cache.lock().unwrap_or_else(|e| e.into_inner());
+    assert_eq!(cache.len(), survivors.len());
+    // Capacity must follow the live set, not the spike: the release is the
+    // whole point, so an assertion that holds either way proves nothing.
+    assert!(
+      cache.capacity() <= cache.len() * 4 + 16,
+      "capacity {} should have tracked {} entries, not the spike of {}",
+      cache.capacity(),
+      cache.len(),
+      spiked_capacity
+    );
+    assert!(
+      cache.capacity() < spiked_capacity / 2,
+      "capacity {} barely moved off the spike {}",
+      cache.capacity(),
+      spiked_capacity
+    );
+  }
+
+  /// Dead pids are dropped and live ones survive — the sweep's actual job,
+  /// which capacity trimming must never get in the way of.
+  #[test]
+  fn sweep_drops_dead_pids_and_keeps_live_ones() {
+    let server = server();
+    for pid in [10u64, 20, 30] {
+      memoize(&server, pid);
+    }
+
+    server.sweep_dead_appids(&[exec(10), exec(30)]);
+
+    let cache = server.appid_cache.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(cache.contains_key(&10));
+    assert!(!cache.contains_key(&20), "dead pid must be dropped");
+    assert!(cache.contains_key(&30));
   }
 }
