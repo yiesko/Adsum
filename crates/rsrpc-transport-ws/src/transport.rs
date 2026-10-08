@@ -393,7 +393,10 @@ impl WsTransport {
       let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
       let ws_config = rsrpc_ws::ServerConfig::builder(addr)
         .max_connections(config.max_connections)
+        .event_queue(config.event_queue)
         .per_client_queue(config.per_client_queue)
+        .max_message_size(config.max_message_size)
+        .max_frame_size(config.max_frame_size)
         .build()
         .map_err(|_| RsrpcError::InvalidConfig("rsrpc-ws bounds must be non-zero"))?;
       match rsrpc_ws::Server::bind(ws_config).await {

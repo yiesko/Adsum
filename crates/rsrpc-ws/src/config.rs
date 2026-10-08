@@ -6,18 +6,27 @@ use crate::Error;
 
 /// Default cap on concurrent connections.
 ///
-/// Each connection owns one Tokio task plus a bounded outbox; 1024 keeps
-/// FD and memory use predictable on a loopback daemon.
-pub const DEFAULT_MAX_CONNECTIONS: usize = 1024;
+/// Each connection owns one Tokio task plus a bounded outbox. A loopback
+/// RPC daemon serves a handful of clients, so 64 keeps FD, task and outbox
+/// memory predictable; a peer that races ahead of its relay is pruned by
+/// the outbox bound below long before the connection cap matters.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 64;
 
 /// Default bound for the global event queue (connect/message/disconnect).
-pub const DEFAULT_EVENT_QUEUE: usize = 1024;
+///
+/// This is the memory ceiling of the server: `event_queue * max_message_size`
+/// bytes can sit in flight at once. At 64 * 1 MiB the worst case is 64 MiB,
+/// against roughly 1 GiB with the historical 1024 — a single stalled hub
+/// consumer must not be able to pin the daemon's whole budget.
+pub const DEFAULT_EVENT_QUEUE: usize = 64;
 
 /// Default bound for each client's outbound queue.
 ///
 /// A full outbox means a slow consumer; the server prunes it instead of
-/// growing memory (slow-loris protection).
-pub const DEFAULT_PER_CLIENT_QUEUE: usize = 64;
+/// growing memory (slow-loris protection). 8 frames is ample for a client
+/// that reads its socket, and bounds the worst case to
+/// `max_connections * per_client_queue` queued frames.
+pub const DEFAULT_PER_CLIENT_QUEUE: usize = 8;
 
 /// Default cap for a single incoming message (1 MiB).
 ///

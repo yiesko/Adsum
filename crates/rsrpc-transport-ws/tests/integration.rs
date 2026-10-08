@@ -163,6 +163,20 @@ async fn snapshots_under_flood_never_stall() {
     }
   });
 
+  // Drain the sink for the whole flood. A real bridge consumes faster
+  // than a client can publish, and the transport→bridge queue is
+  // deliberately bounded: a flood that outruns its consumer sheds counted
+  // by design, so the reader must keep up for "every publish lands" to
+  // mean anything. Counting here makes the invariant independent of how
+  // deep the queue happens to be.
+  let drained = tokio::spawn(async move {
+    let mut seen = 0usize;
+    while rx.recv().await.is_some() {
+      seen += 1;
+    }
+    seen
+  });
+
   let mut ws = connect(port, "?v=1&encoding=json&client_id=flood").await;
   let _ready = read_text(&mut ws).await;
   // 100 publishes back-to-back; replies buffer in the outbox/TCP window.
@@ -183,12 +197,15 @@ async fn snapshots_under_flood_never_stall() {
     .expect("snapshots stalled: map lock held across await?")
     .unwrap();
 
-  // Every publish + the final clear reaches the sink.
-  for _ in 0..101 {
-    next_cmd(&mut rx).await;
-  }
-
+  // Dropping the transport ends the pump (and so the sink sender), which
+  // lets the drainer finish and report the exact count.
   transport.shutdown().await;
+  let seen = tokio::time::timeout(Duration::from_secs(5), drained)
+    .await
+    .expect("sink drainer stuck")
+    .unwrap();
+  // Every publish + the final clear reaches the sink.
+  assert_eq!(seen, 101);
 }
 
 #[tokio::test]
@@ -211,6 +228,40 @@ async fn closed_sink_counts_drops_and_stays_alive() {
     assert_eq!(reply["cmd"], "SET_ACTIVITY");
   }
   assert!(transport.dropped_total() > 0);
+
+  transport.shutdown().await;
+}
+
+#[tokio::test]
+/// A flood that outruns the bridge sheds counted instead of growing the
+/// bounded transport→bridge queue without limit, and the pump keeps
+/// answering clients: shedding is a backpressure valve, not a stall.
+async fn bounded_queue_sheds_flood_without_stalling() {
+  // Capacity far below the burst: the first few publishes land, the rest
+  // are shed counted.
+  let (transport, _rx) = WsTransport::bind(WsTransportConfig::new(0, 0).event_queue(4), user())
+    .await
+    .unwrap();
+  let port = transport.bound_port();
+
+  let mut ws = connect(port, "?v=1&encoding=json&client_id=flood").await;
+  let _ready = read_text(&mut ws).await;
+
+  let before = transport.dropped_total();
+  for _ in 0..32 {
+    ws.send(tungstenite::Message::Text(SET_ACTIVITY.into()))
+      .await
+      .unwrap();
+  }
+  // Replies still flow while the sink is saturated.
+  for _ in 0..32 {
+    let reply = read_text(&mut ws).await;
+    assert_eq!(reply["cmd"], "SET_ACTIVITY");
+  }
+  assert!(
+    transport.dropped_total() > before,
+    "flood past the queue bound must shed counted"
+  );
 
   transport.shutdown().await;
 }
