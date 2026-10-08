@@ -2,7 +2,7 @@
 
 use clap::Parser;
 use rsrpc_core::{Daemon, RPCConfig};
-use rsrpc_detect::db::{DetectableActivity, content_hashes, trim_detectable_value};
+use rsrpc_detect::db::{DetectableActivity, content_hashes};
 use std::path::PathBuf;
 
 mod update;
@@ -186,9 +186,7 @@ fn daemon_from_fetched(
     config.initial_db_content_hash = Some(content_hashes(&detectable, &parsed));
     return Ok((Daemon::from_parsed(parsed, config), "fetched-direct"));
   }
-  if let Ok(trimmed) = trim_detectable_value(&detectable)
-    && let Ok(parsed) = serde_json::from_value::<Vec<DetectableActivity>>(trimmed)
-  {
+  if let Ok(parsed) = rsrpc_detect::db::trim_parse(&detectable) {
     config.initial_db_content_hash = Some(content_hashes(&detectable, &parsed));
     return Ok((Daemon::from_parsed(parsed, config), "fetched-trimmed"));
   }

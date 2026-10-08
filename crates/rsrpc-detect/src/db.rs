@@ -132,105 +132,254 @@ pub fn hash_entry_aliases(entry: &DetectableActivity, hasher: &mut impl std::has
 pub fn trim_detectable_value(body: &str) -> rsrpc_protocol::error::Result<serde_json::Value> {
   let games: Vec<serde_json::Value> = serde_json::from_str(body)?;
   let trimmed: Vec<serde_json::Value> = games
-    .into_iter()
-    .map(|game| {
-      let mut entry = serde_json::Map::new();
-      entry.insert(
-        "id".to_string(),
-        game.get("id").cloned().unwrap_or_else(|| "".into()),
-      );
-      entry.insert(
-        "name".to_string(),
-        game.get("name").cloned().unwrap_or_else(|| "".into()),
-      );
-      entry.insert(
-        "hook".to_string(),
-        game.get("hook").cloned().unwrap_or_else(|| false.into()),
-      );
-      // Keep aliases (alternative titles): the scanner indexes matchable
-      // ones for stem/folder matching. Empty/missing stays missing so the
-      // trimmed snapshot carries no dead weight.
-      if let Some(aliases) = game.get("aliases").and_then(|v| v.as_array()) {
-        let kept: Vec<serde_json::Value> = aliases
-          .iter()
-          .filter_map(|a| a.as_str())
-          .filter(|a| !a.trim().is_empty())
-          .map(|a| serde_json::Value::String(a.to_string()))
-          .collect();
-        if !kept.is_empty() {
-          entry.insert("aliases".to_string(), serde_json::Value::Array(kept));
-        }
-      }
-      let executables: Vec<serde_json::Value> = game
-        .get("executables")
-        .and_then(|v| v.as_array())
-        .map(|executables| {
-          executables
-            .iter()
-            .map(|exe| {
-              let mut m = serde_json::Map::new();
-              m.insert(
-                "name".to_string(),
-                exe.get("name").cloned().unwrap_or_else(|| "".into()),
-              );
-              m.insert(
-                "is_launcher".to_string(),
-                exe
-                  .get("is_launcher")
-                  .cloned()
-                  .unwrap_or_else(|| false.into()),
-              );
-              m.insert(
-                "os".to_string(),
-                exe.get("os").cloned().unwrap_or_else(|| "".into()),
-              );
-              if let Some(args) = exe.get("arguments")
-                && !args.as_str().unwrap_or_default().is_empty()
-              {
-                m.insert("arguments".to_string(), args.clone());
-              }
-              serde_json::Value::Object(m)
-            })
-            .collect()
-        })
-        .unwrap_or_default();
-      entry.insert(
-        "executables".to_string(),
-        serde_json::Value::Array(executables),
-      );
-      // Keep third-party store ids (Steam AppId etc) for automatic matching
-      // of games that ship empty `executables` (e.g. How to Fish).
-      let skus: Vec<serde_json::Value> = game
-        .get("third_party_skus")
-        .and_then(|v| v.as_array())
-        .map(|skus| {
-          skus
-            .iter()
-            .filter_map(|sku| {
-              let distributor = sku.get("distributor")?.as_str()?;
-              let id = sku.get("id").map(|v| match v {
-                serde_json::Value::String(s) => s.clone(),
-                other => other.to_string().trim_matches('"').to_string(),
-              })?;
-              if distributor.is_empty() || id.is_empty() {
-                return None;
-              }
-              let mut m = serde_json::Map::new();
-              m.insert("distributor".to_string(), distributor.into());
-              m.insert("id".to_string(), id.into());
-              Some(serde_json::Value::Object(m))
-            })
-            .collect()
-        })
-        .unwrap_or_default();
-      entry.insert(
-        "third_party_skus".to_string(),
-        serde_json::Value::Array(skus),
-      );
-      serde_json::Value::Object(entry)
-    })
+    .iter()
+    .map(|game| serde_json::Value::Object(trimmed_entry_fields(game)))
     .collect();
   Ok(serde_json::Value::Array(trimmed))
+}
+
+/// One trimmed entry as a JSON object: the projection [`trim_detectable`]
+/// keeps. Shared by the DOM path and [`trim_parse`] so the two cannot
+/// drift apart.
+fn trimmed_entry_fields(game: &serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+  let mut entry = serde_json::Map::new();
+  // Present keys are forwarded verbatim — including a `null` — and only an
+  // absent key falls back to the default. This mirrors the original
+  // `get(..).cloned().unwrap_or_default()` chain exactly, which is what
+  // makes a wrongly-typed entry fail the final struct parse rather than
+  // being silently defaulted.
+  for (key, default) in [
+    ("id", serde_json::Value::String(String::new())),
+    ("name", serde_json::Value::String(String::new())),
+    ("hook", serde_json::Value::Bool(false)),
+  ] {
+    let value = match game.get(key) {
+      Some(value) => value.clone(),
+      None => default,
+    };
+    entry.insert(key.to_string(), value);
+  }
+  // Keep aliases (alternative titles): the scanner indexes matchable
+  // ones for stem/folder matching. Empty/missing stays missing so the
+  // trimmed snapshot carries no dead weight.
+  let aliases = trimmed_aliases(game.get("aliases").and_then(|v| v.as_array()));
+  if !aliases.is_empty() {
+    entry.insert("aliases".to_string(), serde_json::Value::Array(aliases));
+  }
+  entry.insert(
+    "executables".to_string(),
+    serde_json::Value::Array(trimmed_executables(
+      game.get("executables").and_then(|v| v.as_array()),
+    )),
+  );
+  // Keep third-party store ids (Steam AppId etc) for automatic matching
+  // of games that ship empty `executables` (e.g. How to Fish).
+  entry.insert(
+    "third_party_skus".to_string(),
+    serde_json::Value::Array(trimmed_skus(
+      game.get("third_party_skus").and_then(|v| v.as_array()),
+    )),
+  );
+  entry
+}
+
+/// Aliases that are non-empty strings, in order.
+fn trimmed_aliases(aliases: Option<&Vec<serde_json::Value>>) -> Vec<serde_json::Value> {
+  aliases
+    .map(|aliases| {
+      aliases
+        .iter()
+        .filter_map(|a| a.as_str())
+        .filter(|a| !a.trim().is_empty())
+        .map(|a| serde_json::Value::String(a.to_string()))
+        .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// Executable projection: `name`/`is_launcher`/`os` default when absent,
+/// `arguments` only when a non-empty string.
+fn trimmed_executables(executables: Option<&Vec<serde_json::Value>>) -> Vec<serde_json::Value> {
+  executables
+    .map(|executables| {
+      executables
+        .iter()
+        .map(|exe| {
+          let mut m = serde_json::Map::new();
+          m.insert(
+            "name".to_string(),
+            exe.get("name").cloned().unwrap_or_else(|| "".into()),
+          );
+          m.insert(
+            "is_launcher".to_string(),
+            exe
+              .get("is_launcher")
+              .cloned()
+              .unwrap_or_else(|| false.into()),
+          );
+          m.insert(
+            "os".to_string(),
+            exe.get("os").cloned().unwrap_or_else(|| "".into()),
+          );
+          if let Some(args) = exe.get("arguments")
+            && !args.as_str().unwrap_or_default().is_empty()
+          {
+            m.insert("arguments".to_string(), args.clone());
+          }
+          serde_json::Value::Object(m)
+        })
+        .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// Third-party SKUs with a non-empty distributor *and* id. A non-string id
+/// renders through `Display` and has its quotes trimmed, matching the
+/// wire shape the scanner indexes.
+fn trimmed_skus(skus: Option<&Vec<serde_json::Value>>) -> Vec<serde_json::Value> {
+  skus
+    .map(|skus| {
+      skus
+        .iter()
+        .filter_map(|sku| {
+          let distributor = sku.get("distributor")?.as_str()?;
+          let id = sku.get("id").map(|v| match v {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string().trim_matches('"').to_string(),
+          })?;
+          if distributor.is_empty() || id.is_empty() {
+            return None;
+          }
+          let mut m = serde_json::Map::new();
+          m.insert("distributor".to_string(), distributor.into());
+          m.insert("id".to_string(), id.into());
+          Some(serde_json::Value::Object(m))
+        })
+        .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// One JSON key, keeping the three states the DOM path distinguishes:
+/// absent, present-but-null, and present with a value.
+///
+/// `Option<Value>` cannot do this — serde collapses an explicit `null` to
+/// `None`, exactly like a missing key — and the difference matters: a
+/// present `null` is forwarded (and fails the final struct parse), while
+/// an absent key falls back to the projection default.
+#[derive(Debug, Clone, Default)]
+enum RawKey {
+  #[default]
+  Absent,
+  Null,
+  Value(serde_json::Value),
+}
+
+impl<'de> serde::Deserialize<'de> for RawKey {
+  fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+    Ok(
+      match Option::<serde_json::Value>::deserialize(deserializer)? {
+        None => Self::Null,
+        Some(serde_json::Value::Null) => Self::Null,
+        Some(value) => Self::Value(value),
+      },
+    )
+  }
+}
+
+impl RawKey {
+  /// The key for the projected entry: `Absent` is skipped by the caller
+  /// (the projection default applies), everything else is forwarded.
+  fn present(&self) -> Option<serde_json::Value> {
+    match self {
+      Self::Absent => None,
+      Self::Null => Some(serde_json::Value::Null),
+      Self::Value(value) => Some(value.clone()),
+    }
+  }
+}
+
+/// Lenient fallback entry: the scanner-visible projection of one game,
+/// parsed straight out of the body.
+///
+/// Struct at the top level on purpose — serde skips the fields the
+/// projection drops (`description`, `developers`, `cover_image`, …)
+/// instead of materialising them, so the fallback peak is the projection
+/// rather than the whole body. The three kept arrays stay as
+/// [`serde_json::Value`] because the projection is deliberately tolerant
+/// of wrongly-typed entries there (a number in `aliases` is dropped, a
+/// non-object in `executables` is defaulted) where a typed field would
+/// fail the whole fallback.
+#[derive(Deserialize)]
+struct TrimmedActivity {
+  /// Raw and optional: the DOM path forwards whatever JSON value was here
+  /// — including a present `null` or a number — and only the final struct
+  /// parse decides whether that is acceptable. `Option` is what separates
+  /// "key absent" (omit it, so the struct default applies) from "key
+  /// present but null" (forward the null, so the final parse fails), which
+  /// the two cases must not alias. A typed field here would accept and
+  /// reject different bodies than the DOM path does.
+  #[serde(default)]
+  id: RawKey,
+  #[serde(default)]
+  name: RawKey,
+  #[serde(default)]
+  hook: RawKey,
+  #[serde(default)]
+  aliases: Vec<serde_json::Value>,
+  #[serde(default)]
+  executables: Vec<serde_json::Value>,
+  #[serde(default)]
+  third_party_skus: Vec<serde_json::Value>,
+}
+
+/// Parse the database directly into trimmed activities, with no
+/// intermediate DOM.
+///
+/// Same result as [`trim_detectable_value`] followed by a struct parse,
+/// at a fraction of the transient peak: the body is never built as a
+/// `Vec<Value>`, and the trimmed projection is never collected as a
+/// second one. Used by the refresh and boot paths, which only want the
+/// parsed activities; [`trim_detectable_value`] stays for callers that
+/// want the JSON projection itself.
+///
+/// # Errors
+///
+/// [`RsrpcError::InvalidJson`](rsrpc_protocol::error::RsrpcError) when the
+/// body is not a JSON array of objects, or an entry projects into a
+/// structurally invalid activity.
+pub fn trim_parse(body: &str) -> rsrpc_protocol::error::Result<Vec<DetectableActivity>> {
+  let games: Vec<TrimmedActivity> = serde_json::from_str(body)?;
+  let mut parsed = Vec::with_capacity(games.len());
+  for game in games {
+    // Build the projection through the shared helper so the two paths
+    // cannot diverge: one small object per entry, converted and dropped
+    // before the next is read. Absent `id`/`name` default to "" and an
+    // absent `hook` is omitted, exactly as the DOM path does — passing
+    // `null` through would reach a different struct default.
+    let mut raw = serde_json::Map::new();
+    // Absent: omit the key so the projection's default applies. Present,
+    // including `null`: forward it verbatim so the final struct parse sees
+    // exactly what the DOM path would have forwarded.
+    if let Some(id) = game.id.present() {
+      raw.insert("id".to_string(), id);
+    }
+    if let Some(name) = game.name.present() {
+      raw.insert("name".to_string(), name);
+    }
+    if let Some(hook) = game.hook.present() {
+      raw.insert("hook".to_string(), hook);
+    }
+    raw.insert("aliases".to_string(), game.aliases.into());
+    raw.insert("executables".to_string(), game.executables.into());
+    raw.insert("third_party_skus".to_string(), game.third_party_skus.into());
+    let fields = trimmed_entry_fields(&serde_json::Value::Object(raw));
+    parsed.push(
+      serde_json::from_value(serde_json::Value::Object(fields))
+        .map_err(|err| rsrpc_protocol::error::RsrpcError::InvalidJson { source: err })?,
+    );
+  }
+  Ok(parsed)
 }
 
 #[skip_serializing_none]
@@ -452,4 +601,102 @@ pub fn parse_exclusions(body: &str) -> Exclusions {
     }
   }
   exclusions
+}
+
+#[cfg(test)]
+mod trim_parse_tests {
+  use super::*;
+
+  /// `trim_parse` must produce exactly what `trim_detectable_value` plus a
+  /// struct parse produces. The whole point of the struct path is to avoid
+  /// the DOMs, never to change the projection — so this is the contract.
+  fn assert_paths_agree(body: &str) {
+    let via_value: Vec<DetectableActivity> =
+      serde_json::from_value(trim_detectable_value(body).expect("value path")).expect("structs");
+    let via_struct = trim_parse(body).expect("struct path");
+    assert_eq!(
+      serde_json::to_string(&via_struct).expect("serialize"),
+      serde_json::to_string(&via_value).expect("serialize"),
+      "the two paths disagree on: {body}"
+    );
+  }
+
+  /// The bundled snapshot round-trips identically through both paths.
+  #[test]
+  fn trim_parse_matches_the_value_path_on_the_bundled_db() {
+    assert_paths_agree(BUNDLED_DETECTABLE);
+  }
+
+  /// Defaults, empty arrays, empty aliases, extra keys, and the SKU
+  /// filtering rules all agree between the paths.
+  #[test]
+  fn trim_parse_matches_the_value_path_on_edge_shapes() {
+    // Bare entries (defaults), null activity fields, extra keys dropped.
+    assert_paths_agree(r#"[{"id":"1"}]"#);
+    assert_paths_agree(r#"[{}]"#);
+    assert_paths_agree(
+      r#"[{"id":"2","name":"N","description":"dropped","developers":[{"id":"d","name":"D"}]}]"#,
+    );
+
+    // Empty aliases stay absent; blank aliases are dropped.
+    assert_paths_agree(r#"[{"id":"3","aliases":[]}]"#);
+    assert_paths_agree(r#"[{"id":"3","aliases":["  ",""]}]"#);
+    assert_paths_agree(r#"[{"id":"3","aliases":["Alt","  "]}]"#);
+
+    // Executables: absent, empty, and with arguments kept only when a
+    // non-empty string.
+    assert_paths_agree(r#"[{"id":"4","executables":[]}]"#);
+    assert_paths_agree(r#"[{"id":"4","executables":[{}]}]"#);
+    assert_paths_agree(r#"[{"id":"4","executables":[{"name":"g.exe","arguments":""}]}]"#);
+    assert_paths_agree(r#"[{"id":"4","executables":[{"name":"g.exe","arguments":"--x"}]}]"#);
+
+    // SKUs: empty distributor or id dropped; numeric id renders.
+    assert_paths_agree(r#"[{"id":"5","third_party_skus":[]}]"#);
+    assert_paths_agree(r#"[{"id":"5","third_party_skus":[{"distributor":"","id":"1"}]}]"#);
+    assert_paths_agree(r#"[{"id":"5","third_party_skus":[{"distributor":"steam","id":"99"}]}]"#);
+    assert_paths_agree(r#"[{"id":"5","third_party_skus":[{"distributor":"steam","id":99}]}]"#);
+
+    // A wrongly-typed entry the projection tolerates: a number in aliases
+    // is dropped, a non-object in executables is defaulted. The struct
+    // path must tolerate it identically, which is why those arrays stay
+    // untyped.
+    assert_paths_agree(r#"[{"id":"6","aliases":[1,"Alt"],"executables":[7,{"name":"g.exe"}]}]"#);
+  }
+
+  /// Whatever the projection accepts or rejects, both paths agree — and
+  /// they are compared as whole paths (projection *and* final struct
+  /// parse), because `trim_detectable_value` only projects and its callers
+  /// run the parse themselves. A newly accepted or newly rejected body
+  /// would change which fetch a caller falls back from.
+  #[test]
+  fn trim_parse_agrees_on_acceptance_not_just_on_content() {
+    for body in [
+      r#"[{"id":7}]"#,
+      r#"[{"id":null}]"#,
+      r#"[{"id":"ok"}]"#,
+      r#"[{"name":7}]"#,
+      r#"[{"name":null}]"#,
+      r#"[{"hook":"yes"}]"#,
+      r#"[{"hook":null}]"#,
+      r#"[{"hook":true}]"#,
+      r#"[{"aliases":[1,"Alt"],"executables":[7,{"name":"g.exe"}]}]"#,
+      r#"{"not":"an array"}"#,
+      r#"not json{{"#,
+      r#"[]"#,
+      r#"[{"id":"1","description":"d","developers":[{"id":"x","name":"y"}]}]"#,
+    ] {
+      let value = trim_detectable_value(body).and_then(|projected| {
+        serde_json::from_value::<Vec<DetectableActivity>>(projected)
+          .map_err(|err| rsrpc_protocol::error::RsrpcError::InvalidJson { source: err })
+      });
+      let structured = trim_parse(body);
+      assert_eq!(
+        value.is_ok(),
+        structured.is_ok(),
+        "acceptance disagrees for {body}: value={:?} struct={:?}",
+        value.map(|v| v.len()).map_err(|e| e.to_string()),
+        structured.map(|v| v.len()).map_err(|e| e.to_string()),
+      );
+    }
+  }
 }

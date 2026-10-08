@@ -119,15 +119,13 @@ pub fn fetch_detectable_etag(
   // an identical error would double the failure cost for nothing.
   let parsed = match serde_json::from_str::<Vec<DetectableActivity>>(&body) {
     Ok(parsed) => parsed,
-    Err(first_err) => {
-      if let Ok(trimmed) = crate::db::trim_detectable_value(&body)
-        && let Ok(parsed) = serde_json::from_value::<Vec<DetectableActivity>>(trimmed)
-      {
-        parsed
-      } else {
-        return Err(first_err.into());
-      }
-    }
+    Err(first_err) => match crate::db::trim_parse(&body) {
+      Ok(parsed) => parsed,
+      // Neither shape parses: reuse the direct parse's error, which names
+      // the real problem. Re-parsing the same body a third time just to
+      // produce an identical error would double the failure cost.
+      Err(_) => return Err(first_err.into()),
+    },
   };
   // The raw body has served its purposes (raw hash above, parse input
   // here): drop its ~13MB BEFORE the canonical hash and the automata

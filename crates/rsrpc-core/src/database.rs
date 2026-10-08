@@ -45,10 +45,7 @@ pub fn parse_body(body: &str) -> Result<(Vec<DetectableActivity>, &'static str)>
   if let Ok(parsed) = serde_json::from_str::<Vec<DetectableActivity>>(body) {
     return Ok((parsed, "direct"));
   }
-  let trimmed = db::trim_detectable_value(body)?;
-  let parsed: Vec<DetectableActivity> =
-    serde_json::from_value(trimmed).map_err(|err| RsrpcError::InvalidJson { source: err })?;
-  Ok((parsed, "trimmed"))
+  Ok((db::trim_parse(body)?, "trimmed"))
 }
 
 /// Read a database file, then [`parse_body`].
