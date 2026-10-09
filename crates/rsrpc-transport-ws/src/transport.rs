@@ -693,23 +693,32 @@ impl WsTransport {
     // bounded by the youngest entry instead of stalling shutdown on a
     // wedged bridge. Past-budget leftovers shed counted.
     sink.flush_pending(&self.pending_clears);
+    // Drain in batches: one lock per batch instead of one per entry, and
+    // the shared queue is empty between batches so a late staging cannot
+    // be stranded by a walk that already passed it.
     loop {
-      let next = {
-        let mut pending = self
-          .pending_clears
-          .lock()
-          .unwrap_or_else(|e| e.into_inner());
-        if pending.is_empty() {
-          break;
-        }
-        pending.pop_front()
-      };
-      let Some(next) = next else { break };
-      sink
-        .emit_clear_retry(next.payload.into_cmd(), next.deadline)
-        .await;
+      let batch = take_pending(&self.pending_clears);
+      if batch.is_empty() {
+        break;
+      }
+      for entry in batch {
+        sink
+          .emit_clear_retry(entry.payload.into_cmd(), entry.deadline)
+          .await;
+      }
     }
   }
+}
+
+/// Take the whole staged queue at once, leaving an empty one behind.
+///
+/// The shutdown drain used to lock, pop one entry, unlock, await that
+/// entry's bounded retry, and repeat — one lock acquisition per entry and
+/// a queue that kept shifting under each pop. Taking it in one lock costs
+/// the same total work and leaves the shared queue empty, so a late
+/// staging is never stranded by a drain that already walked past it.
+fn take_pending(pending: &Mutex<PendingQueue>) -> PendingQueue {
+  std::mem::take(&mut *pending.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 impl Drop for WsTransport {
@@ -1519,5 +1528,76 @@ mod tests {
       MAX_PENDING_COMMANDS,
       "the staged queue must be untouched"
     );
+  }
+  /// N13: the shutdown drain takes the queue in batches, not one entry per
+  /// lock round-trip.
+  ///
+  /// It used to lock, pop one entry, unlock, await its bounded retry, and
+  /// repeat — so a wedge at shutdown paid one lock acquisition per entry
+  /// and the queue kept shifting under each pop. Taking the whole queue
+  /// leaves one lock and an empty queue behind, and the per-entry await
+  /// (each clear keeps its own deadline) is unchanged.
+  #[tokio::test]
+  async fn a_drain_take_empties_the_queue_in_one_lock() {
+    let (tx, mut rx) = mpsc::channel(8);
+    let sink = Sink {
+      tx,
+      dropped: Arc::new(AtomicU64::new(0)),
+    };
+    let pending = Mutex::new(PendingQueue::new());
+    for pid in [1u64, 2, 3] {
+      sink.stage_clear(&pending, &slot(pid));
+    }
+
+    // One take replaces the whole queue; nothing is lost and the shared
+    // queue is empty, so a concurrent stager cannot be stranded.
+    let batch = take_pending(&pending);
+    assert_eq!(batch.len(), 3, "the whole queue leaves in one take");
+    assert!(
+      pending.lock().unwrap().is_empty(),
+      "the shared queue must be empty after the take"
+    );
+    // Deliver the batch: order is the queue's, unchanged by taking it.
+    for entry in batch {
+      assert!(
+        sink
+          .emit_clear_retry(entry.payload.into_cmd(), entry.deadline)
+          .await
+      );
+    }
+    for pid in [1u64, 2, 3] {
+      let cmd = rx.try_recv().expect("drained in order");
+      assert_eq!(cmd.args.as_ref().and_then(|a| a.pid), Some(pid));
+    }
+    assert_eq!(sink.dropped.load(Ordering::Relaxed), 0);
+  }
+
+  /// A second take after a late staging still drains it: the drain loops on
+  /// batches rather than assuming the first take finished the job.
+  #[tokio::test]
+  async fn a_second_take_still_drains_late_entries() {
+    let (tx, mut rx) = mpsc::channel(8);
+    let sink = Sink {
+      tx,
+      dropped: Arc::new(AtomicU64::new(0)),
+    };
+    let pending = Mutex::new(PendingQueue::new());
+    sink.stage_clear(&pending, &slot(1));
+    assert_eq!(take_pending(&pending).len(), 1);
+    assert!(pending.lock().unwrap().is_empty());
+
+    // A straggler staged after the first batch (nothing does this today,
+    // but the drain must not silently drop it).
+    sink.stage_clear(&pending, &slot(9));
+    let second = take_pending(&pending);
+    assert_eq!(second.len(), 1, "a late entry is still drained");
+    assert_eq!(
+      second.front().map(|entry| match &entry.payload {
+        PendingPayload::Clear(clear) => clear.pid,
+        PendingPayload::Publish(cmd) => cmd.args.as_ref().and_then(|a| a.pid).unwrap_or_default(),
+      }),
+      Some(9)
+    );
+    let _ = rx.try_recv();
   }
 }
