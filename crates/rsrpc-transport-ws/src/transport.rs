@@ -1085,8 +1085,17 @@ async fn on_message(
       }
       "SUBSCRIBE" | "UNSUBSCRIBE" => handlers::handle_subscribe(&event, &slot.responder).await,
       "GET_USER" => {
-        let snapshot = user.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        handlers::handle_get_user(&event, &snapshot, &slot.responder).await
+        // Serialize under the guard, then drop it before the await: a std
+        // Mutex must never be held across a suspension point. The user is
+        // borrowed, so the reply is serialized straight from the shared
+        // value — the snapshot this replaces deep-copied every field of
+        // `RpcUser` on every GET_USER.
+        let response = {
+          let user = user.lock().unwrap_or_else(|e| e.into_inner());
+          handlers::get_user_response(&event, &user)
+        };
+        let reply = Message::Text(response.into());
+        handlers::reply(&slot.responder, reply).await
       }
       other => handlers::handle_unknown(other, &event, &slot.responder).await,
     }

@@ -26,11 +26,24 @@ const REPLY_SEND_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Queue one reply with a bounded wait. `false` means the client is gone
 /// or stalled past the budget: the caller prunes it.
-async fn reply(responder: &Responder, message: Message) -> bool {
+pub(crate) async fn reply(responder: &Responder, message: Message) -> bool {
   responder
     .send_timeout(message, REPLY_SEND_TIMEOUT)
     .await
     .is_ok()
+}
+
+/// Serialize the `GET_USER` reply from a **borrowed** user.
+///
+/// Synchronous on purpose: the caller holds the shared user's guard only
+/// for this call and releases it before awaiting the reply — a std `Mutex`
+/// must never be held across a suspension point. Borrowing also means the
+/// reply is serialized straight from the shared value: the snapshot this
+/// replaces deep-copied every field of `RpcUser` on every `GET_USER`.
+pub(crate) fn get_user_response(event: &ActivityCmd, user: &RpcUser) -> String {
+  let wanted = event.args.as_ref().and_then(|args| args.user_id.as_ref());
+  let matched = wanted.is_none_or(|id| *id == user.id);
+  commands::user_response(event, matched.then_some(user))
 }
 
 /// Echo for a browser command (invite/template/gift): the command's own
@@ -171,21 +184,6 @@ pub(crate) async fn handle_subscribe(event: &ActivityCmd, responder: &Responder)
   reply(
     responder,
     Message::Text(commands::subscribe_ack(event).into()),
-  )
-  .await
-}
-
-/// Answer `GET_USER` with the current identity, or null for strangers.
-pub(crate) async fn handle_get_user(
-  event: &ActivityCmd,
-  user: &RpcUser,
-  responder: &Responder,
-) -> bool {
-  let wanted = event.args.as_ref().and_then(|args| args.user_id.as_ref());
-  let matched = wanted.is_none_or(|id| *id == user.id);
-  reply(
-    responder,
-    Message::Text(commands::user_response(event, matched.then_some(user)).into()),
   )
   .await
 }
@@ -401,5 +399,75 @@ mod tests {
     assert!(!data.contains_key("pid"), "an absent key stays absent");
     assert!(!data.contains_key("activity"), "an absent key stays absent");
     assert!(!data.contains_key("user_id"), "an absent key stays absent");
+  }
+
+  /// A `GET_USER` reply carries the borrowed user, id included.
+  ///
+  /// Pins the shape this reply had while it was built from a clone: the
+  /// serialization is unchanged, so only where the value came from moved.
+  #[test]
+  fn a_get_user_reply_carries_the_borrowed_user() {
+    let event = get_user_cmd(None);
+
+    let body: Value =
+      serde_json::from_str(&get_user_response(&event, &fixture_user())).expect("the reply is JSON");
+
+    assert_eq!(body["cmd"], "GET_USER");
+    assert_eq!(body["data"]["id"], "42", "the id travels");
+    assert_eq!(body["data"]["username"], "tester");
+  }
+
+  /// A `GET_USER` for someone else answers null data, not an empty user.
+  #[test]
+  fn a_get_user_for_a_stranger_answers_null() {
+    let event = get_user_cmd(Some("99".to_string()));
+
+    let body: Value =
+      serde_json::from_str(&get_user_response(&event, &fixture_user())).expect("the reply is JSON");
+
+    assert_eq!(body["cmd"], "GET_USER");
+    assert!(body["data"].is_null(), "a stranger gets null data");
+  }
+
+  /// The matching user gets the user, so the id check is symmetric: asking
+  /// for yourself is not a stranger.
+  #[test]
+  fn a_get_user_for_yourself_answers_the_user() {
+    let event = get_user_cmd(Some("42".to_string()));
+
+    let body: Value =
+      serde_json::from_str(&get_user_response(&event, &fixture_user())).expect("the reply is JSON");
+
+    assert_eq!(body["data"]["id"], "42", "asking for yourself matches");
+  }
+
+  fn fixture_user() -> RpcUser {
+    RpcUser {
+      id: "42".to_string(),
+      username: "tester".to_string(),
+      discriminator: "0001".to_string(),
+      global_name: Some("Tester".to_string()),
+      avatar: None,
+      avatar_decoration_data: None,
+      bot: false,
+      flags: 0,
+      premium_type: 0,
+    }
+  }
+
+  fn get_user_cmd(user_id: Option<String>) -> ActivityCmd {
+    ActivityCmd {
+      application_id: None,
+      cmd: "GET_USER".to_string(),
+      args: Some(ActivityCmdArgs {
+        pid: None,
+        activity: None,
+        code: None,
+        user_id,
+      }),
+      data: None,
+      evt: None,
+      nonce: Value::String("n4".to_string()),
+    }
   }
 }
