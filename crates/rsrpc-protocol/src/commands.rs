@@ -478,7 +478,14 @@ pub struct RecentActivities {
   /// table in the workspace: the keys come from our own parsed command,
   /// not from an attacker-chosen login, so SipHash's DoS resistance buys
   /// nothing and costs hashing on the flood path.
-  entries: rustc_hash::FxHashMap<(String, u64), (Bytes, std::time::Instant)>,
+  ///
+  /// The id is an [`AppId`] because the caller holds one (`ActivityCmd`
+  /// carries it refcounted): keying by it makes recording a refcount bump
+  /// instead of the `String` allocation a borrowed `&str` key forced on
+  /// every publish. `None` is its own slot — a command with no id is not
+  /// the same as one with an empty id, and neither is worth allocating a
+  /// sentinel for.
+  entries: rustc_hash::FxHashMap<(Option<AppId>, u64), (Bytes, std::time::Instant)>,
 }
 
 impl RecentActivities {
@@ -514,11 +521,21 @@ impl RecentActivities {
   /// The payload recorded for `(app_id, pid)`, if any (tests and
   /// diagnostics). Shares its buffer with the caller that tracked it.
   #[must_use]
-  pub fn recorded(&self, app_id: &str, pid: u64) -> Option<&Bytes> {
+  pub fn recorded(&self, app_id: Option<&AppId>, pid: u64) -> Option<&Bytes> {
+    self.entries.get(&(app_id.cloned(), pid)).map(|(fp, _)| fp)
+  }
+
+  /// The app id recorded for `(app_id, pid)`, if any.
+  ///
+  /// Shares its refcount with the caller: this is how a test proves the
+  /// key is borrowed rather than rebuilt. The probe clones the `Arc`, which
+  /// is a refcount bump — no allocation, which is the whole point.
+  #[must_use]
+  pub fn recorded_key(&self, app_id: Option<&AppId>, pid: u64) -> Option<&AppId> {
     self
       .entries
-      .get(&(app_id.to_string(), pid))
-      .map(|(fp, _)| fp)
+      .get_key_value(&(app_id.cloned(), pid))
+      .and_then(|(key, _)| key.0.as_ref())
   }
 
   /// `true` when this exact payload was already seen from `(app_id, pid)`
@@ -532,15 +549,16 @@ impl RecentActivities {
   /// instead of a second copy.
   pub fn should_drop(
     &mut self,
-    app_id: &str,
+    app_id: Option<&AppId>,
     pid: u64,
     payload: Option<&Bytes>,
     now: std::time::Instant,
   ) -> bool {
-    // One allocation per call: build the key once, borrow it for probes,
-    // move it into the insert. (An `AppId` key would allocate identically
-    // here — callers hold `&str` — so the tuple stays `String`-keyed.)
-    let key = (app_id.to_string(), pid);
+    // One key per call, built once: the probe borrows it, the insert moves
+    // it. Cloning an `AppId` is a refcount bump, so tracking a publish
+    // allocates nothing for the key — the `&str` form this replaces paid a
+    // `String` on every call.
+    let key = (app_id.cloned(), pid);
     let Some(bytes) = payload else {
       self.entries.remove(&key);
       return false;

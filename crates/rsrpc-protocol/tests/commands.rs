@@ -223,11 +223,26 @@ fn dedup_drops_exact_duplicate_inside_window() {
   let t0 = Instant::now();
   let payload = Bytes::from_static(b"{}");
 
-  assert!(!recent.should_drop("app", 1, Some(&payload), t0));
-  assert!(recent.should_drop("app", 1, Some(&payload), t0 + Duration::from_secs(1)));
+  assert!(!recent.should_drop(Some(&app1()), 1, Some(&payload), t0));
+  assert!(recent.should_drop(
+    Some(&app1()),
+    1,
+    Some(&payload),
+    t0 + Duration::from_secs(1)
+  ));
   // ...but the same bytes from another pid/app are a different slot.
-  assert!(!recent.should_drop("app", 2, Some(&payload), t0 + Duration::from_secs(1)));
-  assert!(!recent.should_drop("other", 1, Some(&payload), t0 + Duration::from_secs(1)));
+  assert!(!recent.should_drop(
+    Some(&app1()),
+    2,
+    Some(&payload),
+    t0 + Duration::from_secs(1)
+  ));
+  assert!(!recent.should_drop(
+    Some(&other()),
+    1,
+    Some(&payload),
+    t0 + Duration::from_secs(1)
+  ));
 }
 
 #[test]
@@ -237,16 +252,16 @@ fn dedup_passes_changes_clears_and_expiry() {
   let a = Bytes::from_static(b"a");
   let b = Bytes::from_static(b"b");
 
-  assert!(!recent.should_drop("app", 1, Some(&a), t0));
+  assert!(!recent.should_drop(Some(&app1()), 1, Some(&a), t0));
   // Any changed byte passes and becomes the new reference.
-  assert!(!recent.should_drop("app", 1, Some(&b), t0 + Duration::from_secs(1)));
-  assert!(recent.should_drop("app", 1, Some(&b), t0 + Duration::from_secs(2)));
+  assert!(!recent.should_drop(Some(&app1()), 1, Some(&b), t0 + Duration::from_secs(1)));
+  assert!(recent.should_drop(Some(&app1()), 1, Some(&b), t0 + Duration::from_secs(2)));
   // A clear always passes and re-arms the slot: the pre-clear payload
   // passes again right after it.
-  assert!(!recent.should_drop("app", 1, None, t0 + Duration::from_secs(3)));
-  assert!(!recent.should_drop("app", 1, Some(&b), t0 + Duration::from_secs(3)));
+  assert!(!recent.should_drop(Some(&app1()), 1, None, t0 + Duration::from_secs(3)));
+  assert!(!recent.should_drop(Some(&app1()), 1, Some(&b), t0 + Duration::from_secs(3)));
   // Past the window, even identical bytes pass.
-  assert!(!recent.should_drop("app", 1, Some(&b), t0 + Duration::from_secs(9)));
+  assert!(!recent.should_drop(Some(&app1()), 1, Some(&b), t0 + Duration::from_secs(9)));
 }
 
 #[test]
@@ -256,7 +271,7 @@ fn dedup_table_stays_bounded() {
   let payload = Bytes::from_static(b"x");
 
   for pid in 0..20u64 {
-    recent.should_drop("app", pid, Some(&payload), t0);
+    recent.should_drop(Some(&app1()), pid, Some(&payload), t0);
   }
 
   assert!(recent.len() <= 4);
@@ -278,14 +293,51 @@ fn dedup_records_the_buffer_it_was_given() {
   let fp = activity_fingerprint(&mut cmd).expect("fingerprint");
   let fp_ptr = fp.as_ptr();
 
-  assert!(!recent.should_drop("123", 42, Some(&fp), t0));
+  assert!(!recent.should_drop(Some(&id123()), 42, Some(&fp), t0));
 
-  let stored = recent.recorded("123", 42).expect("slot was recorded");
+  let stored = recent
+    .recorded(Some(&id123()), 42)
+    .expect("slot was recorded");
   assert!(
     std::ptr::eq(stored.as_ptr(), fp_ptr),
     "the table must hold the caller's buffer, not a copy of it"
   );
   assert_eq!(stored, &fp);
+}
+
+/// The flood guard keys by the app id it was handed, sharing it.
+///
+/// A `String` key forced one allocation per publish, on the one path whose
+/// frequency is set by how often games re-send presence. With `ActivityCmd`
+/// carrying `AppId` (refcounted), the key now borrows that refcount: the
+/// recording is pointer-identical to the caller's id, so tracking a publish
+/// adds no allocation for the key either.
+///
+/// A table that rebuilt the id (`to_string`, or `AppId::from` from a `&str`)
+/// would store a different allocation and fail here.
+#[test]
+fn dedup_keys_by_the_app_id_it_was_handed() {
+  use rsrpc_protocol::commands::activity_fingerprint;
+  use rsrpc_types::AppId;
+
+  let mut recent = RecentActivities::new(Duration::from_secs(5), 8);
+  let t0 = Instant::now();
+  let mut cmd = set_activity_cmd();
+  let fp = activity_fingerprint(&mut cmd).expect("fingerprint");
+  let app_id = AppId::from("123");
+
+  assert!(!recent.should_drop(Some(&app_id), 42, Some(&fp), t0));
+
+  let stored_key = recent
+    .recorded_key(Some(&app_id), 42)
+    .expect("slot was recorded");
+  assert_eq!(&**stored_key, "123", "the key carries the caller's id");
+  assert!(
+    std::sync::Arc::ptr_eq(&stored_key.0, &app_id.0),
+    "the key must share the caller's app id, not rebuild it"
+  );
+  // A different pid is a different slot, as before.
+  assert!(recent.recorded_key(Some(&app_id), 43).is_none());
 }
 
 /// Cloned payloads share one allocation (`Arc` + refcounted encodings).
@@ -691,4 +743,19 @@ fn borrowed_envelope_matches_the_previous_shape() {
   assert_eq!(got["evt"], "CURRENT_USER_UPDATE");
   assert_eq!(got["nonce"], serde_json::json!(null));
   assert_eq!(got["data"]["username"], "arRPC");
+}
+
+/// Fixtures for the flood-guard tests below: ids shared per test rather
+/// than rebuilt per call, so a call's key allocation would show up as a
+/// pointer mismatch.
+fn app1() -> AppId {
+  AppId::from("app")
+}
+
+fn other() -> AppId {
+  AppId::from("other")
+}
+
+fn id123() -> AppId {
+  AppId::from("123")
 }

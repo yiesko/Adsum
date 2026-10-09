@@ -187,7 +187,7 @@ impl Shared {
       .lock()
       .unwrap_or_else(|e| e.into_inner())
       .should_drop(
-        cmd.application_id.as_deref().unwrap_or(""),
+        cmd.application_id.as_ref(),
         pid,
         fingerprint,
         std::time::Instant::now(),

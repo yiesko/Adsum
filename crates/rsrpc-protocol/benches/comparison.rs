@@ -117,24 +117,24 @@ fn benchmark_set_activity_response(c: &mut Criterion) {
 
 /// Flood path: fingerprint once, drop repeats without building envelopes.
 fn benchmark_flood_drop_pipeline(c: &mut Criterion) {
-  // The flood path after the reorder: fingerprint once, then drop on the
-  // repeat publish — without ever building the envelope. The guard is
-  // seeded once outside the loop so every measured iteration is a drop.
   let mut cmd = sample_command();
   cmd.fix();
   let mut guard = RecentActivities::default();
-  // One timestamp for seeding and every iteration: a fresh `now` per
-  // iteration would eventually age past the dedup window and measure the
-  // admit path instead of the drop path.
   let seeded_at = std::time::Instant::now();
+  // Keyed the way the production flood guard is: the command's own
+  // refcounted `AppId`, shared rather than rebuilt.
+  let app_id = cmd
+    .application_id
+    .clone()
+    .expect("sample command carries an application id");
   {
     let fp = activity_fingerprint(&mut cmd).expect("fingerprint");
-    assert!(!guard.should_drop("123", 42, Some(&fp), seeded_at));
+    assert!(!guard.should_drop(Some(&app_id), 42, Some(&fp), seeded_at));
   }
   c.bench_function("publish_flood_drop", |b| {
     b.iter(|| {
       let fp = activity_fingerprint(black_box(&mut cmd)).expect("fingerprint");
-      black_box(guard.should_drop("123", 42, Some(&fp), seeded_at))
+      black_box(guard.should_drop(Some(&app_id), 42, Some(&fp), seeded_at))
     })
   });
 }
