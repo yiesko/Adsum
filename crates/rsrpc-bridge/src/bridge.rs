@@ -826,6 +826,18 @@ async fn refresh_task(shared: Arc<Shared>, interval: Duration, token: Cancellati
 /// Re-broadcast cached activities so late joiners converge; always marks
 /// the snapshot dirty, even when there is nothing to send.
 fn refresh_once(shared: &Arc<Shared>) {
+  // Nothing to broadcast without a listener: skip the cache walk and the
+  // Vec of refcount bumps it used to build before `send_to_all` could tell
+  // it there was nobody to send to. The snapshot timestamp still moves.
+  if shared
+    .consumers
+    .lock()
+    .unwrap_or_else(|e| e.into_inner())
+    .is_empty()
+  {
+    shared.dirty.store(true, Ordering::Relaxed);
+    return;
+  }
   let payloads: Vec<Arc<CachedActivity>> = shared
     .cache
     .lock()
@@ -1023,4 +1035,61 @@ mod tests {
       None
     );
   }
+}
+
+/// The periodic refresh must not do work nobody asked for.
+///
+/// It used to clone the whole replay cache into a Vec under the cache
+/// lock before checking whether anyone was listening, and `send_to_all`
+/// returns immediately with no consumers — so every interval paid a Vec
+/// allocation plus one refcount bump per cached card to send nothing.
+///
+/// The snapshot timestamp still has to move: a live-but-idle daemon must
+/// not look stale to slot reuse, which is exactly the invariant an early
+/// return is most likely to break.
+#[test]
+fn refresh_with_no_consumers_still_touches_the_snapshot() {
+  let shared = Arc::new(Shared {
+    consumers: Mutex::new(FxHashMap::default()),
+    cache: Mutex::new(HashMap::new()),
+    activity_seq: Mutex::new(0),
+    last_process: Mutex::new(HashMap::new()),
+    handoff: Mutex::new(HandoffState::default()),
+    recent: Mutex::new(RecentActivities::default()),
+    user: Arc::new(Mutex::new(RpcUser::default())),
+    dirty: AtomicBool::new(false),
+    dropped_broadcasts: AtomicU64::new(0),
+    app_version: String::new(),
+    state_path: None,
+    json_port: 0,
+    msgpack_port: 0,
+    ws_port: None,
+    ipc_path: None,
+    ipc_tx: None,
+    game_tx: None,
+    proc_tx: None,
+    game_clients: None,
+    watch_shed: None,
+    allowed_origins: Vec::new(),
+  });
+  // One cached card, so the old path had something to clone.
+  let payload = commands::empty_cached(1, SocketId::from("sock-1")).expect("payload");
+  shared
+    .cache
+    .lock()
+    .unwrap()
+    .insert(SocketId::from("sock-1"), (payload, 0));
+  assert!(!shared.dirty.load(Ordering::Relaxed));
+
+  refresh_once(&shared);
+
+  assert!(
+    shared.dirty.load(Ordering::Relaxed),
+    "an idle refresh must still move the snapshot timestamp"
+  );
+  // Nothing was broadcast: there is no consumer to send to.
+  assert!(
+    shared.consumers.lock().unwrap().is_empty(),
+    "no consumer should be registered by a refresh"
+  );
 }
