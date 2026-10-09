@@ -453,3 +453,50 @@ async fn client_ids_are_unique_across_servers() {
   server_a.shutdown().await;
   server_b.shutdown().await;
 }
+
+/// A full outbox is reported to the caller; the server never disconnects a
+/// slow consumer on its own.
+///
+/// `DisconnectReason::SlowConsumer` exists in the API but is never emitted,
+/// and the crate-level docs used to claim the opposite ("slow consumers are
+/// pruned"). Pruning on a full outbox would be a behavior change, not a
+/// docs fix, so the contract is pinned here: the outbox stays full, the
+/// connection stays open, and the disconnect that eventually arrives is the
+/// one the caller asked for.
+#[tokio::test]
+async fn a_full_outbox_is_reported_not_disconnected() {
+  let config = ServerConfig::builder("127.0.0.1:0".parse().unwrap())
+    .per_client_queue(1)
+    .build()
+    .unwrap();
+  let (server, mut hub) = Server::bind(config).await.unwrap();
+  let addr = server.local_addr();
+
+  // Never read from this client: the outbox fills and stays full.
+  let _ws = connect(addr).await;
+  let responder = match next_event(&mut hub).await {
+    Event::Connect(_, responder) => responder,
+    other => panic!("expected Connect, got {other:?}"),
+  };
+  let _ = responder.try_send(Message::from("first")); // fills the queue
+  assert!(
+    matches!(
+      responder.try_send(Message::from("overflow")),
+      Err(rsrpc_ws::TrySendError::Full)
+    ),
+    "an outbox at capacity reports Full"
+  );
+
+  // No disconnect of any kind: the flood itself must not take the
+  // connection down, whatever reason the server would label it with. The
+  // outbox stays full and the connection stays open; pruning is the
+  // caller's call, not the server's.
+  if let Ok(Some(Event::Disconnect(_, reason))) =
+    tokio::time::timeout(Duration::from_millis(50), hub.next()).await
+  {
+    panic!("a full outbox must not disconnect the client (got {reason:?})");
+  }
+
+  // The connection is still the caller's to prune.
+  responder.close(rsrpc_ws::CloseCode::Normal).await;
+}

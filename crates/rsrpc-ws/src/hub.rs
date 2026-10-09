@@ -34,6 +34,13 @@ pub enum DisconnectReason {
   /// Silent past `idle_timeout` despite server pings (half-open reaped).
   IdleTimeout,
   /// Pruned by policy: outbound queue stayed full (slow consumer).
+  ///
+  /// Never emitted today. The server *bounds* the outbox and reports
+  /// [`TrySendError::Full`] to the caller, which decides whether to
+  /// retry, drop or prune — that is where a slow consumer is actually
+  /// reaped (see [`Responder::try_send`]). Kept so the variant is
+  /// available if pruning ever moves into the server; it is not a
+  /// promise that it has.
   SlowConsumer,
   /// Server is shutting down.
   ServerShutdown,
