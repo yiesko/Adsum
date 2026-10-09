@@ -33,7 +33,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::BridgeConfig;
-use crate::consumer::{BridgeProtocol, Consumer, ConsumerMap, send_cached, send_message};
+use crate::consumer::{BridgeProtocol, Consumer, ConsumerMap, Frame, send_cached, send_frame};
 use crate::control::handle_bridge_control;
 use crate::handoff::{
   ClearReason, HandoffState, ProcInput, is_process_alive, track_process_publication,
@@ -410,7 +410,7 @@ async fn bridge_pump(hub: EventHub, shared: Arc<Shared>, default_protocol: Bridg
           .lock()
           .unwrap_or_else(|e| e.into_inner())
           .ready_payload();
-        send_message(&responder, &ready, protocol);
+        send_frame(&responder, &Frame::new(ready), protocol);
         // Replay for late joiners.
         let cached: Vec<Arc<CachedActivity>> = shared
           .cache
@@ -466,19 +466,21 @@ async fn bridge_pump(hub: EventHub, shared: Arc<Shared>, default_protocol: Bridg
                 .get(&id)
                 .map(|consumer| consumer.responder.clone())
               {
-                send_message(&responder, &ack, protocol);
+                send_frame(&responder, &Frame::new(ack), protocol);
               }
               if let Some(user) = changed {
                 let dispatch = commands::current_user_update(&user);
                 // One pass over one map, each consumer answered in its own
                 // encoding — the two-map version walked both for a combined
-                // total that equals this single walk.
+                // total that equals this single walk. The frame is encoded
+                // once and shared, so K MessagePack consumers cost one
+                // derive instead of K.
+                let frame = Frame::new(dispatch);
                 let mut consumers = shared.consumers.lock().unwrap_or_else(|e| e.into_inner());
                 let dead: Vec<ClientId> = consumers
                   .iter()
                   .filter_map(|(id, consumer)| {
-                    (!send_message(&consumer.responder, &dispatch, consumer.protocol))
-                      .then_some(*id)
+                    (!send_frame(&consumer.responder, &frame, consumer.protocol)).then_some(*id)
                   })
                   .collect();
                 for id in dead {
