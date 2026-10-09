@@ -467,7 +467,11 @@ pub fn set_activity_response(cmd: &mut ActivityCmd) -> Option<String> {
 pub struct RecentActivities {
   window: std::time::Duration,
   cap: usize,
-  entries: HashMap<(String, u64), (Bytes, std::time::Instant)>,
+  /// Keyed by `(app_id, pid)`, hashed with `FxHash` like every other
+  /// table in the workspace: the keys come from our own parsed command,
+  /// not from an attacker-chosen login, so SipHash's DoS resistance buys
+  /// nothing and costs hashing on the flood path.
+  entries: rustc_hash::FxHashMap<(String, u64), (Bytes, std::time::Instant)>,
 }
 
 impl RecentActivities {
@@ -484,7 +488,7 @@ impl RecentActivities {
     Self {
       window,
       cap,
-      entries: HashMap::new(),
+      entries: rustc_hash::FxHashMap::default(),
     }
   }
 
@@ -595,5 +599,26 @@ mod tests {
       assert_eq!(parsed["cmd"], "SET_ACTIVITY");
       assert_eq!(parsed["evt"], evt.map_or(Value::Null, |e| e.into()));
     }
+  }
+
+  /// N20: the flood guard hashes with the workspace's `FxHashMap`, not
+  /// `std`'s `SipHash`.
+  ///
+  /// The guard runs once per publish over `(String, u64)` keys — small,
+  /// and derived from our own parsed command rather than from an
+  /// attacker-chosen login, so SipHash's DoS resistance buys nothing here
+  /// and costs hashing on the hot path. Every other table in the
+  /// workspace already uses `FxHash`.
+  ///
+  /// Structural, because the win is hashing cost: no behavioral assertion
+  /// can tell the two hashers apart, they just produce different bucket
+  /// orders. The helper's parameter type is the assertion — it stops
+  /// compiling if the field ever reverts.
+  #[test]
+  fn flood_guard_uses_the_workspace_hasher() {
+    // Compiles only for a `FxHashMap`.
+    fn assert_fx<K: Eq + std::hash::Hash, V>(_: &rustc_hash::FxHashMap<K, V>) {}
+    let guard = RecentActivities::default();
+    assert_fx(&guard.entries);
   }
 }
