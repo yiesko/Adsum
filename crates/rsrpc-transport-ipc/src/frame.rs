@@ -220,6 +220,33 @@ pub fn send_empty(sink: &EventSink, pid: u64) {
   sink.emit_clear(activity);
 }
 
+/// Floor for the reused read buffer.
+///
+/// Steady-state frames are a few hundred bytes; the payload cap is 1 MiB.
+/// A buffer that grew past the floor held it for an oversized frame, so
+/// the surplus is handed back rather than remembered for the connection's
+/// whole life — with one pump per connection, the cap would otherwise be
+/// paid per connection.
+const MESSAGE_BUFFER_FLOOR: usize = 64 * 1024;
+
+/// Hand back the read buffer's surplus capacity after a frame.
+///
+/// `String::clear()` keeps the capacity, which is what makes the buffer
+/// reusable across frames — and what makes one oversized frame stick for
+/// the rest of the connection. Releasing only past the floor keeps both
+/// properties: reuse for normal traffic, no permanent retention for a
+/// spike.
+///
+/// Clears first, because `shrink_to` never moves below the current
+/// length: releasing after a 1 MiB frame without clearing would be a
+/// no-op, which is what the first version of this did.
+fn release_message_capacity(message: &mut String) {
+  message.clear();
+  if message.capacity() > MESSAGE_BUFFER_FLOOR {
+    message.shrink_to(MESSAGE_BUFFER_FLOOR);
+  }
+}
+
 /// Pump one connection until close, error, or peer loss.
 ///
 /// `stream` is any synchronous duplex byte stream (socketpair, socket,
@@ -330,6 +357,11 @@ pub fn handle_stream(ipc: &mut dyn IpcFacilitator, stream: &mut (impl Read + Wri
         tracing::debug!("[ipc] Recieved pong");
       }
     }
+
+    // Reuse the buffer for the next frame, but do not remember a spike:
+    // one oversized payload would otherwise hold its capacity for the
+    // connection's whole life.
+    release_message_capacity(&mut message);
   }
 }
 
@@ -577,5 +609,57 @@ fn handle_set_activity(
   // lock-step guarantee is the reply itself, not a rewritten body.
   if let Err(err) = stream.write_all(&encode(PacketType::Frame, &response)) {
     tracing::warn!("[ipc] Error sending connection response: {err}");
+  }
+}
+
+#[cfg(test)]
+mod read_buffer_tests {
+  use super::*;
+
+  /// N29: one oversized frame must not pin its buffer for the rest of the
+  /// connection's life.
+  ///
+  /// The read buffer is reused across frames (`clear()`, not a fresh
+  /// `String`), so it keeps whatever the largest frame needed. The payload
+  /// cap is 1 MiB, and a pump serves one connection each: a single client
+  /// that ever sent a big frame would hold that much for its whole
+  /// lifetime, and the high-water mark would never come back down.
+  #[test]
+  fn an_oversized_frame_releases_the_buffer() {
+    let mut message = String::with_capacity(MAX_IPC_PAYLOAD as usize);
+    message.push_str(&"x".repeat(MAX_IPC_PAYLOAD as usize));
+    release_message_capacity(&mut message);
+    assert!(
+      message.capacity() <= MESSAGE_BUFFER_FLOOR,
+      "an oversized frame must release its buffer, kept {} bytes",
+      message.capacity()
+    );
+  }
+
+  /// The release must be conditional: steady-state frames are a few
+  /// hundred bytes, and reallocating on every one of those would trade a
+  /// one-off retention for per-frame churn.
+  #[test]
+  fn a_steady_frame_keeps_its_buffer() {
+    let mut message = String::with_capacity(256);
+    message.push_str(&"x".repeat(256));
+    let before = message.capacity();
+    release_message_capacity(&mut message);
+    assert!(
+      message.capacity() >= before,
+      "a small buffer must not be shrunk on every frame"
+    );
+  }
+
+  /// The buffer must stay usable after a release: the next frame refills
+  /// the same `String`, and the capacity rule is re-evaluated per frame.
+  #[test]
+  fn the_buffer_is_reusable_after_a_release() {
+    let mut message = String::with_capacity(MAX_IPC_PAYLOAD as usize);
+    message.push_str(&"x".repeat(MAX_IPC_PAYLOAD as usize));
+    release_message_capacity(&mut message);
+    message.clear();
+    message.push_str("next-frame");
+    assert_eq!(message, "next-frame");
   }
 }
