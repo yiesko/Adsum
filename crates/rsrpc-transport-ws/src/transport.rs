@@ -202,6 +202,13 @@ impl ClientSlot {
   fn forget_published(&mut self, pid: u64) {
     if let Some(pos) = self.published.iter().position(|entry| entry.pid == pid) {
       self.published.remove(pos);
+      // Hand the buffer back once nothing is published: its capacity is
+      // whatever a multiplexing client peaked at, and holding that for the
+      // connection's whole life is how the per-connection footprint
+      // ratchets.
+      if self.published.is_empty() {
+        self.published = Vec::new();
+      }
     }
   }
 
@@ -1599,5 +1606,78 @@ mod tests {
       Some(9)
     );
     let _ = rx.try_recv();
+  }
+
+  /// N12: a connection that forgets its last published pid releases the
+  /// `published` buffer instead of holding its high-water mark.
+  ///
+  /// The list grows with what a multiplexing client publishes, so its
+  /// capacity is that client's peak — not the steady state. Replacing it
+  /// with a fresh `Vec` when it drains returns that buffer while the
+  /// connection is still open, which is where the per-connection
+  /// footprint would otherwise ratchet.
+  #[test]
+  fn forgetting_the_last_pid_releases_the_published_buffer() {
+    let mut slot = ClientSlot {
+      responder: rsrpc_ws::Responder::for_test(),
+      published: Vec::new(),
+      query_client_id: None,
+    };
+    for pid in 1..=handlers::MAX_TRACKED_PIDS as u64 {
+      let admission = slot.note_published(
+        Some(rsrpc_types::AppId::from("app-1")),
+        pid,
+        Value::String(format!("n{pid}")),
+      );
+      assert!(
+        matches!(admission, Admission::Admitted { .. }),
+        "each pid fits"
+      );
+    }
+    let peak = slot.published.capacity();
+    assert!(
+      peak >= handlers::MAX_TRACKED_PIDS,
+      "buffer grew to the peak"
+    );
+
+    for pid in 1..=handlers::MAX_TRACKED_PIDS as u64 {
+      slot.forget_published(pid);
+    }
+    assert!(slot.published.is_empty());
+    assert_eq!(
+      slot.published.capacity(),
+      0,
+      "an emptied publication list must hand its buffer back"
+    );
+  }
+
+  /// A list that still holds entries keeps its buffer: releasing per
+  /// removal would trade a one-off retention for per-publish reallocation.
+  #[test]
+  fn a_partially_forgotten_list_keeps_its_buffer() {
+    let mut slot = ClientSlot {
+      responder: rsrpc_ws::Responder::for_test(),
+      published: Vec::new(),
+      query_client_id: None,
+    };
+    slot.note_published(
+      Some(rsrpc_types::AppId::from("app-1")),
+      1,
+      Value::String("n1".into()),
+    );
+    slot.note_published(
+      Some(rsrpc_types::AppId::from("app-1")),
+      2,
+      Value::String("n2".into()),
+    );
+    let before = slot.published.capacity();
+
+    slot.forget_published(1);
+
+    assert_eq!(slot.published.len(), 1);
+    assert!(
+      slot.published.capacity() >= before,
+      "a still-populated list must not be reallocated"
+    );
   }
 }
