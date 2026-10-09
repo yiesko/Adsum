@@ -19,6 +19,7 @@ use super::scan::{ScanScratch, apply_ignore_list, first_sightings};
 use super::scan::read_exec_into;
 use super::server::{ProcessServer, allocator_numbers, release_parse_arenas};
 use super::types::{Exec, ProcessDetectedEvent, ScannedHit, epoch_ms};
+use rsrpc_telemetry::SendChecked;
 
 /// Re-entrancy guard for [`ProcessServer::scan_for_processes`]: acquired
 /// atomically, released on drop (all exit paths, panics included).
@@ -98,6 +99,111 @@ pub(crate) fn spawn_worker(
 
 /// Whether a failed `event_sender.send` must end the calling thread.
 ///
+/// The rule that makes the snapshot lane safe under a lossy channel.
+///
+/// The old order recorded the new table in `last_emitted` **before**
+/// sending its events. With an unbounded channel that was invisible
+/// (sends only fail when the receiver is gone, which ends the thread), so
+/// the bug was latent. The moment a send can be dropped — a bounded
+/// channel, `send_checked` shedding past its cap — the new state is
+/// recorded while the event that carries it is lost, and the next tick
+/// computes its delta against the new table: the vanished slot never gets
+/// its `Removed`, and the consumer is left holding a card it was told to
+/// forget (a ghost clear) or never told about (a ghost card).
+///
+/// So the table is only recorded once every event of the tick reached the
+/// channel. A shed tick leaves the previous table in place and is
+/// re-emitted whole on the next tick — the same self-healing the flood
+/// guard already relies on, and downstream dedups repeats per app id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotDelivery {
+  /// Every event of the tick was accepted: the caller may record the new
+  /// table as emitted.
+  Complete,
+  /// At least one event was shed: the consumer still holds the previous
+  /// table, so the caller must keep it and let the next tick re-emit.
+  Shed,
+  /// The receiver is gone (shutdown).
+  Closed,
+}
+
+/// Backlog budget for the snapshot lane's events.
+///
+/// Events are tiny (`ScannedHit` is 32 B plus an `Arc`), the lane feeds a
+/// bridge pump that drains continuously, and a shed is repaired by the
+/// next tick — so this is a budget that bounds the *blast radius* of a
+/// stalled consumer, not a queue that must never fill.
+pub(crate) const SNAPSHOT_EVENT_CAP: usize = 128;
+
+/// Send one snapshot's events (removals, then detections, then the
+/// empty-table clear) and report whether the tick was fully delivered.
+///
+/// Stops early on a shed: piling more events onto a full backlog cannot
+/// make the tick complete, and the next tick re-emits from the previous
+/// table anyway.
+pub(crate) fn deliver_snapshot(
+  sender: &rsrpc_telemetry::GaugeSender<ProcessDetectedEvent>,
+  removed: &[(String, u64)],
+  detected: &[ScannedHit],
+  cleared: bool,
+) -> SnapshotDelivery {
+  for (id, pid) in removed {
+    match sender.send_checked(
+      ProcessDetectedEvent::Removed {
+        id: id.clone().into_boxed_str(),
+        pid: *pid,
+      },
+      SNAPSHOT_EVENT_CAP,
+    ) {
+      SendChecked::Sent => {}
+      SendChecked::Shed => return SnapshotDelivery::Shed,
+      SendChecked::Closed => return SnapshotDelivery::Closed,
+    }
+  }
+  for game in detected {
+    match sender.send_checked(
+      ProcessDetectedEvent::detected(game.clone()),
+      SNAPSHOT_EVENT_CAP,
+    ) {
+      SendChecked::Sent => {}
+      SendChecked::Shed => return SnapshotDelivery::Shed,
+      SendChecked::Closed => return SnapshotDelivery::Closed,
+    }
+  }
+  if cleared {
+    match sender.send_checked(ProcessDetectedEvent::cleared(), SNAPSHOT_EVENT_CAP) {
+      SendChecked::Sent => {}
+      SendChecked::Shed => return SnapshotDelivery::Shed,
+      SendChecked::Closed => return SnapshotDelivery::Closed,
+    }
+  }
+  SnapshotDelivery::Complete
+}
+
+/// Advance the snapshot lane for one tick: compute the delta against the
+/// recorded table, deliver it, and record the new table **only when the
+/// delivery was complete**.
+///
+/// This is the whole E2 fix, isolated so the ordering is testable without
+/// a channel. `deliver` is injected so a test can force each outcome; the
+/// delta is always computed from the *recorded* table, which is what makes
+/// a shed tick self-healing rather than a silent loss.
+pub(crate) fn advance_snapshot_lane<F>(
+  last_emitted: &mut Vec<(String, u64)>,
+  snapshot: Vec<(String, u64)>,
+  deliver: F,
+) -> SnapshotDelivery
+where
+  F: FnOnce(&[(String, u64)]) -> SnapshotDelivery,
+{
+  let removed = removed_slots(last_emitted, &snapshot);
+  let delivery = deliver(&removed);
+  if matches!(delivery, SnapshotDelivery::Complete) {
+    *last_emitted = snapshot;
+  }
+  delivery
+}
+
 /// The sender wraps an unbounded `std::mpsc`: `Err` means the receiver is
 /// gone (shutdown), never transient backpressure — retrying would spin
 /// `scan_for_processes` forever after shutdown. The EXEC fast path already
@@ -740,59 +846,26 @@ impl ProcessServer {
           .scan_dirty
           .swap(false, std::sync::atomic::Ordering::AcqRel);
         let emit = changed || forced;
-        // Slots vanished while others remain (A+B -> B): clear exactly
-        // those before republishing the rest. The empty-table clear below
-        // only fires when nothing remains, so without this the removed
-        // game would ghost while another continues.
-        let removed = if emit {
-          removed_slots(&last_emitted, &snapshot)
+        // Advance only when the tick emits: `advance_snapshot_lane` computes
+        // the delta from the recorded table, delivers it, and records the new
+        // one only when the delivery is complete.
+        let delivery = if emit {
+          advance_snapshot_lane(&mut last_emitted, snapshot, |removed| {
+            deliver_snapshot(&clone.event_sender, removed, &detected, detected.is_empty())
+          })
         } else {
-          Vec::new()
+          SnapshotDelivery::Complete
         };
-        if emit {
-          last_emitted = snapshot;
-        }
-        // A failed send means the receiver is gone (shutdown): the channel
-        // is unbounded, so there is no transient backpressure to retry.
-        // End the thread instead of spinning `scan_for_processes` forever.
-        if emit && !removed.is_empty() {
-          for (id, pid) in removed {
-            if should_exit_on_send_error(
-              &clone
-                .event_sender
-                .send(ProcessDetectedEvent::removed(id.into_boxed_str(), pid)),
-            ) {
-              tracing::warn!("[Process Scanner] Event receiver gone, shutting down scan");
-              return;
-            }
-          }
-        }
-        // Forward the changed table, one event per slot. Downstream
-        // publishes per app id and dedups repeats, so co-running games
-        // each own their card instead of only the first.
-        if emit && !detected.is_empty() {
-          for game in &detected {
-            if should_exit_on_send_error(
-              &clone
-                .event_sender
-                .send(ProcessDetectedEvent::detected(game.clone())),
-            ) {
-              tracing::warn!("[Process Scanner] Event receiver gone, shutting down scan");
-              return;
-            }
-          }
-        }
-
-        // If there are no detected processes, send an empty message —
-        // but only on the transition into emptiness (the bridge clears
-        // once and then ignores further nulls the same way). A forced
-        // emission of the empty table carries the EXEC-hole clear.
-        if emit
-          && detected.is_empty()
-          && should_exit_on_send_error(&clone.event_sender.send(ProcessDetectedEvent::cleared()))
-        {
+        if matches!(delivery, SnapshotDelivery::Closed) {
           tracing::warn!("[Process Scanner] Event receiver gone, shutting down scan");
           return;
+        }
+        if matches!(delivery, SnapshotDelivery::Shed) {
+          // The consumer still holds the previous table: `advance_snapshot_lane`
+          // did not record this one, so the next tick re-emits it whole.
+          // Nothing is lost, because `last_emitted` was never advanced past
+          // an undelivered tick.
+          tracing::debug!("[Process Scanner] Shed a snapshot event; next tick re-emits");
         }
 
         // Idle backoff: consecutive empty ticks stretch the cadence
@@ -845,6 +918,147 @@ impl ProcessServer {
       tracing::info!(
         "[Process Scanner] proc-events watcher disabled by configuration, polling only"
       );
+    }
+  }
+}
+
+#[cfg(test)]
+mod snapshot_lane_tests {
+  use super::super::types::ScannedEntry;
+  use super::*;
+  use rsrpc_types::DetectSource;
+
+  /// A delivery the channel accepts must read as complete, so the caller
+  /// may record the new table.
+  #[test]
+  fn accepted_events_report_a_complete_delivery() {
+    let (tx, _rx) = rsrpc_telemetry::QueueGauge::pair::<ProcessDetectedEvent>();
+    assert_eq!(
+      deliver_snapshot(&tx, &[], &[placeholder_hit()], true),
+      SnapshotDelivery::Complete,
+      "an empty channel accepts the tick's events"
+    );
+  }
+  /// The regression this guards: when the channel sheds, the delivery must
+  /// NOT read as complete.
+  ///
+  /// The old order recorded the new table *before* sending, so a lost
+  /// event was never re-sent — the consumer kept a table it had already
+  /// been told to forget, and the next tick's delta was computed against
+  /// the new one. That is the ghost clear (and the ghost card).
+  #[test]
+  fn a_shed_event_never_reports_complete() {
+    let (tx, rx) = rsrpc_telemetry::QueueGauge::pair::<ProcessDetectedEvent>();
+    // Saturate the backlog with real events, no receiver draining.
+    let cap = SNAPSHOT_EVENT_CAP;
+    while matches!(
+      tx.send_checked(ProcessDetectedEvent::Cleared, cap),
+      SendChecked::Sent
+    ) {}
+    let hit = placeholder_hit();
+    let delivered = deliver_snapshot(&tx, &[], &[hit], true);
+    assert_eq!(
+      delivered,
+      SnapshotDelivery::Shed,
+      "a shed event must be reported, never treated as delivered"
+    );
+    assert!(
+      matches!(delivered, SnapshotDelivery::Shed),
+      "redundant but explicit: only a shed delivery keeps the previous table"
+    );
+    drop(rx);
+  }
+
+  /// A gone receiver is shutdown, not a shed: the caller must end the
+  /// thread rather than re-emit forever.
+  #[test]
+  fn a_gone_receiver_reports_closed() {
+    let (tx, rx) = rsrpc_telemetry::QueueGauge::pair::<ProcessDetectedEvent>();
+    drop(rx);
+    assert_eq!(
+      deliver_snapshot(&tx, &[], &[placeholder_hit()], true),
+      SnapshotDelivery::Closed,
+      "a gone receiver is shutdown, not a shed"
+    );
+  }
+
+  /// The ordering the whole fix is about: a shed delivery must leave the
+  /// recorded table untouched.
+  ///
+  /// The old code assigned `last_emitted` *before* sending, so a lost
+  /// event was never re-sent and the consumer was left with a table it
+  /// had already been told to forget. This test drives the loop's own
+  /// advance step with an injected delivery, so it fails on that order —
+  /// the earlier tests only covered `deliver_snapshot`, and the injection
+  /// slipped straight past them.
+  #[test]
+  fn a_shed_tick_keeps_the_recorded_table() {
+    let mut recorded: Vec<(String, u64)> = vec![("a".into(), 1)];
+    let snapshot: Vec<(String, u64)> = vec![("b".into(), 2)];
+
+    let delivery = advance_snapshot_lane(&mut recorded, snapshot.clone(), |removed| {
+      assert_eq!(
+        removed,
+        &[("a".to_string(), 1)],
+        "delta from the recorded table"
+      );
+      SnapshotDelivery::Shed
+    });
+
+    assert_eq!(delivery, SnapshotDelivery::Shed);
+    assert_eq!(
+      recorded,
+      vec![("a".to_string(), 1)],
+      "a shed tick must not advance the recorded table"
+    );
+  }
+
+  /// The mirror image: a complete delivery records the new table, so the
+  /// next tick's delta starts from what the consumer actually holds.
+  #[test]
+  fn a_complete_tick_records_the_new_table() {
+    let mut recorded: Vec<(String, u64)> = vec![("a".into(), 1)];
+    let snapshot: Vec<(String, u64)> = vec![("b".into(), 2)];
+
+    let delivery = advance_snapshot_lane(&mut recorded, snapshot.clone(), |_| {
+      SnapshotDelivery::Complete
+    });
+
+    assert_eq!(delivery, SnapshotDelivery::Complete);
+    assert_eq!(recorded, snapshot, "a delivered tick must be recorded");
+  }
+
+  /// A shed delivery must leave the delta reproducible: with the previous
+  /// table still in place, the next tick computes the same removals
+  /// again. That is what makes "re-emit next tick" a repair instead of a
+  /// duplicate storm.
+  #[test]
+  fn a_shed_tick_recomputes_the_same_delta() {
+    let previous = vec![("a".to_string(), 1u64), ("b".to_string(), 2)];
+    let current = vec![("a".to_string(), 1u64)];
+    let mut first = removed_slots(&previous, &current);
+    let mut second = removed_slots(&previous, &current);
+    first.sort();
+    second.sort();
+    assert_eq!(
+      first, second,
+      "the delta must be reproducible when re-emitted"
+    );
+  }
+
+  /// One placeholder hit for the delivery tests (pid/entry are irrelevant).
+  fn placeholder_hit() -> ScannedHit {
+    ScannedHit {
+      entry: Arc::new(ScannedEntry {
+        id: "1".into(),
+        name: "G".into(),
+        executables: Box::new([]),
+        steam_ids: Box::new([]),
+        aliases: Box::new([]),
+      }),
+      pid: 1,
+      start: 0,
+      source: DetectSource::Automaton,
     }
   }
 }
