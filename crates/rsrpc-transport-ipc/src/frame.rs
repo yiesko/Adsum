@@ -36,10 +36,10 @@ pub trait IpcFacilitator: Send {
   /// Remember the last pid.
   fn set_pid(&mut self, pid: u64);
 
-  /// Last nonce seen (echoed on the close-clear).
-  fn nonce(&self) -> String;
+  /// Last nonce seen (echoed on the close-clear), as the client sent it.
+  fn nonce(&self) -> Value;
   /// Remember the last nonce.
-  fn set_nonce(&mut self, nonce: String);
+  fn set_nonce(&mut self, nonce: Value);
 
   /// The `DISPATCH`/`READY` frame for new connections (reflects the
   /// current shared user, including `SET_USER` patches).
@@ -410,7 +410,7 @@ fn on_close(ipc: &mut dyn IpcFacilitator) {
       code: None,
       user_id: None,
     }),
-    nonce: Value::String(ipc.nonce()),
+    nonce: ipc.nonce(),
   };
   // Route through the clear path: a clean close must never be shed when
   // the queue is momentarily full, or the bridge keeps the card.
@@ -579,8 +579,11 @@ fn handle_set_activity(
   ipc.set_pid(pid);
   // Read what the facilitator still needs before the command moves into
   // the sink: the nonce is remembered for the close-clear echo and patch.
-  let nonce = activity_cmd.nonce.to_string();
-  ipc.set_nonce(nonce);
+  // Stored as the value the client sent, not its JSON *text*: re-wrapping
+  // that text double-encoded a string nonce (`"abc"` → `"\"abc\""`) and
+  // turned a null nonce into the literal `"null"`. Cloning, not taking —
+  // the command still forwards and its own nonce must survive the trip.
+  ipc.set_nonce(activity_cmd.nonce.clone());
 
   // Fix once, up front: the reply echoes the fixed shape and the sink now
   // receives the very same fixed command. The bridge re-runs `fix()` on

@@ -22,7 +22,7 @@ struct TestFacilitator {
   handshake: bool,
   client_id: AppId,
   pid: u64,
-  nonce: String,
+  nonce: serde_json::Value,
   sink: EventSink,
   published_pids: Vec<u64>,
 }
@@ -53,11 +53,11 @@ impl IpcFacilitator for TestFacilitator {
     self.pid = pid;
   }
   /// Test state: latest command nonce.
-  fn nonce(&self) -> String {
+  fn nonce(&self) -> serde_json::Value {
     self.nonce.clone()
   }
   /// Test state: latest command nonce.
-  fn set_nonce(&mut self, nonce: String) {
+  fn set_nonce(&mut self, nonce: serde_json::Value) {
     self.nonce = nonce;
   }
   /// Default identity payload (no user state in these tests).
@@ -99,7 +99,7 @@ fn handshake_set_activity_close_flow() {
     handshake: false,
     client_id: AppId::from(""),
     pid: 0,
-    nonce: String::new(),
+    nonce: serde_json::Value::Null,
     sink,
     published_pids: Vec::new(),
   };
@@ -178,7 +178,7 @@ fn set_activity_forwards_the_fixed_shape() {
     handshake: false,
     client_id: AppId::from(""),
     pid: 0,
-    nonce: String::new(),
+    nonce: serde_json::Value::Null,
     sink,
     published_pids: Vec::new(),
   };
@@ -245,7 +245,7 @@ fn invalid_utf8_body_clears_published_pid() {
     handshake: false,
     client_id: AppId::from(""),
     pid: 0,
-    nonce: String::new(),
+    nonce: serde_json::Value::Null,
     sink,
     published_pids: Vec::new(),
   };
@@ -329,7 +329,7 @@ fn spawn_server() -> (
     handshake: false,
     client_id: AppId::from(""),
     pid: 0,
-    nonce: String::new(),
+    nonce: serde_json::Value::Null,
     sink,
     published_pids: Vec::new(),
   };
@@ -491,7 +491,7 @@ fn abrupt_close_clears_every_published_pid() {
     handshake: false,
     client_id: AppId::from(""),
     pid: 0,
-    nonce: String::new(),
+    nonce: serde_json::Value::Null,
     sink,
     published_pids: Vec::new(),
   };
@@ -545,7 +545,7 @@ fn published_pid_history_is_bounded() {
     handshake: false,
     client_id: AppId::from(""),
     pid: 0,
-    nonce: String::new(),
+    nonce: serde_json::Value::Null,
     sink,
     published_pids: Vec::new(),
   };
@@ -606,7 +606,7 @@ fn clean_close_clear_survives_a_full_sink() {
     handshake: false,
     client_id: AppId::from(""),
     pid: 0,
-    nonce: String::new(),
+    nonce: serde_json::Value::Null,
     sink,
     published_pids: Vec::new(),
   };
@@ -650,4 +650,76 @@ fn clean_close_clear_survives_a_full_sink() {
   );
 
   server.join().expect("server thread");
+}
+
+/// The close-clear echo carries the client's own nonce, byte-identical.
+///
+/// The facilitator used to remember the nonce as its JSON *text*, and the
+/// close echo re-wrapped that text as `Value::String`. For a string nonce
+/// that double-encodes it (`"abc"` becomes `"\"abc\""`), and for a null
+/// nonce it turns absence into the literal `"null"`. Lock-step clients
+/// match on the nonce, so an echo that is not the nonce they sent is a
+/// client that never learns its clear landed.
+#[test]
+fn close_echo_carries_the_clients_own_nonce() {
+  for nonce in [
+    serde_json::json!("abc"),
+    serde_json::json!(7),
+    serde_json::Value::Null,
+  ] {
+    let (server_stream, mut client) = UnixStream::pair().expect("socketpair");
+    client
+      .set_read_timeout(Some(Duration::from_secs(5)))
+      .expect("timeout");
+    let (sink, mut rx) = EventSink::bounded(16);
+
+    let mut facil = TestFacilitator {
+      handshake: false,
+      client_id: AppId::from("test-app"),
+      pid: 0,
+      nonce: serde_json::Value::Null,
+      sink,
+      published_pids: Vec::new(),
+    };
+    let mut server_stream = server_stream;
+    let server = std::thread::spawn(move || handle_stream(&mut facil, &mut server_stream));
+
+    // A SET_ACTIVITY establishes the connection, and with it the nonce the
+    // close echo must repeat.
+    write_frame(
+      &mut client,
+      PacketType::Handshake,
+      r#"{"v":1,"client_id":"test-app"}"#,
+    );
+    let _ = read_frame(&mut client);
+    write_frame(
+      &mut client,
+      PacketType::Frame,
+      &format!(
+        r#"{{"cmd":"SET_ACTIVITY","args":{{"pid":3,"activity":{{"name":"G","type":0}}}},"nonce":{nonce}}}"#
+      ),
+    );
+    let _ = read_frame(&mut client);
+
+    write_frame(&mut client, PacketType::Close, "{}");
+    // The sink also saw the SET_ACTIVITY itself, so drain until the clear.
+    let clear = loop {
+      let cmd = recv_cmd(&mut rx);
+      if cmd
+        .args
+        .as_ref()
+        .and_then(|a| a.activity.as_ref())
+        .is_none()
+      {
+        break cmd;
+      }
+    };
+
+    assert_eq!(
+      clear.nonce, nonce,
+      "the close echo must carry the client's own nonce verbatim"
+    );
+
+    server.join().expect("server thread");
+  }
 }

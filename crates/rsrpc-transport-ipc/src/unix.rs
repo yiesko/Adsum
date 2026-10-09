@@ -17,6 +17,7 @@ use rsrpc_protocol::error::{Result, RsrpcError};
 use rsrpc_types::AppId;
 use rsrpc_types::cmd::ActivityCmd;
 use rsrpc_types::user::RpcUser;
+use serde_json::Value;
 use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
@@ -48,7 +49,7 @@ struct ConnFacilitator {
   handshake: bool,
   client_id: AppId,
   pid: u64,
-  nonce: String,
+  nonce: Value,
   user: Arc<Mutex<RpcUser>>,
   sink: EventSink,
   /// Pids published on this connection, oldest first (bounded).
@@ -62,7 +63,7 @@ impl ConnFacilitator {
       handshake: false,
       client_id: AppId::from(""),
       pid: 0,
-      nonce: String::new(),
+      nonce: Value::Null,
       user,
       sink,
       published_pids: Vec::new(),
@@ -96,11 +97,11 @@ impl IpcFacilitator for ConnFacilitator {
     self.pid = pid;
   }
   /// Latest command nonce (lock-step replies echo it back).
-  fn nonce(&self) -> String {
+  fn nonce(&self) -> Value {
     self.nonce.clone()
   }
   /// Store the latest command nonce.
-  fn set_nonce(&mut self, nonce: String) {
+  fn set_nonce(&mut self, nonce: Value) {
     self.nonce = nonce;
   }
   /// Current identity rendered as the READY payload.
