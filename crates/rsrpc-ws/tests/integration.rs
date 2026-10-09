@@ -454,8 +454,59 @@ async fn client_ids_are_unique_across_servers() {
   server_b.shutdown().await;
 }
 
-/// A full outbox is reported to the caller; the server never disconnects a
-/// slow consumer on its own.
+/// A full global event queue backpressures every reader instead of
+/// dropping events.
+///
+/// All connections share one bounded queue, so a hub that stops draining
+/// stalls every connection's read loop — including one that only sends
+/// pings. That coupling is the price of a single queue, and it is
+/// deliberate: the alternative is either unbounded memory or silently
+/// dropped `Connect`/`Message`/`Disconnect` events, and the order of
+/// those events is global by design.
+///
+/// Pinned so the queue is never "fixed" by dropping on a full channel:
+/// with capacity 1 and nothing draining, three messages still arrive in
+/// order once the hub catches up.
+#[tokio::test]
+async fn a_full_event_queue_backpressures_and_keeps_every_event() {
+  let config = rsrpc_ws::ServerConfig::builder("127.0.0.1:0".parse().unwrap())
+    .event_queue(1)
+    .build()
+    .unwrap();
+  let (server, mut hub) = rsrpc_ws::Server::bind(config).await.unwrap();
+  let addr = server.local_addr();
+
+  let mut ws = connect(addr).await;
+  let id = match next_event(&mut hub).await {
+    Event::Connect(id, _) => id,
+    other => panic!("expected Connect, got {other:?}"),
+  };
+
+  // Three messages with the queue at capacity 1 and no drain: the first is
+  // enqueued, the reader then parks on the next send, and the rest wait in
+  // the socket buffer.
+  for body in ["one", "two", "three"] {
+    ws.send(tungstenite::Message::Text(body.into()))
+      .await
+      .unwrap();
+    tokio::time::sleep(Duration::from_millis(25)).await;
+  }
+
+  // Draining the hub unparks the reader, which forwards the next message —
+  // nothing is dropped, and nothing overtakes.
+  for expected in ["one", "two", "three"] {
+    match next_event(&mut hub).await {
+      Event::Message(got_id, Message::Text(text)) => {
+        assert_eq!(got_id, id);
+        assert_eq!(text, expected, "events arrive in send order");
+      }
+      other => panic!("expected Message({expected}), got {other:?}"),
+    }
+  }
+
+  ws.close(None).await.unwrap();
+  let _ = server;
+}
 ///
 /// `DisconnectReason::SlowConsumer` exists in the API but is never emitted,
 /// and the crate-level docs used to claim the opposite ("slow consumers are
