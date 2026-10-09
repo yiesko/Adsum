@@ -177,27 +177,66 @@ impl DetectablesBundle {
   }
 }
 
+/// Exact upper bound for the name map: one slot per entry, plus one per
+/// alias.
+///
+/// The alternative was to reserve twice the entry count, which at ~24k
+/// entries buys over a megabyte of scratch for a table that holds a
+/// fraction of it. The vector lives only for the build and is dropped
+/// right after, so the slack is pure transient peak — paid at every
+/// database refresh and override append.
+pub fn name_map_bound(detectables: &[Arc<ScannedEntry>]) -> usize {
+  detectables.len()
+    + detectables
+      .iter()
+      .map(|entry| entry.aliases.len())
+      .sum::<usize>()
+}
+
 /// Auxiliary lookup maps over the main DB:
 /// Steam store id -> activity index, normalized game name -> activity index.
 /// Alternative titles (`aliases`) join the name map under the same
 /// conservative gate — exact, multi-word only — so a generic alias can
 /// never collide; canonical names are inserted first and win ties.
 pub fn build_aux_maps(detectables: &[Arc<ScannedEntry>]) -> (SortedIndex, SortedIndex) {
-  // Pre-sized from the entry count (steam ids ≤ entries in practice;
-  // names get one slot per entry plus room for aliases): no growth
-  // copies mid-build.
+  // Steam ids ≤ entries in practice.
   let mut steam: Vec<(Box<str>, usize)> = Vec::with_capacity(detectables.len());
-  let mut names: Vec<(Box<str>, usize)> = Vec::with_capacity(detectables.len() * 2);
-
   for (index, activity) in detectables.iter().enumerate() {
     for id in &activity.steam_ids {
       if !id.is_empty() {
         steam.push((id.clone(), index));
       }
     }
+  }
 
-    // Only matchable names participate in the exe-stem fallback, so generic
-    // stems (`fish`, `steam`, `game`) can never collide with `Fish`/`Steam`.
+  // Names reserve and fill in one place, so the bound cannot drift from
+  // what the table can actually hold (see `collect_names`).
+  let (steam_map, name_map) = (
+    SortedIndex::build(steam),
+    SortedIndex::build(collect_names(detectables)),
+  );
+  tracing::info!(
+    "[Process Scanner] Aux maps: {} steam ids, {} matchable names",
+    steam_map.len(),
+    name_map.len()
+  );
+  (steam_map, name_map)
+}
+
+/// Collect the name map's entries, reserving exactly what they can occupy.
+///
+/// Only matchable names participate in the exe-stem fallback, so generic
+/// stems (`fish`, `steam`, `game`) can never collide with
+/// `Fish`/`Steam`. Canonical names are inserted first and win ties.
+///
+/// The reservation is the exact bound rather than a multiple of the entry
+/// count: `len * 2` over-bought by the alias deficit — at ~24k entries
+/// that is most of a megabyte of scratch held only for the build. It is
+/// also why the bound and the fill live together here: split apart, the
+/// reserve can drift back to a guess nobody tests.
+fn collect_names(detectables: &[Arc<ScannedEntry>]) -> Vec<(Box<str>, usize)> {
+  let mut names: Vec<(Box<str>, usize)> = Vec::with_capacity(name_map_bound(detectables));
+  for (index, activity) in detectables.iter().enumerate() {
     let normalized = normalize_name(&activity.name);
     if name_matchable(&normalized) {
       names.push((normalized.into_boxed_str(), index));
@@ -209,14 +248,7 @@ pub fn build_aux_maps(detectables: &[Arc<ScannedEntry>]) -> (SortedIndex, Sorted
       }
     }
   }
-
-  let (steam_map, name_map) = (SortedIndex::build(steam), SortedIndex::build(names));
-  tracing::info!(
-    "[Process Scanner] Aux maps: {} steam ids, {} matchable names",
-    steam_map.len(),
-    name_map.len()
-  );
-  (steam_map, name_map)
+  names
 }
 
 /// De-dotted form for the folder-walk fallback tier: dots become
@@ -662,6 +694,57 @@ mod tests {
     assert_eq!(split.native_patterns.len(), split.native_idx.len());
     #[cfg(target_os = "linux")]
     assert_eq!(split.proton_patterns.len(), split.proton_idx.len());
+  }
+
+  /// Slim entry fixture with caller-chosen alias count.
+  fn entry_with_aliases(aliases: usize) -> Arc<ScannedEntry> {
+    Arc::new(ScannedEntry {
+      id: "1".into(),
+      // Multi-word: the aux map's gate only admits matchable names, so a
+      // single-word fixture would reserve slots the fill never uses.
+      name: "how to fish".into(),
+      executables: Box::new([]),
+      steam_ids: Box::new([]),
+      aliases: (0..aliases)
+        .map(|i| format!("alias {i}").into_boxed_str())
+        .collect(),
+    })
+  }
+
+  /// The collected name table reserves its exact bound, not twice the
+  /// entry count.
+  ///
+  /// One slot per entry plus one per alias is the most the table can ever
+  /// hold, so reserving that is both slack-free and growth-free. The old
+  /// `len * 2` over-bought by the alias deficit: at ~24k entries with few
+  /// aliases that is most of a megabyte of scratch held only for the
+  /// duration of the build, paid at every refresh and override append.
+  ///
+  /// Asserted on `collect_names` — the function that both reserves and
+  /// fills — because a bound tested in isolation says nothing about the
+  /// call site. The alias counts are chosen so growth cannot land on the
+  /// bound by accident: with few aliases `len * 2` is already too big, and
+  /// with many it overshoots on the last doubling.
+  #[test]
+  fn collected_names_reserve_their_exact_bound() {
+    for (entries, aliases) in [(100usize, 0usize), (100, 5)] {
+      let fixtures: Vec<Arc<ScannedEntry>> =
+        (0..entries).map(|_| entry_with_aliases(aliases)).collect();
+      let names = collect_names(&fixtures);
+      let bound = name_map_bound(&fixtures);
+
+      assert_eq!(
+        names.len(),
+        bound,
+        "every reserved slot is filled ({entries} entries, {aliases} aliases)"
+      );
+      assert_eq!(
+        names.capacity(),
+        bound,
+        "the collected table must reserve exactly its bound, no doubling slack \
+         ({entries} entries, {aliases} aliases)"
+      );
+    }
   }
 
   /// The custom-override index releases its growth slack like the native
