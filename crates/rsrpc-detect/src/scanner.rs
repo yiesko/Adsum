@@ -45,12 +45,13 @@ impl ProcessServer {
   /// 0.76s effective cadence instead of 5s during NFS).
   #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
   pub fn should_wake_on_exit(&self, pid: u64) -> bool {
-    if !self
-      .detected_pids
-      .lock()
-      .unwrap_or_else(|e| e.into_inner())
-      .contains(&pid)
-    {
+    // One guard for both the membership check and the removal: the pid is
+    // consumed by an actual wake, so a follow-up EXIT of the same game
+    // must still be able to wake — and taking the lock twice re-opened a
+    // window where another EXIT could remove it in between, silently
+    // dropping that wake.
+    let mut pids = self.detected_pids.lock().unwrap_or_else(|e| e.into_inner());
+    if !pids.contains(&pid) {
       return false;
     }
     let due = self
@@ -61,11 +62,7 @@ impl ProcessServer {
       .as_secs()
       >= 1;
     if due {
-      self
-        .detected_pids
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&pid);
+      pids.remove(&pid);
     }
     due
   }

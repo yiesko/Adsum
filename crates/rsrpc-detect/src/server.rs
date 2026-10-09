@@ -669,4 +669,67 @@ mod tests {
     );
     assert!(shed > 0, "the reference end must have shed past its cap");
   }
+  /// The debounce consumes the pid: a second EXIT for the same game
+  /// inside the 1s window must not wake again.
+  ///
+  /// This is the invariant the single-lock version of
+  /// `should_wake_on_exit` exists to keep — taking the lock twice for the
+  /// membership check and the removal re-opened the window where two EXITs
+  /// of the same pid both pass the check, wake twice, and only then consume
+  /// once. Proton helpers die constantly, so a duplicated wake is not a
+  /// rare corner.
+  #[test]
+  fn a_consumed_exit_pid_does_not_wake_twice() {
+    let server = fixture_server();
+    let pid = std::process::id().into();
+    server
+      .detected_pids
+      .lock()
+      .unwrap_or_else(|e| e.into_inner())
+      .insert(pid);
+    // Steal the last_scan latch so the debounce is "due" immediately.
+    *server.last_scan.lock().unwrap_or_else(|e| e.into_inner()) =
+      std::time::Instant::now() - std::time::Duration::from_secs(2);
+
+    assert!(server.should_wake_on_exit(pid), "the first exit wakes");
+    assert!(
+      !server.should_wake_on_exit(pid),
+      "the pid was consumed, so a second exit must not wake"
+    );
+    assert!(
+      server
+        .detected_pids
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_empty(),
+      "the consumed pid must not be remembered for the next sweep"
+    );
+  }
+
+  /// An EXIT that arrives before the debounce is due does not consume the
+  /// pid: a follow-up EXIT still has its chance to wake.
+  #[test]
+  fn an_early_exit_keeps_the_pid_for_a_later_one() {
+    let server = fixture_server();
+    let pid = std::process::id().into();
+    server
+      .detected_pids
+      .lock()
+      .unwrap_or_else(|e| e.into_inner())
+      .insert(pid);
+
+    // last_scan is fresh, so the debounce is not due.
+    assert!(
+      !server.should_wake_on_exit(pid),
+      "inside the debounce window there is no wake"
+    );
+    assert!(
+      server
+        .detected_pids
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&pid),
+      "an early exit must leave the pid tracked"
+    );
+  }
 }
