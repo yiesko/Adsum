@@ -87,7 +87,12 @@ pub(crate) struct Shared {
   /// pinned by a responder it no longer has.
   pub(crate) consumers: ConsumerMap,
   pub(crate) cache: Mutex<ReplayCache>,
-  pub(crate) activity_seq: Mutex<u64>,
+  /// Counter for the replay cache's sequence stamps.
+  ///
+  /// An atomic rather than its own `Mutex`: it is only ever read and
+  /// bumped while the cache lock is held, so the mutex bought no
+  /// serialization and cost one nested acquisition per publish.
+  pub(crate) activity_seq: std::sync::atomic::AtomicU64,
   pub(crate) last_process: Mutex<HashMap<AppId, u64>>,
   pub(crate) handoff: Mutex<HandoffState>,
   pub(crate) recent: Mutex<RecentActivities>,
@@ -199,7 +204,7 @@ impl Bridge {
     let shared = Arc::new(Shared {
       consumers: Mutex::new(FxHashMap::default()),
       cache: Mutex::new(HashMap::new()),
-      activity_seq: Mutex::new(0),
+      activity_seq: std::sync::atomic::AtomicU64::new(0),
       last_process: Mutex::new(HashMap::new()),
       handoff: Mutex::new(HandoffState::default()),
       recent: Mutex::new(RecentActivities::default()),
@@ -879,8 +884,37 @@ async fn persist_task(shared: Arc<Shared>, interval: Duration, token: Cancellati
   }
 }
 
+/// A `Shared` with no consumers, no sink and no cache: the shape the
+/// publish and snapshot paths need to be driven in isolation.
 #[cfg(test)]
-mod tests {
+pub(crate) fn shared_for_test() -> std::sync::Arc<Shared> {
+  std::sync::Arc::new(Shared {
+    consumers: std::sync::Mutex::new(rustc_hash::FxHashMap::default()),
+    cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+    activity_seq: std::sync::atomic::AtomicU64::new(0),
+    last_process: std::sync::Mutex::new(std::collections::HashMap::new()),
+    handoff: std::sync::Mutex::new(HandoffState::default()),
+    recent: std::sync::Mutex::new(RecentActivities::default()),
+    user: std::sync::Arc::new(std::sync::Mutex::new(RpcUser::default())),
+    dirty: std::sync::atomic::AtomicBool::new(false),
+    dropped_broadcasts: std::sync::atomic::AtomicU64::new(0),
+    app_version: String::new(),
+    state_path: None,
+    json_port: 0,
+    msgpack_port: 0,
+    ws_port: None,
+    ipc_path: None,
+    ipc_tx: None,
+    game_tx: None,
+    proc_tx: None,
+    game_clients: None,
+    watch_shed: None,
+    allowed_origins: Vec::new(),
+  })
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
   use super::*;
   use crate::handoff::ScannedGame;
   use rsrpc_types::DetectSource;
@@ -893,7 +927,7 @@ mod tests {
     let shared = Shared {
       consumers: Mutex::new(FxHashMap::default()),
       cache: Mutex::new(HashMap::new()),
-      activity_seq: Mutex::new(0),
+      activity_seq: std::sync::atomic::AtomicU64::new(0),
       last_process: Mutex::new(HashMap::new()),
       handoff: Mutex::new(HandoffState::default()),
       recent: Mutex::new(RecentActivities::default()),
@@ -946,7 +980,7 @@ mod tests {
     let shared = Shared {
       consumers: Mutex::new(FxHashMap::default()),
       cache: Mutex::new(HashMap::new()),
-      activity_seq: Mutex::new(0),
+      activity_seq: std::sync::atomic::AtomicU64::new(0),
       last_process: Mutex::new(HashMap::new()),
       handoff: Mutex::new(HandoffState::default()),
       recent: Mutex::new(RecentActivities::default()),
@@ -1052,7 +1086,7 @@ fn refresh_with_no_consumers_still_touches_the_snapshot() {
   let shared = Arc::new(Shared {
     consumers: Mutex::new(FxHashMap::default()),
     cache: Mutex::new(HashMap::new()),
-    activity_seq: Mutex::new(0),
+    activity_seq: std::sync::atomic::AtomicU64::new(0),
     last_process: Mutex::new(HashMap::new()),
     handoff: Mutex::new(HandoffState::default()),
     recent: Mutex::new(RecentActivities::default()),

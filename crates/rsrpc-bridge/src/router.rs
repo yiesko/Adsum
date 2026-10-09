@@ -383,9 +383,11 @@ impl Shared {
       if is_clear {
         cache.remove(&socket_id);
       } else {
-        let mut seq = self.activity_seq.lock().unwrap_or_else(|e| e.into_inner());
-        *seq = seq.saturating_add(1);
-        cache.insert(socket_id, (Arc::clone(&payload), *seq));
+        let seq = self
+          .activity_seq
+          .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+          + 1;
+        cache.insert(socket_id, (Arc::clone(&payload), seq));
         prune_cache(&mut cache);
       }
     }
@@ -519,5 +521,93 @@ mod tests {
       std::ptr::eq(name_ptr, resumed.name.as_ptr()),
       "a resumed game must share its name buffer, never copy it"
     );
+  }
+
+  /// The replay cache stamps each entry with a fresh sequence number.
+  ///
+  /// The counter used to live in its own `Mutex` taken *inside* the cache
+  /// lock — two acquisitions per publish, and a nested-lock ordering that
+  /// exists only because the counter is never touched outside it.
+  ///
+  /// The invariant the change must not break: every non-clear publish
+  /// stamps a sequence the previous one did not, so insertion order stays
+  /// recoverable from the cache alone.
+  #[tokio::test]
+  async fn each_publish_stamps_a_fresh_sequence() {
+    let shared = crate::bridge::shared_for_test();
+    let mut cmd: ActivityCmd = serde_json::from_str(
+      r#"{"cmd":"SET_ACTIVITY","application_id":"app-1","args":{"pid":1,
+            "activity":{"name":"G","type":0}},"nonce":"n1"}"#,
+    )
+    .expect("parses");
+
+    shared.handle_set_activity(cmd.clone()).await;
+    let first = seq_of(&shared, 1);
+
+    // A different pid, so this is a second cache entry rather than a
+    // replace of the first.
+    cmd.args.as_mut().unwrap().pid = Some(2);
+    shared.handle_set_activity(cmd).await;
+    let second = seq_of(&shared, 2);
+
+    assert!(first >= 1, "the first publish stamps a sequence");
+    assert!(
+      second > first,
+      "a second publish must not reuse the first's sequence ({first})"
+    );
+  }
+
+  /// A clear evicts rather than stamps, and a republish after it gets a
+  /// later sequence than the pre-clear one.
+  #[tokio::test]
+  async fn a_clear_does_not_reuse_a_sequence() {
+    let shared = crate::bridge::shared_for_test();
+    let cmd: ActivityCmd = serde_json::from_str(
+      r#"{"cmd":"SET_ACTIVITY","application_id":"app-1","args":{"pid":1,
+            "activity":{"name":"G","type":0}},"nonce":"n1"}"#,
+    )
+    .expect("parses");
+    shared.handle_set_activity(cmd.clone()).await;
+    let before = seq_of(&shared, 1);
+
+    let clear = ActivityCmd {
+      application_id: Some(rsrpc_types::AppId::from("app-1")),
+      cmd: "SET_ACTIVITY".to_string(),
+      data: None,
+      evt: None,
+      args: Some(rsrpc_types::cmd::ActivityCmdArgs {
+        pid: Some(1),
+        activity: None,
+        code: None,
+        user_id: None,
+      }),
+      nonce: serde_json::Value::String("n2".to_string()),
+    };
+    shared.handle_set_activity(clear).await;
+    assert!(
+      shared
+        .cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_empty(),
+      "a clear evicts the entry"
+    );
+
+    shared.handle_set_activity(cmd).await;
+    assert!(
+      seq_of(&shared, 1) > before,
+      "a republish must not reuse the pre-clear sequence ({before})"
+    );
+  }
+
+  /// Sequence stamped for the entry cached under `pid`, or 0 when absent.
+  fn seq_of(shared: &crate::bridge::Shared, pid: u64) -> u64 {
+    shared
+      .cache
+      .lock()
+      .unwrap_or_else(|e| e.into_inner())
+      .get(&SocketId::from(pid))
+      .map(|(_, seq)| *seq)
+      .unwrap_or(0)
   }
 }
