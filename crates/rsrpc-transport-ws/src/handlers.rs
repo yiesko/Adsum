@@ -15,6 +15,7 @@ use rsrpc_types::AppId;
 use rsrpc_types::cmd::{ActivityCmd, ActivityCmdArgs};
 use rsrpc_types::user::RpcUser;
 use rsrpc_ws::{Message, Responder};
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::transport::{PendingQueue, Sink};
@@ -32,23 +33,55 @@ async fn reply(responder: &Responder, message: Message) -> bool {
     .is_ok()
 }
 
-/// Serialize command args to a string map, preserving value types.
-/// Borrows: `to_value` already produces an owned `Value`, so cloning the
-/// args first would copy the whole subtree twice.
-fn event_args_as_hashmap(args: Option<&ActivityCmdArgs>) -> HashMap<String, Value> {
-  let args = match args {
-    Some(args) => serde_json::to_value(args).unwrap_or(Value::Null),
-    None => Value::Null,
-  };
+/// Echo for a browser command (invite/template/gift): the command's own
+/// identity with its `args` echoed under `data`.
+///
+/// Borrows instead of cloning, and writes the args straight into the
+/// `data` key rather than routing them through a `serde_json::Value`
+/// object, a `HashMap` rebuild and a second serialization: the old shape
+/// serialized the args once to build that map and again to write the
+/// reply, and copied `application_id`, `cmd` and `nonce` to do it.
+#[derive(Serialize)]
+struct BrowserEcho<'a> {
+  #[serde(skip_serializing_if = "Option::is_none")]
+  application_id: Option<&'a AppId>,
+  cmd: &'a str,
+  /// The command's args, nested under `data` exactly where the wire
+  /// contract puts them (`args`/`evt` stay absent). Written through the
+  /// struct serializer: no intermediate map, no re-serialization.
+  #[serde(
+    serialize_with = "serialize_args_as_data",
+    skip_serializing_if = "Option::is_none"
+  )]
+  data: Option<&'a ActivityCmdArgs>,
+  nonce: &'a Value,
+}
+
+/// Serialize args into the `data` value, borrowing the struct.
+fn serialize_args_as_data<S: serde::Serializer>(
+  args: &Option<&ActivityCmdArgs>,
+  serializer: S,
+) -> Result<S::Ok, S::Error> {
   match args {
-    Value::Object(map) => map.into_iter().collect(),
-    _ => HashMap::new(),
+    Some(args) => args.serialize(serializer),
+    None => serializer.serialize_none(),
+  }
+}
+
+impl<'a> BrowserEcho<'a> {
+  fn borrow(event: &'a ActivityCmd) -> Self {
+    Self {
+      application_id: event.application_id.as_ref(),
+      cmd: &event.cmd,
+      data: event.args.as_ref(),
+      nonce: &event.nonce,
+    }
   }
 }
 
 /// Forward an invite/template/gift command after validating its code.
 pub(crate) async fn handle_browser_command(
-  event: &ActivityCmd,
+  event: ActivityCmd,
   responder: &Responder,
   sink: &Sink,
 ) -> bool {
@@ -74,25 +107,18 @@ pub(crate) async fn handle_browser_command(
     .await;
   }
 
-  // Optimistic forward; the outcome lives downstream.
-  let response = ActivityCmd {
-    application_id: event.application_id.clone(),
-    cmd: event.cmd.clone(),
-    args: None,
-    data: Some(event_args_as_hashmap(event.args.as_ref())),
-    evt: None,
-    nonce: event.nonce.clone(),
-  };
-  sink.emit(event.clone()).await;
+  // Optimistic forward; the outcome lives downstream. The echo is built by
+  // borrowing, so the command itself is the only thing that moves — the
+  // old path deep-cloned the whole body just to send it and then copied
+  // three fields to answer.
+  let echo = serde_json::to_string(&BrowserEcho::borrow(&event));
+  sink.emit(event).await;
 
   // Client-supplied `data` may hold non-finite floats, which JSON cannot
-  // encode: drop loudly instead of ending the pump. Nothing was sent, so
-  // the client is still considered alive.
-  let Ok(response) = serde_json::to_string(&response) else {
-    tracing::warn!(
-      "[transport-ws] Dropping unserializable response for {}",
-      event.cmd
-    );
+  // encode: drop loudly instead of ending the pump. The forward above
+  // already left, so the client is still considered alive.
+  let Ok(response) = echo else {
+    tracing::warn!("[transport-ws] Dropping unserializable response for a browser command");
     return true;
   };
   reply(responder, Message::Text(response.into())).await
@@ -282,5 +308,98 @@ pub(crate) fn clear_for_slot(published: &PublishedSlot) -> ActivityCmd {
       user_id: None,
     }),
     nonce: published.nonce.clone(),
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// A browser command with args echoes those args under their own keys,
+  /// in `data`, with `args` and `evt` absent.
+  ///
+  /// This is the wire contract the borrowing echo replaces a clone-based
+  /// `ActivityCmd` for, so the shape is pinned rather than assumed: the
+  /// old form built a `HashMap` out of the args and serialized that, and
+  /// dropping the map is exactly where a key could go missing.
+  #[test]
+  fn a_browser_echo_flattens_args_into_data() {
+    let event = ActivityCmd {
+      application_id: Some(AppId::from("app-1")),
+      cmd: "INVITE_BROWSER".to_string(),
+      args: Some(ActivityCmdArgs {
+        pid: Some(3),
+        activity: None,
+        code: Some("abc123".to_string()),
+        user_id: None,
+      }),
+      data: None,
+      evt: None,
+      nonce: Value::String("n1".to_string()),
+    };
+
+    let body: Value =
+      serde_json::from_str(&serde_json::to_string(&BrowserEcho::borrow(&event)).unwrap())
+        .expect("the echo is JSON");
+
+    assert_eq!(body["cmd"], "INVITE_BROWSER");
+    assert_eq!(body["application_id"], "app-1");
+    assert_eq!(body["nonce"], "n1");
+    assert_eq!(body["data"]["code"], "abc123", "the code lands in data");
+    assert_eq!(body["data"]["pid"], 3, "the pid lands in data too");
+    assert!(body.get("args").is_none(), "args stays absent");
+    assert!(body.get("evt").is_none(), "evt stays absent");
+  }
+
+  /// A command with no args echoes no `data` at all — the omitted key is
+  /// what the old `HashMap`-based shape produced too.
+  #[test]
+  fn a_browser_echo_without_args_has_no_data() {
+    let event = ActivityCmd {
+      application_id: None,
+      cmd: "DEEP_LINK".to_string(),
+      args: None,
+      data: None,
+      evt: None,
+      nonce: Value::String("n2".to_string()),
+    };
+
+    let body: Value =
+      serde_json::from_str(&serde_json::to_string(&BrowserEcho::borrow(&event)).unwrap())
+        .expect("the echo is JSON");
+
+    assert_eq!(body["cmd"], "DEEP_LINK");
+    assert!(body.get("data").is_none(), "no args, no data");
+    assert!(body.get("application_id").is_none(), "absent stays absent");
+  }
+
+  /// Args with `None` fields omit those keys, exactly as the old
+  /// `HashMap`-from-`to_value` shape did — the map dropped absent keys,
+  /// and so does `skip_serializing_none` on the args struct.
+  #[test]
+  fn a_browser_echo_omits_absent_arg_keys() {
+    let event = ActivityCmd {
+      application_id: Some(AppId::from("app-1")),
+      cmd: "GIFT_CODE_BROWSER".to_string(),
+      args: Some(ActivityCmdArgs {
+        pid: None,
+        activity: None,
+        code: Some("xyz".to_string()),
+        user_id: None,
+      }),
+      data: None,
+      evt: None,
+      nonce: Value::String("n3".to_string()),
+    };
+
+    let body: Value =
+      serde_json::from_str(&serde_json::to_string(&BrowserEcho::borrow(&event)).unwrap())
+        .expect("the echo is JSON");
+
+    let data = body["data"].as_object().expect("data is an object");
+    assert!(data.contains_key("code"), "the present key survives");
+    assert!(!data.contains_key("pid"), "an absent key stays absent");
+    assert!(!data.contains_key("activity"), "an absent key stays absent");
+    assert!(!data.contains_key("user_id"), "an absent key stays absent");
   }
 }

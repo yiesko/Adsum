@@ -1067,7 +1067,9 @@ async fn on_message(
         if !secondary_events {
           return;
         }
-        handlers::handle_browser_command(&event, &slot.responder, sink).await
+        // By value: the handler echoes by borrowing and forwards the
+        // command itself, so nothing here is deep-copied.
+        handlers::handle_browser_command(event, &slot.responder, sink).await
       }
       "DEEP_LINK" => {
         if !secondary_events {

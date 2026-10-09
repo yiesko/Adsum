@@ -1157,6 +1157,7 @@ dependencies = [
  "rsrpc-types",
  "rsrpc-ws",
  "rustc-hash",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-tungstenite",

@@ -19,6 +19,7 @@ rsrpc-protocol = { path = "../rsrpc-protocol" }
 rsrpc-ws = { path = "../rsrpc-ws" }
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "time", "macros", "sync"] }
 serde_json.workspace = true
+serde.workspace = true
 tracing.workspace = true
 rustc-hash.workspace = true
 
