@@ -405,7 +405,8 @@ pub(crate) fn build_bundle(
   let (custom_ac, custom_idx) = if custom.is_empty() {
     (None, Vec::new())
   } else {
-    let (ac, idx) = build_ac_patterns_allow_all_os(&custom)?;
+    let (ac, mut idx) = build_ac_patterns_allow_all_os(&custom)?;
+    idx.shrink_to_fit();
     (Some(ac), idx)
   };
   Ok(DetectablesBundle {
@@ -661,6 +662,46 @@ mod tests {
     assert_eq!(split.native_patterns.len(), split.native_idx.len());
     #[cfg(target_os = "linux")]
     assert_eq!(split.proton_patterns.len(), split.proton_idx.len());
+  }
+
+  /// The custom-override index releases its growth slack like the native
+  /// and Proton tables do.
+  ///
+  /// `custom_indexes` was the only stored table left holding amortized
+  /// doubling slack. The native and Proton ones get `shrink_to_fit` after
+  /// their source vectors are dropped, so the bundle's tables are exactly
+  /// their length; the custom one grew from empty with no bound and kept
+  /// whatever the last doubling left it.
+  #[test]
+  fn custom_index_releases_its_growth_slack() {
+    // Five entries force at least one doubling (`Vec` grows 4 → 8), so
+    // there is slack to release. One exe each: one pattern per entry.
+    let custom: Vec<Arc<ScannedEntry>> = (0..5)
+      .map(|i| entry_with_exes(&format!("c{i}"), OsName::Linux, &["custom.bin"]))
+      .collect();
+    let detectable: Vec<Arc<ScannedEntry>> = (0..3)
+      .map(|i| entry_with_exes(&format!("d{i}"), OsName::Linux, &["native.bin"]))
+      .collect();
+    let bundle =
+      build_bundle(Arc::from(detectable), Arc::from(custom)).expect("custom automaton builds");
+
+    assert!(
+      bundle.custom_indexes.len() >= 5,
+      "the custom patterns were built (got {})",
+      bundle.custom_indexes.len()
+    );
+    assert_eq!(
+      bundle.custom_indexes.capacity(),
+      bundle.custom_indexes.len(),
+      "the custom index must store exactly its length, not doubling slack"
+    );
+    // The sibling tables keep the same contract, so a later change cannot
+    // release one and forget the others.
+    assert_eq!(
+      bundle.indexes.capacity(),
+      bundle.indexes.len(),
+      "the native index must store exactly its length"
+    );
   }
 }
 
