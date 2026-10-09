@@ -472,7 +472,7 @@ fn on_frame(ipc: &mut dyn IpcFacilitator, stream: &mut (impl Read + Write), mess
       }
     }
     "SET_ACTIVITY" => {
-      handle_set_activity(ipc, stream, message, activity_cmd);
+      handle_set_activity(ipc, stream, activity_cmd);
     }
     "GET_USER" => {
       // Official response: the user object, or null when the id
@@ -540,12 +540,10 @@ fn on_frame(ipc: &mut dyn IpcFacilitator, stream: &mut (impl Read + Write), mess
   false
 }
 /// Handle a `SET_ACTIVITY` frame: forward to the event sink and echo the
-/// arRPC-shaped confirmation. `raw` is echoed back when the command has no
-/// usable body, so lock-step clients never hang.
+/// arRPC-shaped confirmation.
 fn handle_set_activity(
   ipc: &mut dyn IpcFacilitator,
   stream: &mut (impl Read + Write),
-  raw: &str,
   mut activity_cmd: ActivityCmd,
 ) {
   let args = match activity_cmd.args {
@@ -591,8 +589,11 @@ fn handle_set_activity(
   // call it), so the serialized payload and the fingerprint are identical
   // to what an unfixed forward would have produced.
   activity_cmd.fix();
-  let response =
-    commands::set_activity_response(&mut activity_cmd).unwrap_or_else(|| raw.to_string());
+  // `args` was validated above, so the reply always builds: the old
+  // `unwrap_or_else(|| raw.to_string())` fallback was unreachable, and with
+  // it the whole `raw` parameter the caller had to keep alive.
+  let response = commands::set_activity_response(&mut activity_cmd)
+    .expect("args was validated above, so the reply always builds");
 
   // Refused pids never reach the sink (echo below still flows, so
   // lock-step clients never hang); recording stays limited to forwarded
