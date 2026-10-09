@@ -202,7 +202,7 @@ fn activity_provenance_is_additive() {
 
   let traced = StateActivity {
     socket_id: "1".to_string(),
-    detection_source: Some("steam-app-id".to_string()),
+    detection_source: Some("steam-app-id".into()),
     detect_latency_ms: Some(4321),
     ..StateActivity::default()
   };

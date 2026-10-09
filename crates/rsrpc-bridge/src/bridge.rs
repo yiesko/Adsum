@@ -869,6 +869,7 @@ async fn persist_task(shared: Arc<Shared>, interval: Duration, token: Cancellati
 mod tests {
   use super::*;
   use crate::handoff::ScannedGame;
+  use rsrpc_types::DetectSource;
 
   /// Registration means presence in the protocol table: refused origins
   /// never insert, so their ids stay unknown even if a frame arrives.
@@ -975,10 +976,10 @@ mod tests {
   fn table_transition_fires_only_on_state_edges() {
     let game = ScannedGame {
       id: AppId::from("1"),
-      name: "G".to_string(),
+      name: Arc::from("G"),
       pid: 7,
       start: 0,
-      source: "automaton".to_string(),
+      source: DetectSource::Automaton,
       process_start_ms: None,
     };
     // Empty -> game: session start; repeats stay quiet.

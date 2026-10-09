@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -15,7 +16,9 @@ use rsrpc_types::{AppId, SocketId};
 #[derive(Serialize)]
 pub struct ProcessActivity {
   pub application_id: AppId,
-  pub name: String,
+  /// Refcounted like `ScannedGame::name`: the payload builder clones it
+  /// per publish, and a `String` there copied the game name every time.
+  pub name: Arc<str>,
   pub timestamps: ProcessTimestamps,
   pub r#type: u32,
   pub metadata: HashMap<String, String>,
@@ -78,7 +81,11 @@ pub struct CachedActivity {
 pub struct ActivityProvenance {
   /// Matcher source (`automaton`, `steam-app-id`, …) or `"sdk"` for
   /// client-published activities.
-  pub source: String,
+  ///
+  /// A `Cow` because both producers hand over a `'static` identifier — a
+  /// matcher's wire string, or the literal `"sdk"` — so a publish never
+  /// allocates to say where the card came from.
+  pub source: Cow<'static, str>,
   /// Process age in ms at first publish (`None` when the start time
   /// was unreadable, always for SDK activities).
   pub latency_ms: Option<u64>,

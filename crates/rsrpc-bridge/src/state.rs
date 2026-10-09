@@ -12,6 +12,7 @@
 //! Slot selection is best-effort: concurrent daemons may pick the same
 //! slot and overwrite each other — last writer wins, same as arRPC.
 
+use std::borrow::Cow;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -68,8 +69,12 @@ pub struct StateActivity {
   pub start_time: Option<String>,
   /// How this card was detected (matcher source, or `"sdk"` for
   /// client-published activities). Additive: absent on old cards.
+  ///
+  /// A `Cow` because the provenance it mirrors is one: a borrowed static
+  /// wire id for a matcher source, or `"sdk"`. Deserializing an old
+  /// snapshot file yields an owned `String`, which is the same value.
   #[serde(rename = "detectionSource", skip_serializing_if = "Option::is_none")]
-  pub detection_source: Option<String>,
+  pub detection_source: Option<Cow<'static, str>>,
   /// Process age in ms when first published (`None` when the start
   /// time was unreadable). Additive: absent on old cards.
   #[serde(rename = "detectLatencyMs", skip_serializing_if = "Option::is_none")]

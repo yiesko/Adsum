@@ -253,41 +253,14 @@ impl ScannedEntry {
 }
 
 /// Which matcher classified the process: the provenance asked for when
-/// a detection needs explaining. `Copy` and allocation-free by design —
-/// it travels on every hit without touching the hot path's budget.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum DetectSource {
-  /// Database-declared path (Aho-Corasick on the process path).
-  Automaton,
-  /// Bare exe joined with the process working directory.
-  CwdJoined,
-  /// `win32` (Proton) database entries.
-  ProtonAutomaton,
-  /// Authoritative store id (Steam/Proton environ, or cmdline fallback).
-  SteamAppId,
-  /// Install directory inherited from a known Steam library.
-  SteamLibrary,
-  /// Executable stem equal to a multi-word game name.
-  ExeStem,
-  /// Install folder carrying the title.
-  Folder,
-}
-
-impl DetectSource {
-  /// Stable log identifier for journal correlation.
-  #[must_use]
-  pub fn as_str(self) -> &'static str {
-    match self {
-      Self::Automaton => "automaton",
-      Self::CwdJoined => "cwd-joined",
-      Self::ProtonAutomaton => "proton-automaton",
-      Self::SteamAppId => "steam-app-id",
-      Self::SteamLibrary => "steam-library",
-      Self::ExeStem => "exe-stem",
-      Self::Folder => "folder",
-    }
-  }
-}
+/// a detection needs explaining.
+///
+/// Re-exported from `rsrpc-types` so every existing `crate::types::`
+/// import and `pub use` keeps resolving. It lives there because the value
+/// crosses the scanner/bridge boundary inside `ScannedGame`, and the
+/// bridge deliberately does not depend on the detector — see
+/// [`rsrpc_types::DetectSource`] for the rationale.
+pub use rsrpc_types::DetectSource;
 
 /// One classified game: the shared slim entry plus the observation (pid +
 /// epoch-millis start). Replaces stamping pid/timestamp onto a full-struct

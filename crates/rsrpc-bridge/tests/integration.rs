@@ -215,10 +215,10 @@ async fn process_scan_publishes_generic_and_null_clears() {
   fx.proc_tx
     .send(ProcInput::Detected(ScannedGame {
       id: "game-9".into(),
-      name: "Scanned".to_string(),
+      name: "Scanned".into(),
       pid: 4242,
       start: 1_700_000_000,
-      source: "automaton".to_string(),
+      source: rsrpc_types::DetectSource::Automaton,
       process_start_ms: None,
     }))
     .await
@@ -247,10 +247,10 @@ async fn null_scan_clears_live_generic_exactly_once() {
   fx.proc_tx
     .send(ProcInput::Detected(ScannedGame {
       id: "123456789".into(),
-      name: "LiveGeneric".to_string(),
+      name: "LiveGeneric".into(),
       pid: live,
       start: 1_700_000_000,
-      source: "automaton".to_string(),
+      source: rsrpc_types::DetectSource::Automaton,
       process_start_ms: None,
     }))
     .await
@@ -406,10 +406,10 @@ async fn null_scan_keeps_live_pid_cards() {
   fx.proc_tx
     .send(ProcInput::Detected(ScannedGame {
       id: "barrier".into(),
-      name: "Barrier".to_string(),
+      name: "Barrier".into(),
       pid: live,
       start: 1_700_000_000,
-      source: "automaton".to_string(),
+      source: rsrpc_types::DetectSource::Automaton,
       process_start_ms: None,
     }))
     .await
@@ -598,10 +598,10 @@ async fn session_transitions_emit_census_lines() {
   fx.proc_tx
     .send(ProcInput::Detected(ScannedGame {
       id: "game-7".into(),
-      name: "Session".to_string(),
+      name: "Session".into(),
       pid: u64::from(std::process::id()),
       start: 1_700_000_000,
-      source: "automaton".to_string(),
+      source: rsrpc_types::DetectSource::Automaton,
       process_start_ms: None,
     }))
     .await

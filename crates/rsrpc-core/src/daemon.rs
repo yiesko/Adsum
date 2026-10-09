@@ -416,12 +416,12 @@ impl Daemon {
           let input = match event {
             rsrpc_detect::ProcessDetectedEvent::Detected(hit) => ProcInput::Detected(ScannedGame {
               id: rsrpc_types::AppId::from(&*hit.entry.id),
-              name: hit.entry.name.to_string(),
+              name: Arc::from(hit.entry.name.as_ref()),
               pid: hit.pid,
               start: hit.start,
               // Provenance travels per event (rare by construction): one
               // start-time read here, never on the scan tick.
-              source: hit.source.as_str().to_string(),
+              source: hit.source,
               process_start_ms: rsrpc_detect::proc_start::process_start_ms(hit.pid),
             }),
             rsrpc_detect::ProcessDetectedEvent::Cleared => ProcInput::Cleared,

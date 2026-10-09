@@ -6,6 +6,8 @@
 
 pub mod app_id;
 pub mod cmd;
+pub mod detect_source;
 pub mod user;
 
 pub use app_id::{AppId, SocketId};
+pub use detect_source::DetectSource;

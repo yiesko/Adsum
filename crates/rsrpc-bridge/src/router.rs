@@ -6,6 +6,7 @@
 //! the consumer fan-out. Transport-agnostic: pumps feed it commands,
 //! it answers through the [`Shared`] state.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -77,7 +78,9 @@ pub(crate) fn generic_payload(game: &ScannedGame) -> Option<Arc<CachedActivity>>
     .and_then(|age| u64::try_from(age.as_millis()).ok())
     .unwrap_or(0);
   let provenance = Some(commands::ActivityProvenance {
-    source: game.source.clone(),
+    // Borrowed static wire id: the publish path allocates nothing to say
+    // where the card came from.
+    source: Cow::Borrowed(game.source.as_str()),
     latency_ms: game
       .process_start_ms
       .map(|started| now_ms.saturating_sub(started)),
@@ -331,7 +334,7 @@ impl Shared {
       };
       if let Some(payload) = Arc::get_mut(&mut payload) {
         payload.provenance = Some(commands::ActivityProvenance {
-          source: "sdk".to_string(),
+          source: Cow::Borrowed("sdk"),
           latency_ms: None,
         });
       }
@@ -394,6 +397,8 @@ impl Shared {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::handoff::HandoffState;
+  use rsrpc_types::DetectSource;
 
   /// Epoch millis for latency fixtures.
   fn now_ms() -> u64 {
@@ -411,10 +416,10 @@ mod tests {
   fn generic_payload_stamps_provenance() {
     let game = ScannedGame {
       id: AppId::from("12345"),
-      name: "Source Game".to_string(),
+      name: Arc::from("Source Game"),
       pid: u64::from(std::process::id()),
       start: 0,
-      source: "steam-app-id".to_string(),
+      source: DetectSource::SteamAppId,
       process_start_ms: Some(now_ms().saturating_sub(5000)),
     };
     let payload = generic_payload(&game).expect("builds");
@@ -424,6 +429,95 @@ mod tests {
     assert!(
       (5000..=60_000).contains(&latency),
       "latency {latency}ms should be ~5s"
+    );
+  }
+
+  /// F2: the matcher source travels as a `DetectSource`, not a `String`,
+  /// and the provenance keeps the wire identifier without re-allocating.
+  ///
+  /// Before, the daemon stringified the enum at the scanner/bridge
+  /// boundary, the bridge cloned that `String` per event, and the
+  /// provenance cloned it again. The enum is `Copy`, and the provenance
+  /// borrows the static wire identifier — so detection provenance costs
+  /// nothing on the publish path.
+  #[test]
+  fn provenance_source_travels_as_the_matcher_enum() {
+    for (source, expected) in [
+      (DetectSource::Automaton, "automaton"),
+      (DetectSource::SteamAppId, "steam-app-id"),
+      (DetectSource::ProtonAutomaton, "proton-automaton"),
+      (DetectSource::SteamLibrary, "steam-library"),
+      (DetectSource::ExeStem, "exe-stem"),
+      (DetectSource::Folder, "folder"),
+      (DetectSource::CwdJoined, "cwd-joined"),
+    ] {
+      let game = ScannedGame {
+        id: AppId::from("12345"),
+        name: Arc::from("Source Game"),
+        pid: u64::from(std::process::id()),
+        start: 0,
+        source,
+        process_start_ms: Some(now_ms().saturating_sub(5000)),
+      };
+      let payload = generic_payload(&game).expect("builds");
+      let provenance = payload.provenance.clone().expect("stamped");
+      assert_eq!(
+        &*provenance.source, expected,
+        "wire id changed for {source:?}"
+      );
+      // The point of the `Cow`: a matcher source borrows its static wire
+      // id, so a publish allocates nothing to say where the card came
+      // from. Value equality alone would pass with an owned `String`.
+      assert!(
+        matches!(provenance.source, Cow::Borrowed(_)),
+        "{source:?} must borrow the static wire id, not allocate a String"
+      );
+    }
+  }
+
+  /// The `"sdk"` provenance (client-published, not a matcher) still reads
+  /// as the same wire string a snapshot consumer has always seen — and it
+  /// borrows the literal, so saying where a client card came from costs
+  /// no allocation.
+  #[test]
+  fn sdk_provenance_keeps_its_wire_string() {
+    // Built exactly the way the SDK publish path builds it
+    // (`handle_set_activity` stamps provenance after the payload build).
+    let provenance = commands::ActivityProvenance {
+      source: Cow::Borrowed("sdk"),
+      latency_ms: None,
+    };
+    assert_eq!(&*provenance.source, "sdk");
+    assert!(
+      matches!(provenance.source, Cow::Borrowed(_)),
+      "the SDK path must borrow the literal, not allocate a String"
+    );
+  }
+
+  /// F3: a handoff's game name is refcounted, so the resume clone (the
+  /// second of four deep `String` copies the chain used to pay) is a
+  /// counter bump over the same buffer.
+  ///
+  /// Pointer identity is the assertion: a copy would land in a fresh
+  /// allocation and fail here, while the refcounted field does not.
+  #[test]
+  fn handoff_resume_shares_the_game_name_buffer() {
+    let mut handoff = HandoffState::default();
+    let game = ScannedGame {
+      id: AppId::from("12345"),
+      name: Arc::from("Source Game"),
+      pid: 7,
+      start: 0,
+      source: DetectSource::Automaton,
+      process_start_ms: None,
+    };
+    handoff.note_scan(Some(game));
+    let name_ptr = handoff.resume_for("12345").expect("resumed").name.as_ptr();
+
+    let resumed = handoff.resume_for("12345").expect("still resumed");
+    assert!(
+      std::ptr::eq(name_ptr, resumed.name.as_ptr()),
+      "a resumed game must share its name buffer, never copy it"
     );
   }
 }
