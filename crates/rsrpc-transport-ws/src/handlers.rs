@@ -228,9 +228,10 @@ pub(crate) async fn handle_set_activity(
     // before its own clears, so a never-delivered publish degrades to a
     // harmless clear of an unshown card (ignored downstream).
     Forward::Staged => {
-      sink.stage_publish(pending_clears, event);
-      sink.flush_pending(pending_clears);
-      true
+      // Try the sink directly and only queue on a full one: staging and
+      // immediately draining cost two lock round-trips for every staged
+      // publish, including the ones that left the queue at once.
+      sink.emit_or_stage_publish(pending_clears, event)
     }
     Forward::Refused => false,
   };
