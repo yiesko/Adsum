@@ -210,31 +210,6 @@ impl<T> GaugeSender<T> {
   }
 }
 
-/// Common blocking-receive shape for the raw bounded receiver and the
-/// gauged one, so one loop serves both legs without duplicating its body.
-pub trait RecvQueue<T> {
-  /// Blocking receive.
-  ///
-  /// # Errors
-  ///
-  /// Returns [`mpsc::RecvError`] once every sender is gone (shutdown).
-  fn recv_q(&self) -> Result<T, mpsc::RecvError>;
-}
-
-impl<T> RecvQueue<T> for mpsc::Receiver<T> {
-  /// Plain blocking receive (no gauge to update).
-  fn recv_q(&self) -> Result<T, mpsc::RecvError> {
-    self.recv()
-  }
-}
-
-impl<T> RecvQueue<T> for GaugeReceiver<T> {
-  /// Blocking receive that also releases the backlog count.
-  fn recv_q(&self) -> Result<T, mpsc::RecvError> {
-    self.recv()
-  }
-}
-
 /// `mpsc::Receiver` that releases its backlog count on every receive.
 pub struct GaugeReceiver<T> {
   inner: mpsc::Receiver<T>,
