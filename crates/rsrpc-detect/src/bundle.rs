@@ -12,6 +12,14 @@ use crate::db::DetectableActivity;
 use crate::scan::{name_matchable, normalize_name, os_matches};
 use crate::types::{OsName, ScannedEntry};
 
+/// 64-bit markers a process path may carry (parity with arrpc/pog5-rsrpc).
+///
+/// A path is matched against each in turn: `/usr/lib64/x64/game64.exe`
+/// strips down to `/usr/lib/x/game.exe` via `64`, and to
+/// `/usr/lib64//game64.exe` via `x64` — which is what lets a
+/// `/games/wow64.exe` process match a plain `wow.exe` database entry.
+const MARKERS: [&str; 4] = ["64", ".x64", "x64", "_64"];
+
 /// Sorted key→index table replacing a `HashMap` for the aux lookups: no
 /// buckets (~33B each in SwissTable), no hashing, no per-key `String`
 /// capacity field. Lookups happen only on match misses (rare per tick),
@@ -288,24 +296,47 @@ pub fn undotted_names(name_map: &SortedIndex) -> SortedIndex {
 /// `/games/wow.exe` which matches a `wow.exe` database entry.
 ///
 /// Writes into caller-owned buffers and returns how many are filled, so the
-/// per-process scan allocates nothing at steady state (buffers are reused
-/// across processes and scans; only marker hits allocate one temp string).
+/// per-process scan allocates nothing at steady state: buffers are reused
+/// across processes and scans, and the marker strip writes into the slot
+/// it will occupy (see [`remove_marker_into`]).
 pub fn path_variants_into(path: &str, out: &mut [String; 5]) -> usize {
   out[0].clear();
   out[0].push_str(path);
   let mut count = 1;
-  for marker in ["64", ".x64", "x64", "_64"] {
-    if !path.contains(marker) {
+  for marker in MARKERS {
+    // Bound first: past the last slot there is nothing to write, and a
+    // strip here would be work whose result is dropped.
+    if !path.contains(marker) || count >= out.len() {
       continue;
     }
-    let variant = path.replace(marker, "");
-    if variant != path && !out[..count].contains(&variant) && count < out.len() {
-      out[count].clear();
-      out[count].push_str(&variant);
+    // Write into the slot it would occupy, then decide: the candidate and
+    // the already-written variants are disjoint ranges of `out`, so both
+    // can be borrowed at once for the dedup check.
+    let (filled, candidate) = out.split_at_mut(count);
+    let candidate = &mut candidate[0];
+    remove_marker_into(path, marker, candidate);
+    if *candidate != path && !filled.iter().any(|variant| variant == candidate) {
       count += 1;
     }
   }
   count
+}
+
+/// Remove **every** occurrence of `marker`, writing into `buf` (cleared
+/// first). Equivalent to `str::replace`, without its allocation.
+///
+/// This is what keeps `path_variants_into` allocation-free on the scan hot
+/// path: the per-process walk hits a marker on most 64-bit Linux
+/// processes — `/usr/lib64/...` alone matches — and a temp `String` per hit
+/// was an allocation per process per tick.
+pub(crate) fn remove_marker_into(path: &str, marker: &str, buf: &mut String) {
+  buf.clear();
+  let mut rest = path;
+  while let Some(at) = rest.find(marker) {
+    buf.push_str(&rest[..at]);
+    rest = &rest[at + marker.len()..];
+  }
+  buf.push_str(rest);
 }
 
 /// Exe file name when the normalized `argv[0]` carries no directories
@@ -694,6 +725,63 @@ mod tests {
     assert_eq!(split.native_patterns.len(), split.native_idx.len());
     #[cfg(target_os = "linux")]
     assert_eq!(split.proton_patterns.len(), split.proton_idx.len());
+  }
+
+  /// The marker strip is `str::replace` without its allocation.
+  ///
+  /// The hand-written loop is the whole risk here: dropping an occurrence,
+  /// or dropping one after a match that consumed a shared byte, would
+  /// silently change which database entry a process matches. Compared
+  /// against the standard library for every interesting shape — including
+  /// multiple occurrences in one path, which is what `/usr/lib64/x64/…`
+  /// gives.
+  #[test]
+  fn remove_marker_matches_str_replace() {
+    for (path, marker) in [
+      ("/games/wow64.exe", "64"),
+      ("/usr/lib64/x64/game64.exe", "64"),
+      ("/usr/lib64/x64/game64.exe", "x64"),
+      ("a.x64b.x64c", ".x64"),
+      ("no marker here", "x64"),
+      ("/games/wow.exe", "64"),
+      ("64", "64"),
+      ("", "64"),
+      ("646464", "64"),
+    ] {
+      let mut buf = String::new();
+      remove_marker_into(path, marker, &mut buf);
+      assert_eq!(buf, path.replace(marker, ""), "{path} minus {marker:?}");
+    }
+  }
+
+  /// Path variants still dedup, stay bounded, and lead with the raw path.
+  ///
+  /// `/usr/lib64/x64/game64.exe` matches two markers, and the `64` strip
+  /// removes **three** occurrences — including the one inside `x64`. That is
+  /// the shape a first-occurrence-only implementation gets wrong, and the
+  /// reason the previous test exists.
+  #[test]
+  fn path_variants_strip_every_marker_and_stay_bounded() {
+    let mut out: [String; 5] = Default::default();
+    let count = path_variants_into("/usr/lib64/x64/game64.exe", &mut out);
+
+    assert_eq!(out[0], "/usr/lib64/x64/game64.exe", "the raw path leads");
+    assert_eq!(count, 3, "one raw plus two distinct marker strips");
+    // Every `64` goes, the one inside `x64` included: `64` is a substring of
+    // `x64`, and `str::replace` removes all of them.
+    assert_eq!(out[1], "/usr/lib/x/game.exe");
+    assert_eq!(out[2], "/usr/lib64//game64.exe");
+    assert!(count <= out.len(), "never past the caller's slots");
+  }
+
+  /// A path with no markers yields exactly the raw path: no strip, no
+  /// dedup work, nothing written.
+  #[test]
+  fn a_plain_path_yields_itself() {
+    let mut out: [String; 5] = Default::default();
+    let count = path_variants_into("/games/terraria", &mut out);
+    assert_eq!(count, 1);
+    assert_eq!(out[0], "/games/terraria");
   }
 
   /// Slim entry fixture with caller-chosen alias count.
