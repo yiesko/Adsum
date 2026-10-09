@@ -5,6 +5,38 @@ use serde_with::skip_serializing_none;
 /// `tools/updater`. Used for offline startup.
 pub const BUNDLED_DETECTABLE: &str = include_str!("../resources/detectable.json");
 
+/// Structural caps on a fetched detectable database.
+///
+/// Measured against the real `applications/detectable` body: the live
+/// database and the bundled snapshot agree exactly, at 16 executables,
+/// 8 aliases and 31 Steam SKUs per entry, 204-character names and
+/// 109-character executable names. Every cap below sits an order of
+/// magnitude above that, so ordinary database growth never trips them.
+///
+/// What they guard against is a body that parses but is not a database
+/// this daemon should build: one entry carrying tens of thousands of
+/// executables would generate one Aho-Corasick pattern and one index
+/// pair each, and the 64 MiB body limit alone does not bound that — a
+/// megabyte of JSON can be one pathological entry.
+///
+/// Raising any of these is a deliberate act: the tests hold them to a
+/// database shaped like the real one, at the top end of every field.
+pub const MAX_ENTRIES: usize = 100_000;
+/// Executables (Aho-Corasick patterns) one entry may carry.
+pub const MAX_EXECUTABLES_PER_ENTRY: usize = 256;
+/// Alternative titles one entry may carry (each is an aux-map key).
+pub const MAX_ALIASES_PER_ENTRY: usize = 64;
+/// Steam distributor SKUs one entry may carry (sorted-map entries).
+pub const MAX_THIRD_PARTY_SKUS_PER_ENTRY: usize = 128;
+/// Characters in a game name (an aux-map key and a log line).
+pub const MAX_NAME_LEN: usize = 1_024;
+/// Characters in an executable name (one automaton pattern).
+pub const MAX_EXECUTABLE_NAME_LEN: usize = 512;
+/// Characters in an executable's argument string (one match input).
+pub const MAX_ARGUMENTS_LEN: usize = 256;
+/// Characters in an application id (Discord snowflakes are ≤ 20 digits).
+pub const MAX_ID_LEN: usize = 64;
+
 /// Content hash for change detection (std-only SipHash: deterministic
 /// within a run, which is the only scope it is ever compared in).
 pub fn body_hash(body: &str) -> u64 {
@@ -122,6 +154,98 @@ pub fn hash_entry_aliases(entry: &DetectableActivity, hasher: &mut impl std::has
   for alias in aliases {
     0x05u8.hash(hasher);
     alias.hash(hasher);
+  }
+}
+
+/// Reject a parsed database that breaks a structural cap.
+///
+/// Called by every path that turns a fetched or supplied body into
+/// entries, so a cap added here holds on all of them. Pure and cheap: one
+/// pass, no allocation, no locks.
+///
+/// # Errors
+///
+/// [`RsrpcError::DatabaseTooLarge`](rsrpc_protocol::error::RsrpcError::DatabaseTooLarge)
+/// naming the first cap that was broken. Callers treat it like a parse
+/// failure and keep the database they already hold.
+pub fn enforce_structure(entries: &[DetectableActivity]) -> rsrpc_protocol::error::Result<()> {
+  use rsrpc_protocol::error::RsrpcError;
+  if entries.len() > MAX_ENTRIES {
+    return Err(RsrpcError::DatabaseTooLarge("too many entries"));
+  }
+  for entry in entries {
+    if entry.id.len() > MAX_ID_LEN {
+      return Err(RsrpcError::DatabaseTooLarge("application id too long"));
+    }
+    if entry.name.len() > MAX_NAME_LEN {
+      return Err(RsrpcError::DatabaseTooLarge("game name too long"));
+    }
+    let executables = entry.executables.as_ref().map_or(0, Vec::len);
+    if executables > MAX_EXECUTABLES_PER_ENTRY {
+      return Err(RsrpcError::DatabaseTooLarge(
+        "too many executables in one entry",
+      ));
+    }
+    for executable in entry.executables.iter().flatten() {
+      if executable.name.len() > MAX_EXECUTABLE_NAME_LEN {
+        return Err(RsrpcError::DatabaseTooLarge("executable name too long"));
+      }
+      if let Some(arguments) = executable.arguments.as_deref()
+        && arguments.len() > MAX_ARGUMENTS_LEN
+      {
+        return Err(RsrpcError::DatabaseTooLarge(
+          "executable arguments too long",
+        ));
+      }
+    }
+    let aliases = entry.aliases.as_ref().map_or(0, Vec::len);
+    if aliases > MAX_ALIASES_PER_ENTRY {
+      return Err(RsrpcError::DatabaseTooLarge(
+        "too many aliases in one entry",
+      ));
+    }
+    let skus = entry.third_party_skus.as_ref().map_or(0, Vec::len);
+    if skus > MAX_THIRD_PARTY_SKUS_PER_ENTRY {
+      return Err(RsrpcError::DatabaseTooLarge(
+        "too many Steam SKUs in one entry",
+      ));
+    }
+  }
+  Ok(())
+}
+
+/// Parse a database body: direct struct decode first, the shared trim as
+/// fallback, then the structural caps.
+///
+/// Single source of truth for every path that turns a body into entries —
+/// the hourly refresh and the CLI/`--detectable-file` path each used to
+/// spell this out, and a cap added to one would not have held on the
+/// other. The trim already enforces, so the fallback path is covered by
+/// construction; the direct branch checks here.
+///
+/// # Errors
+///
+/// The direct parse's error when neither shape decodes (it names the real
+/// problem), or [`RsrpcError::DatabaseTooLarge`](rsrpc_protocol::error::RsrpcError::DatabaseTooLarge)
+/// when the entries break a cap.
+///
+/// The second element says which shape decoded (`direct` or `trimmed`),
+/// because the fallback is part of the contract, not an implementation
+/// detail: callers log it.
+pub fn parse_database(
+  body: &str,
+) -> rsrpc_protocol::error::Result<(Vec<DetectableActivity>, &'static str)> {
+  match serde_json::from_str::<Vec<DetectableActivity>>(body) {
+    Ok(parsed) => {
+      enforce_structure(&parsed)?;
+      Ok((parsed, "direct"))
+    }
+    // Neither shape parses: reuse the direct parse's error, which names
+    // the real problem. Re-parsing the same body a third time just to
+    // produce an identical error would double the failure cost.
+    Err(first_err) => trim_parse(body)
+      .map(|parsed| (parsed, "trimmed"))
+      .map_err(|_| first_err.into()),
   }
 }
 
@@ -379,6 +503,10 @@ pub fn trim_parse(body: &str) -> rsrpc_protocol::error::Result<Vec<DetectableAct
         .map_err(|err| rsrpc_protocol::error::RsrpcError::InvalidJson { source: err })?,
     );
   }
+  // The trimmed path is a fallback for shapes the struct decode rejects,
+  // so it is exactly where a hostile body is likeliest to land: cap it
+  // here rather than trusting every caller to remember.
+  enforce_structure(&parsed)?;
   Ok(parsed)
 }
 
@@ -625,6 +753,140 @@ mod trim_parse_tests {
   #[test]
   fn trim_parse_matches_the_value_path_on_the_bundled_db() {
     assert_paths_agree(BUNDLED_DETECTABLE);
+  }
+
+  /// A body that parses but breaks a structural cap is rejected, on both
+  /// the direct and the trimmed path.
+  ///
+  /// Measured against the real `applications/detectable` body (see
+  /// [`MAX_EXECUTABLES_PER_ENTRY`]): the largest values are 16 executables,
+  /// 8 aliases, 204-char names and 109-char executable names, and they are
+  /// identical in the bundled snapshot and in the live one. The caps sit
+  /// an order of magnitude above that, so ordinary growth never trips
+  /// them — but a body that parses is not automatically a body worth
+  /// building.
+  #[test]
+  fn structural_caps_reject_a_hostile_body() {
+    let exes: String = (0..MAX_EXECUTABLES_PER_ENTRY + 1)
+      .map(|i| format!(r#"{{"name":"e{i}.exe","os":"win32","is_launcher":false}}"#))
+      .collect::<Vec<_>>()
+      .join(",");
+    let cases: [(&str, String); 7] = [
+      (
+        "too many executables in one entry",
+        format!(r#"[{{"id":"1","name":"G","hook":false,"executables":[{exes}]}}]"#),
+      ),
+      (
+        "too many aliases in one entry",
+        format!(
+          r#"[{{"id":"1","name":"G","hook":false,"aliases":[{}]}}]"#,
+          (0..MAX_ALIASES_PER_ENTRY + 1)
+            .map(|i| format!(r#""a{i}""#))
+            .collect::<Vec<_>>()
+            .join(",")
+        ),
+      ),
+      (
+        "too many entries",
+        format!(
+          "[{}]",
+          (0..MAX_ENTRIES + 1)
+            .map(|i| format!(r#"{{"id":"{i}","name":"G","hook":false}}"#))
+            .collect::<Vec<_>>()
+            .join(",")
+        ),
+      ),
+      (
+        "name past its cap",
+        format!(
+          r#"[{{"id":"1","hook":false,"name":"{}"}}]"#,
+          "n".repeat(MAX_NAME_LEN + 1)
+        ),
+      ),
+      (
+        "executable name past its cap",
+        format!(
+          r#"[{{"id":"1","name":"G","hook":false,"executables":[{{"name":"{}","os":"linux","is_launcher":false}}]}}]"#,
+          "e".repeat(MAX_EXECUTABLE_NAME_LEN + 1)
+        ),
+      ),
+      (
+        "application id past its cap",
+        format!(
+          r#"[{{"id":"{}","name":"G","hook":false}}]"#,
+          "1".repeat(MAX_ID_LEN + 1)
+        ),
+      ),
+      (
+        "too many Steam SKUs in one entry",
+        format!(
+          r#"[{{"id":"1","name":"G","hook":false,"third_party_skus":[{}]}}]"#,
+          (0..MAX_THIRD_PARTY_SKUS_PER_ENTRY + 1)
+            .map(|i| format!(r#"{{"distributor":"steam","id":"{i}","sku":null}}"#))
+            .collect::<Vec<_>>()
+            .join(",")
+        ),
+      ),
+    ];
+
+    for (label, body) in cases {
+      let direct = serde_json::from_str::<Vec<DetectableActivity>>(&body)
+        .ok()
+        .map(|entries| enforce_structure(&entries).is_err());
+      let trimmed = trim_parse(&body).err().map(|_| ());
+      assert_eq!(
+        direct,
+        Some(true),
+        "{label}: the direct path must reject it (direct={direct:?})"
+      );
+      assert_eq!(
+        trimmed,
+        Some(()),
+        "{label}: the trimmed path must reject it too"
+      );
+    }
+  }
+
+  /// The real database is accepted: the caps must not be the thing that
+  /// breaks a refresh. The bundled snapshot is a real body, so this is
+  /// the guard against a cap set below the data.
+  #[test]
+  fn structural_caps_accept_the_real_database() {
+    let via_struct = trim_parse(BUNDLED_DETECTABLE).expect("the bundled database parses");
+    enforce_structure(&via_struct).expect("the real database is within every cap");
+  }
+
+  /// A database shaped like the real one — every field at its measured
+  /// top end — is accepted.
+  ///
+  /// The live `applications/detectable` body and the bundled snapshot
+  /// measure the same: 16 executables, 8 aliases, 31 Steam SKUs and a
+  /// 204-character name at the top of the distribution. This builds that
+  /// shape by hand rather than trusting a committed file, so a cap lowered
+  /// below the real data fails here even before the bundled snapshot is
+  /// refreshed.
+  #[test]
+  fn caps_admit_a_database_shaped_like_the_real_one() {
+    let executables: String = (0..16)
+      .map(|i| format!(r#"{{"name":"e{i}.exe","os":"linux","is_launcher":false}}"#))
+      .collect::<Vec<_>>()
+      .join(",");
+    let aliases: String = (0..8)
+      .map(|i| format!(r#""alias {i}""#))
+      .collect::<Vec<_>>()
+      .join(",");
+    let skus: String = (0..31)
+      .map(|i| format!(r#"{{"distributor":"steam","id":"{i}","sku":null}}"#))
+      .collect::<Vec<_>>()
+      .join(",");
+    let body = format!(
+      r#"[{{"id":"1045800378228281345","name":"{}","hook":false,
+           "aliases":[{aliases}],"executables":[{executables}],
+           "third_party_skus":[{skus}]}}]"#,
+      "n".repeat(204)
+    );
+
+    parse_database(&body).expect("a database at the real top end is within every cap");
   }
 
   /// Defaults, empty arrays, empty aliases, extra keys, and the SKU

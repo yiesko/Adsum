@@ -117,16 +117,7 @@ pub fn fetch_detectable_etag(
   // missing required fields (it defaults them). The first error is
   // reused below: re-parsing the same body a third time just to produce
   // an identical error would double the failure cost for nothing.
-  let parsed = match serde_json::from_str::<Vec<DetectableActivity>>(&body) {
-    Ok(parsed) => parsed,
-    Err(first_err) => match crate::db::trim_parse(&body) {
-      Ok(parsed) => parsed,
-      // Neither shape parses: reuse the direct parse's error, which names
-      // the real problem. Re-parsing the same body a third time just to
-      // produce an identical error would double the failure cost.
-      Err(_) => return Err(first_err.into()),
-    },
-  };
+  let (parsed, _which_shape) = crate::db::parse_database(&body)?;
   // The raw body has served its purposes (raw hash above, parse input
   // here): drop its ~13MB BEFORE the canonical hash and the automata
   // build below, instead of letting it ride along to the end of this
