@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use rsrpc_transport_ws::{WsTransport, WsTransportConfig};
+use rsrpc_types::AppId;
 use rsrpc_types::cmd::ActivityCmd;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -312,7 +313,7 @@ fn activity_cmd(pid: u64, app: &str, name: &str) -> String {
 /// Next sink clear as `(application_id, pid)` (panics on non-clears).
 async fn recv_clear(
   rx: &mut tokio::sync::mpsc::Receiver<ActivityCmd>,
-) -> (Option<String>, Option<u64>) {
+) -> (Option<AppId>, Option<u64>) {
   let cmd = next_cmd(rx).await;
   assert_eq!(cmd.cmd, "SET_ACTIVITY");
   assert!(
@@ -356,8 +357,8 @@ async fn abrupt_close_clears_every_published_pid() {
   assert_eq!(
     clears,
     vec![
-      (Some("app-a".to_string()), Some(11)),
-      (Some("app-b".to_string()), Some(22)),
+      (Some(AppId::from("app-a")), Some(11)),
+      (Some(AppId::from("app-b")), Some(22)),
     ]
   );
 

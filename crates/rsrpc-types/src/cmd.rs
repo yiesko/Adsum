@@ -3,6 +3,8 @@ use serde_json::Value;
 use serde_with::skip_serializing_none;
 use std::collections::HashMap;
 
+use crate::AppId;
+
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct ActivityPayload {
   pub activity: Option<Activity>,
@@ -11,11 +13,16 @@ pub struct ActivityPayload {
   pub socket_id: Option<String>,
 }
 
+/// One game command as it arrives from a client.
+///
+/// `application_id` is refcounted like the rest of the id surface
+/// ([`AppId`]): the command is cloned per publish on the bridge path, and
+/// a `String` there copied the id every time.
 #[skip_serializing_none]
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "snake_case")]
 pub struct ActivityCmd {
-  pub application_id: Option<String>,
+  pub application_id: Option<AppId>,
   pub cmd: String,
   pub args: Option<ActivityCmdArgs>,
   pub data: Option<HashMap<String, Value>>,
@@ -189,7 +196,10 @@ pub struct Activity {
   pub platform: Option<String>,
   pub supported_platforms: Option<Vec<String>>,
   pub timestamps: Option<Timestamps>,
-  pub application_id: Option<String>,
+  /// Application id the activity itself was published under. Serde-
+  /// transparent over [`AppId`], so the wire byte is the same plain
+  /// string it always was.
+  pub application_id: Option<AppId>,
   pub details: Option<String>,
   /// URL opened when clicking the details text (official, max 256 chars).
   pub details_url: Option<String>,

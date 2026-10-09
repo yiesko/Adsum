@@ -78,8 +78,9 @@ impl PendingPayload {
 /// retaining the command it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingClear {
-  /// Application the published card belonged to.
-  pub(crate) app_id: Option<String>,
+  /// Application the published card belonged to. Refcounted like the
+  /// command's own id: this is cloned out per staged clear.
+  pub(crate) app_id: Option<AppId>,
   /// Process whose card is being cleared (pid 0 is never genuine).
   pub(crate) pid: u64,
   /// Nonce of the publish this clear answers.
@@ -177,7 +178,7 @@ impl ClientSlot {
   /// Unknown pids past [`handlers::MAX_TRACKED_PIDS`] are refused: the
   /// caller must not forward them, keeping every forwarded pid tracked
   /// (and therefore covered by disconnect cleanup).
-  fn note_published(&mut self, app_id: Option<String>, pid: u64, nonce: Value) -> Admission {
+  fn note_published(&mut self, app_id: Option<AppId>, pid: u64, nonce: Value) -> Admission {
     if let Some(pos) = self.published.iter().position(|entry| entry.pid == pid) {
       let displaced = self.published.remove(pos);
       self
@@ -932,12 +933,10 @@ async fn on_message(
     // always forward (the bridge may hold the card), and free the slot
     // once delivered so new pids fit again. Applies the same
     // connect-query client_id fallback the forwarded command carries.
-    let app_id = event.application_id.clone().or_else(|| {
-      slot
-        .query_client_id
-        .as_ref()
-        .map(|id| id.as_ref().to_string())
-    });
+    let app_id = event
+      .application_id
+      .clone()
+      .or_else(|| slot.query_client_id.clone());
     let pid = event.args.as_ref().and_then(|a| a.pid).unwrap_or_default();
     let is_clear = event
       .args
@@ -1156,7 +1155,7 @@ mod tests {
   /// One published slot, as a disconnect would stage it.
   fn slot(pid: u64) -> handlers::PublishedSlot {
     handlers::PublishedSlot {
-      app_id: Some("app-1".to_string()),
+      app_id: Some(AppId::from("app-1")),
       pid,
       nonce: Value::String(format!("n{pid}")),
     }
@@ -1166,7 +1165,7 @@ mod tests {
   /// measurable (the point of the slim representation).
   fn big_publish(pid: u64) -> ActivityCmd {
     ActivityCmd {
-      application_id: Some("app-1".to_string()),
+      application_id: Some(AppId::from("app-1")),
       cmd: "SET_ACTIVITY".to_string(),
       data: None,
       evt: None,

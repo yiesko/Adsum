@@ -11,6 +11,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use rsrpc_protocol::commands;
+use rsrpc_types::AppId;
 use rsrpc_types::cmd::{ActivityCmd, ActivityCmdArgs};
 use rsrpc_types::user::RpcUser;
 use rsrpc_ws::{Message, Responder};
@@ -211,7 +212,7 @@ pub(crate) async fn handle_set_activity(
   // Fall back to the client_id provided on connect (query param) when the
   // command itself does not carry an application_id.
   if event.application_id.is_none() {
-    event.application_id = query_client_id.map(str::to_string);
+    event.application_id = query_client_id.map(AppId::from);
   }
 
   // Apply field fixes so the confirmation reply carries labels/urls (fix is
@@ -250,7 +251,9 @@ pub(crate) async fn handle_set_activity(
 /// [`MAX_TRACKED_PIDS`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PublishedSlot {
-  pub app_id: Option<String>,
+  /// Refcounted like the command's own id: this is cloned out per publish
+  /// and per disconnect clear, and it used to be a `String` copy each time.
+  pub app_id: Option<AppId>,
   pub pid: u64,
   pub nonce: Value,
 }

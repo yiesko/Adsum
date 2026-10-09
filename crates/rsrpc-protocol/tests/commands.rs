@@ -7,6 +7,7 @@ use rsrpc_protocol::commands::{
   RecentActivities, activity_fingerprint, cached_activity, current_user_update, generic_ack,
   rpc_error, set_activity_response, subscribe_ack, unsupported_command, user_response,
 };
+use rsrpc_types::AppId;
 use rsrpc_types::cmd::ActivityCmd;
 use rsrpc_types::user::RpcUser;
 
@@ -165,7 +166,7 @@ fn set_activity_response_echoes_activity_intact() {
     r#"{"cmd":"SET_ACTIVITY","nonce":"echo-1","args":{"pid":777,"activity":{
       "name":"My Game","type":2,"details":"AFK"}}}"#,
   );
-  cmd.application_id = Some("123".to_string());
+  cmd.application_id = Some(AppId::from("123"));
 
   let reply: Value =
     serde_json::from_str(&set_activity_response(&mut cmd).expect("response")).expect("valid json");
@@ -189,7 +190,7 @@ fn set_activity_response_keeps_extra_and_derived_metadata() {
       "buttons":[{"label":"Play","url":"https://example.com/play"}],
       "mystery_field_xyz":"must-survive"}}}"#,
   );
-  cmd.application_id = Some("123".to_string());
+  cmd.application_id = Some(AppId::from("123"));
   cmd.fix();
 
   let reply: Value =
@@ -206,7 +207,7 @@ fn set_activity_response_keeps_extra_and_derived_metadata() {
 fn set_activity_response_clear_carries_null_data() {
   let mut cmd =
     parse_cmd(r#"{"cmd":"SET_ACTIVITY","nonce":"clear-1","args":{"pid":777,"activity":null}}"#);
-  cmd.application_id = Some("123".to_string());
+  cmd.application_id = Some(AppId::from("123"));
 
   let reply: Value =
     serde_json::from_str(&set_activity_response(&mut cmd).expect("response")).expect("valid json");
@@ -402,7 +403,7 @@ fn cached_activity_carries_fingerprint_bytes() {
 #[test]
 fn cached_activity_stamps_outer_application_id() {
   let mut cmd = set_activity_cmd();
-  cmd.application_id = Some("424242".to_string());
+  cmd.application_id = Some(AppId::from("424242"));
   let payload = cached_activity(cmd, None).expect("payload");
 
   let body: Value = serde_json::from_str(&payload.json).expect("valid json");
@@ -440,8 +441,8 @@ fn set_activity_response_matches_the_dom_reference() {
     "application_id".to_string(),
     cmd
       .application_id
-      .clone()
-      .map(Value::String)
+      .as_deref()
+      .map(Value::from)
       .unwrap_or(Value::Null),
   );
   let reference = serde_json::json!({
@@ -583,10 +584,47 @@ fn fingerprint_includes_outer_application_id() {
   // be misclassified as unchanged and keep the old application.
   let mut a = set_activity_cmd();
   let mut b = set_activity_cmd();
-  b.application_id = Some("999".to_string());
+  b.application_id = Some(AppId::from("999"));
   let fa = activity_fingerprint(&mut a).expect("fingerprint");
   let fb = activity_fingerprint(&mut b).expect("fingerprint");
   assert_ne!(fa, fb);
+}
+
+/// C3: the id stamps move the shared id instead of copying it.
+///
+/// `activity_fingerprint` and `cached_activity` both stamp the outer
+/// `application_id` onto the activity so the two encodings agree, and
+/// each runs once per publish. With a `String` field every stamp copied
+/// the id — half of what this migration removes, and a per-tick cost on
+/// the flood-guard path.
+///
+/// Pointer identity is the assertion: a round-trip through `String`
+/// allocates a fresh buffer and fails here, while the refcounted move
+/// does not.
+#[test]
+fn id_stamps_share_the_command_buffer() {
+  let mut cmd = parse_cmd(
+    r#"{"cmd":"SET_ACTIVITY","application_id":"123456789012345678",
+        "args":{"pid":42,"activity":{"name":"G","type":0}},"nonce":"n1"}"#,
+  );
+  let outer_ptr = cmd.application_id.as_ref().expect("outer id").as_ptr();
+
+  // First stamp (flood-guard fingerprint).
+  activity_fingerprint(&mut cmd).expect("fingerprint");
+  let stamped = cmd
+    .args
+    .as_ref()
+    .expect("args")
+    .activity
+    .as_ref()
+    .expect("activity")
+    .application_id
+    .as_ref()
+    .expect("stamped");
+  assert!(
+    std::ptr::eq(stamped.as_ptr(), outer_ptr),
+    "the fingerprint stamp must move the shared id, never copy it"
+  );
 }
 
 /// Every reply builder on the borrowed-envelope path must produce exactly

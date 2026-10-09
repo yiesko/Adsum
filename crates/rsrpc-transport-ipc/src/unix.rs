@@ -14,6 +14,7 @@ use std::sync::{
 use std::time::Duration;
 
 use rsrpc_protocol::error::{Result, RsrpcError};
+use rsrpc_types::AppId;
 use rsrpc_types::cmd::ActivityCmd;
 use rsrpc_types::user::RpcUser;
 use tokio::net::UnixListener;
@@ -45,7 +46,7 @@ fn accept_error_backoff(err: &std::io::Error) -> Option<Duration> {
 /// Per-connection protocol state plus shared handles.
 struct ConnFacilitator {
   handshake: bool,
-  client_id: String,
+  client_id: AppId,
   pid: u64,
   nonce: String,
   user: Arc<Mutex<RpcUser>>,
@@ -59,7 +60,7 @@ impl ConnFacilitator {
   fn fresh(user: Arc<Mutex<RpcUser>>, sink: EventSink) -> Self {
     Self {
       handshake: false,
-      client_id: String::new(),
+      client_id: AppId::from(""),
       pid: 0,
       nonce: String::new(),
       user,
@@ -79,11 +80,11 @@ impl IpcFacilitator for ConnFacilitator {
     self.handshake = handshake;
   }
   /// Application id from the handshake (empty until then).
-  fn client_id(&self) -> String {
+  fn client_id(&self) -> AppId {
     self.client_id.clone()
   }
   /// Store the handshake application id.
-  fn set_client_id(&mut self, client_id: String) {
+  fn set_client_id(&mut self, client_id: AppId) {
     self.client_id = client_id;
   }
   /// Last pid seen on this connection (0 until the first activity).

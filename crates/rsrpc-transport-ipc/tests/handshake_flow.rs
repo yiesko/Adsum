@@ -14,12 +14,13 @@ use std::time::Duration;
 use common::{read_frame, recv_cmd, write_frame};
 use rsrpc_transport_ipc::EventSink;
 use rsrpc_transport_ipc::frame::{IpcFacilitator, PacketType, handle_stream};
+use rsrpc_types::AppId;
 use rsrpc_types::cmd::ActivityCmd;
 use rsrpc_types::user::RpcUser;
 
 struct TestFacilitator {
   handshake: bool,
-  client_id: String,
+  client_id: AppId,
   pid: u64,
   nonce: String,
   sink: EventSink,
@@ -36,11 +37,11 @@ impl IpcFacilitator for TestFacilitator {
     self.handshake = handshake;
   }
   /// Test state: handshake application id.
-  fn client_id(&self) -> String {
+  fn client_id(&self) -> AppId {
     self.client_id.clone()
   }
   /// Test state: handshake application id.
-  fn set_client_id(&mut self, client_id: String) {
+  fn set_client_id(&mut self, client_id: AppId) {
     self.client_id = client_id;
   }
   /// Test state: latest activity pid.
@@ -96,7 +97,7 @@ fn handshake_set_activity_close_flow() {
 
   let mut facil = TestFacilitator {
     handshake: false,
-    client_id: String::new(),
+    client_id: AppId::from(""),
     pid: 0,
     nonce: String::new(),
     sink,
@@ -175,7 +176,7 @@ fn set_activity_forwards_the_fixed_shape() {
 
   let mut facil = TestFacilitator {
     handshake: false,
-    client_id: String::new(),
+    client_id: AppId::from(""),
     pid: 0,
     nonce: String::new(),
     sink,
@@ -242,7 +243,7 @@ fn invalid_utf8_body_clears_published_pid() {
 
   let mut facil = TestFacilitator {
     handshake: false,
-    client_id: String::new(),
+    client_id: AppId::from(""),
     pid: 0,
     nonce: String::new(),
     sink,
@@ -326,7 +327,7 @@ fn spawn_server() -> (
   let (sink, rx) = EventSink::bounded(16);
   let mut facil = TestFacilitator {
     handshake: false,
-    client_id: String::new(),
+    client_id: AppId::from(""),
     pid: 0,
     nonce: String::new(),
     sink,
@@ -488,7 +489,7 @@ fn abrupt_close_clears_every_published_pid() {
   let (sink, mut rx) = EventSink::bounded(16);
   let mut facil = TestFacilitator {
     handshake: false,
-    client_id: String::new(),
+    client_id: AppId::from(""),
     pid: 0,
     nonce: String::new(),
     sink,
@@ -542,7 +543,7 @@ fn published_pid_history_is_bounded() {
   let (sink, mut rx) = EventSink::bounded(64);
   let mut facil = TestFacilitator {
     handshake: false,
-    client_id: String::new(),
+    client_id: AppId::from(""),
     pid: 0,
     nonce: String::new(),
     sink,
@@ -603,7 +604,7 @@ fn clean_close_clear_survives_a_full_sink() {
 
   let mut facil = TestFacilitator {
     handshake: false,
-    client_id: String::new(),
+    client_id: AppId::from(""),
     pid: 0,
     nonce: String::new(),
     sink,

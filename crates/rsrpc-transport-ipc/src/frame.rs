@@ -9,6 +9,7 @@
 use std::io::{Read, Write};
 
 use rsrpc_protocol::commands;
+use rsrpc_types::AppId;
 use rsrpc_types::cmd::{ActivityCmd, ActivityCmdArgs};
 use rsrpc_types::user::RpcUser;
 use serde_json::Value;
@@ -24,9 +25,11 @@ pub trait IpcFacilitator: Send {
   fn set_handshake(&mut self, handshake: bool);
 
   /// Client id from the handshake (routing enrichment for forwarded frames).
-  fn client_id(&self) -> String;
-  /// Remember the handshake client id.
-  fn set_client_id(&mut self, client_id: String);
+  /// Application id from the handshake (refcounted: the forward path
+  /// stamps it onto every command the connection sends).
+  fn client_id(&self) -> AppId;
+  /// Remember the handshake application id.
+  fn set_client_id(&mut self, client_id: AppId);
 
   /// Last pid seen on `SET_ACTIVITY` (clear attribution on abrupt close).
   fn pid(&self) -> u64;
@@ -352,7 +355,7 @@ fn on_handshake(
     return true;
   }
   ipc.set_handshake(true);
-  ipc.set_client_id(data.client_id.clone());
+  ipc.set_client_id(AppId::from(data.client_id.as_str()));
   tracing::info!("[ipc] Client connected: {}", data.client_id);
   if let Err(err) = stream.write_all(&encode(PacketType::Frame, &ipc.user_payload())) {
     tracing::warn!("[ipc] Error sending connection response: {err}");
@@ -392,7 +395,7 @@ fn on_close(ipc: &mut dyn IpcFacilitator) {
   // Reset for a potential reuse of this facilitator; the server
   // listener itself is never rebound (see crate docs).
   ipc.set_handshake(false);
-  ipc.set_client_id(String::new());
+  ipc.set_client_id(AppId::from(""));
   ipc.set_pid(0);
 }
 
