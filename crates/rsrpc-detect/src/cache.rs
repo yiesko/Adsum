@@ -8,6 +8,7 @@ use rustc_hash::FxHashSet;
 use crate::scan::{ExecScratch, read_steam_app_id};
 use crate::server::ProcessServer;
 use crate::types::Exec;
+use rsrpc_types::AppId;
 
 /// Memoized SteamAppId plus its invalidation sequence (see
 /// [`ProcessServer::cached_app_id`]). Verified outcomes (`Present` /
@@ -20,8 +21,9 @@ use crate::types::Exec;
 pub(crate) enum AppIdMemo {
   /// Verified: this pid has no SteamAppId. Valid until invalidated.
   Absent(u64),
-  /// Verified SteamAppId, valid under the same rules.
-  Present(u64, String),
+  /// Verified SteamAppId, valid under the same rules. Refcounted, so a
+  /// cache hit is a counter bump rather than a `String` copy per tick.
+  Present(u64, AppId),
   /// Never read, or invalidated by EXEC: read environ, then store the
   /// outcome — unless the sequence moved under us (racing EXEC), in
   /// which case the stale read is discarded, never stored.
@@ -41,10 +43,11 @@ impl ProcessServer {
   ///
   /// `exec_scratch` supplies the environ and path buffers, so a
   /// `Stale` miss (the common case) costs no allocation of its own.
-  pub fn cached_app_id(&self, pid: u64, exec_scratch: &mut ExecScratch) -> Option<String> {
+  pub fn cached_app_id(&self, pid: u64, exec_scratch: &mut ExecScratch) -> Option<AppId> {
     // Fast paths: verified memos, cloned once straight into the return.
     // `Absent` is the common case (non-Steam processes) and performs no
     // I/O at all; only `Stale` falls through to the environ read below.
+    // The memo's `AppId` clone is a refcount bump, not a copy of the id.
     let memo = self
       .appid_cache
       .lock()
@@ -61,20 +64,23 @@ impl ProcessServer {
     let mut cache = self.appid_cache.lock().unwrap_or_else(|e| e.into_inner());
     // A racing EXEC invalidated this pid mid-read (sequence bumped) or
     // the tick swept it: discard the stale environ instead of pinning
-    // it for the pid lifetime.
+    // a pre-exec id for the pid lifetime.
     let fresh = match cache.get(&pid) {
       Some(AppIdMemo::Stale(seq)) if *seq == seq0 => true,
       None if seq0 == 0 => true,
       _ => false,
     };
     if fresh {
-      let memo = match id.clone() {
-        Some(id) => AppIdMemo::Present(seq0, id),
+      let memo = match id.as_ref() {
+        Some(id) => AppIdMemo::Present(seq0, AppId::from(id.as_str())),
         None => AppIdMemo::Absent(seq0),
       };
       cache.insert(pid, memo);
     }
-    id
+    // The miss path still owns a `String` from the environ read; wrap it
+    // for the caller rather than changing the reader's shape. A hit that
+    // reached here (not `fresh`) re-wraps its own `String` once.
+    id.map(AppId::from)
   }
 
   /// Drop memoized AppIds of pids that died since the last tick: pid
@@ -133,7 +139,6 @@ mod sweep_tests {
   use super::*;
 
   use rsrpc_telemetry::QueueGauge;
-
   /// A bare server: no detectable base, no listeners, no refresh.
   fn server() -> ProcessServer {
     let (tx, _rx) = QueueGauge::pair();
@@ -221,5 +226,46 @@ mod sweep_tests {
     assert!(cache.contains_key(&10));
     assert!(!cache.contains_key(&20), "dead pid must be dropped");
     assert!(cache.contains_key(&30));
+  }
+
+  /// D7: the memo holds a refcounted id, so a cache hit is a refcount
+  /// bump instead of a `String` clone.
+  ///
+  /// Every monitored game paid one `String` copy per scan tick — the
+  /// `.cloned()` of the memo plus the copy into the return value. With
+  /// `AppId` inside, both are counter bumps over the same buffer.
+  ///
+  /// The invariant is pointer identity: a clone that copies would land
+  /// in a fresh allocation and this fails, while a refcount bump does not.
+  #[test]
+  fn cached_app_id_hit_shares_the_memoized_buffer() {
+    let server = server();
+    // Plant a verified memo directly, so the assertion is about the hit
+    // path (no environment dependency on whether /proc/<pid>/environ
+    // happens to carry a SteamAppId).
+    let pid = 42u64;
+    {
+      let mut cache = server.appid_cache.lock().unwrap_or_else(|e| e.into_inner());
+      cache.insert(
+        pid,
+        AppIdMemo::Present(1, AppId::from("123456789012345678")),
+      );
+    }
+    let stored_ptr = {
+      let cache = server.appid_cache.lock().unwrap_or_else(|e| e.into_inner());
+      let Some(AppIdMemo::Present(_, id)) = cache.get(&pid) else {
+        panic!("planted memo must be Present");
+      };
+      id.as_ptr()
+    };
+
+    let mut scratch = ExecScratch::default();
+    let returned = server.cached_app_id(pid, &mut scratch).expect("hit");
+
+    assert!(
+      std::ptr::eq(returned.as_ptr(), stored_ptr),
+      "a cache hit must share the memoized buffer, never copy it"
+    );
+    assert_eq!(&*returned, "123456789012345678");
   }
 }

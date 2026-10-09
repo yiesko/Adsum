@@ -10,6 +10,7 @@ use std::sync::Arc;
 use crate::bundle::{DetectablesBundle, SortedIndex, bare_exe, path_variants_into};
 use crate::server::ProcessServer;
 use crate::types::{DetectSource, Exec, ScannedEntry, ScannedHit};
+use rsrpc_types::AppId;
 
 /// Read one process's cmdline into an `Exec` (Linux). `None` for kernel
 /// threads, zombies, vanished or unreadable pids — the caller just skips
@@ -855,7 +856,7 @@ impl ProcessServer {
           // Owned copy: only paid when environ is unreadable (sandboxed
           // Proton), so the common paths stay borrow-only.
           None => (
-            app_id_from_args(process.arguments.as_deref()).map(|id| id.to_string()),
+            app_id_from_args(process.arguments.as_deref()).map(AppId::from),
             true,
           ),
         };
