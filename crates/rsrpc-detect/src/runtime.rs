@@ -180,6 +180,30 @@ pub(crate) fn deliver_snapshot(
   SnapshotDelivery::Complete
 }
 
+/// Backlog budget for the EXEC fast path's publication. Matches the
+/// snapshot lane: events are tiny, the consumer drains continuously, and
+/// a shed is repaired by the forced full emission `scan_dirty` triggers.
+pub(crate) const EXEC_EVENT_CAP: usize = 128;
+
+/// Publish one EXEC classification, capacity-checked.
+///
+/// A shed is **not** a failure: the caller sets `scan_dirty` before
+/// publishing, so a lost hint costs one poll interval and then the whole
+/// table is re-emitted. Reporting it as a success is what lets the lane
+/// carry on instead of tearing itself down over a dropped best-effort
+/// event. Only a gone receiver ends the lane — with no receiver there is
+/// nothing to drain and nothing to repair.
+pub(crate) fn publish_exec_hit(
+  sender: &rsrpc_telemetry::GaugeSender<ProcessDetectedEvent>,
+  hit: ScannedHit,
+  cap: usize,
+) -> bool {
+  match sender.send_checked(ProcessDetectedEvent::detected(hit), cap) {
+    SendChecked::Sent | SendChecked::Shed => true,
+    SendChecked::Closed => false,
+  }
+}
+
 /// Advance the snapshot lane for one tick: compute the delta against the
 /// recorded table, deliver it, and record the new table **only when the
 /// delivery was complete**.
@@ -204,14 +228,46 @@ where
   delivery
 }
 
-/// The sender wraps an unbounded `std::mpsc`: `Err` means the receiver is
-/// gone (shutdown), never transient backpressure — retrying would spin
-/// `scan_for_processes` forever after shutdown. The EXEC fast path already
-/// breaks; the polling loop must do the same.
-pub(crate) fn should_exit_on_send_error<T>(
-  result: &Result<(), std::sync::mpsc::SendError<T>>,
-) -> bool {
-  result.is_err()
+/// The sender wraps an unbounded `std::mpsc`, so a plain `send` only
+/// fails when the receiver is gone — which is why the lane uses
+/// [`publish_exec_hit`] and [`deliver_snapshot`], both of which report
+/// that case as shutdown and every other outcome as delivered-or-shed.
+#[cfg(test)]
+mod send_outcome_tests {
+  use super::super::types::ScannedEntry;
+  use super::*;
+
+  /// A gone receiver is the only send outcome that ends a lane: everything
+  /// else is either delivered or shed-and-repaired.
+  #[test]
+  fn a_gone_receiver_is_the_only_stopping_outcome() {
+    let (tx, rx) = rsrpc_telemetry::QueueGauge::pair::<ProcessDetectedEvent>();
+    drop(rx);
+    assert_eq!(
+      deliver_snapshot(&tx, &[], &[], true),
+      SnapshotDelivery::Closed,
+      "a gone receiver stops the snapshot lane"
+    );
+    assert!(
+      !publish_exec_hit(&tx, placeholder_hit(), EXEC_EVENT_CAP),
+      "a gone receiver stops the exec lane"
+    );
+  }
+
+  fn placeholder_hit() -> ScannedHit {
+    ScannedHit {
+      entry: Arc::new(ScannedEntry {
+        id: "1".into(),
+        name: "G".into(),
+        executables: Box::new([]),
+        steam_ids: Box::new([]),
+        aliases: Box::new([]),
+      }),
+      pid: 1,
+      start: 0,
+      source: rsrpc_types::DetectSource::Automaton,
+    }
+  }
 }
 
 /// `(app id, pid)` pairs present in the previous snapshot but absent now.
@@ -449,13 +505,11 @@ fn spawn_proc_watcher(server: &ProcessServer) -> rsrpc_telemetry::QueueGauge {
               dispatch
                 .scan_dirty
                 .store(true, std::sync::atomic::Ordering::Release);
-              // Receiver gone means shutdown: end the thread, polling dies
-              // with the daemon anyway.
-              if should_exit_on_send_error(
-                &dispatch
-                  .event_sender
-                  .send(ProcessDetectedEvent::detected(hit)),
-              ) {
+              // Best-effort publication: a shed backstops through
+              // `scan_dirty` (set above), which forces the next tick to
+              // re-emit the whole table. Only a gone receiver ends the
+              // thread.
+              if !publish_exec_hit(&dispatch.event_sender, hit, EXEC_EVENT_CAP) {
                 break;
               }
             }
@@ -918,6 +972,76 @@ impl ProcessServer {
       tracing::info!(
         "[Process Scanner] proc-events watcher disabled by configuration, polling only"
       );
+    }
+  }
+}
+
+#[cfg(test)]
+mod exec_lane_tests {
+  use super::super::types::ScannedEntry;
+  use super::*;
+
+  /// A hit the channel accepts is published.
+  #[test]
+  fn an_accepted_exec_hit_is_published() {
+    let (tx, _rx) = rsrpc_telemetry::QueueGauge::pair::<ProcessDetectedEvent>();
+    assert!(
+      publish_exec_hit(&tx, placeholder_hit(), EXEC_EVENT_CAP),
+      "an accepted hit is published"
+    );
+  }
+
+  /// The semantic that makes the EXEC lane safe to bound: a shed is not an
+  /// error.
+  ///
+  /// The caller marks `scan_dirty` *before* publishing, so a lost fast-path
+  /// event costs one poll interval and then the whole table is re-emitted.
+  /// Reporting "published" for a shed is what lets the loop carry on
+  /// instead of tearing the thread down over a dropped best-effort hint.
+  #[test]
+  fn a_shed_exec_hit_is_not_an_error() {
+    let (tx, rx) = rsrpc_telemetry::QueueGauge::pair::<ProcessDetectedEvent>();
+    let cap = EXEC_EVENT_CAP;
+    // Saturate the backlog without draining, so the next send sheds.
+    while matches!(
+      tx.send_checked(ProcessDetectedEvent::Cleared, cap),
+      SendChecked::Sent
+    ) {}
+    assert!(
+      publish_exec_hit(&tx, placeholder_hit(), cap),
+      "a shed best-effort hint must not read as a failure"
+    );
+    assert!(
+      tx.gauge().dropped_total() > 0,
+      "the shed must be counted, so the census can see a backlogged lane"
+    );
+    drop(rx);
+  }
+
+  /// A gone receiver is shutdown: the caller must stop, not spin.
+  #[test]
+  fn a_gone_receiver_stops_the_exec_lane() {
+    let (tx, rx) = rsrpc_telemetry::QueueGauge::pair::<ProcessDetectedEvent>();
+    drop(rx);
+    assert!(
+      !publish_exec_hit(&tx, placeholder_hit(), EXEC_EVENT_CAP),
+      "a gone receiver is shutdown, not a shed"
+    );
+  }
+
+  /// One placeholder hit (pid/entry are irrelevant to the lane).
+  fn placeholder_hit() -> ScannedHit {
+    ScannedHit {
+      entry: Arc::new(ScannedEntry {
+        id: "1".into(),
+        name: "G".into(),
+        executables: Box::new([]),
+        steam_ids: Box::new([]),
+        aliases: Box::new([]),
+      }),
+      pid: 1,
+      start: 0,
+      source: rsrpc_types::DetectSource::Automaton,
     }
   }
 }

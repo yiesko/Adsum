@@ -322,10 +322,8 @@ mod tests {
   use super::*;
   use std::time::Duration;
 
-  use crate::runtime::{
-    exec_hit_ignored, removed_slots, scan_cadence, should_exit_on_send_error, unpark_scan_wake,
-  };
-  use crate::types::{DetectSource, ProcessDetectedEvent, ScannedEntry, ScannedHit};
+  use crate::runtime::{exec_hit_ignored, removed_slots, scan_cadence, unpark_scan_wake};
+  use crate::types::{DetectSource, ScannedEntry, ScannedHit};
 
   /// Empty-database server with a live gauge sender for unit tests.
   fn fixture_server() -> ProcessServer {
@@ -393,19 +391,6 @@ mod tests {
       removed_slots(&previous, &restarted),
       vec![("a".to_string(), 1)]
     );
-  }
-
-  /// A dropped receiver fails sends, and the policy says exit (no retry).
-  #[test]
-  fn closed_queue_exits_scan_instead_of_retrying() {
-    // `GaugeSender` wraps an unbounded `std::mpsc`: `Err` means the
-    // receiver is gone (shutdown), never transient backpressure.
-    let (tx, rx) = rsrpc_telemetry::QueueGauge::pair();
-    drop(rx);
-    let failed: Result<(), std::sync::mpsc::SendError<ProcessDetectedEvent>> =
-      tx.send(ProcessDetectedEvent::cleared());
-    assert!(failed.is_err());
-    assert!(should_exit_on_send_error(&failed));
   }
 
   /// Ignored app ids never publish on the EXEC fast path either.
