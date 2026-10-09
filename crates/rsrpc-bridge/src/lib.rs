@@ -17,7 +17,7 @@ pub mod handoff;
 mod origin;
 mod replay;
 mod router;
-mod snapshot;
+pub mod snapshot;
 pub mod state;
 
 pub use bridge::{Bridge, BridgeInputs};

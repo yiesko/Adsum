@@ -39,7 +39,10 @@ pub const STATE_STALE_SECS: u64 = 10;
 
 #[derive(Serialize, Clone, Debug)]
 pub struct StateServer {
-  pub host: String,
+  /// Loopback host the server is bound to. A `Cow` because the value is
+  /// one of two constants and the snapshot is rebuilt from scratch on
+  /// every persist: borrowing the literal keeps that rebuild free.
+  pub host: Cow<'static, str>,
   pub port: u16,
 }
 

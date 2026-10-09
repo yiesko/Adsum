@@ -222,3 +222,41 @@ fn snapshot_carries_caller_version_not_crate_version() {
   let snapshot = StateSnapshot::new("9.9.9-test", StateServers::default(), vec![]);
   assert_eq!(snapshot.app_version, "9.9.9-test");
 }
+
+/// A snapshot's hosts are the static literals they have always been, and
+/// building the server table allocates nothing for them.
+///
+/// Every persist rebuilds the snapshot from scratch, and the build used to
+/// allocate a `String` per host — three of them, all the same constant.
+/// The values are fixed, so a `Cow` borrows them.
+#[test]
+fn snapshot_server_hosts_borrow_their_static_literals() {
+  let servers = rsrpc_bridge::snapshot::state_servers(1337, 1338, Some(1339));
+
+  for (label, server) in [
+    ("bridge", &servers.bridge),
+    ("msgpack", &servers.msgpack),
+    ("websocket", &servers.websocket),
+  ] {
+    let server = server.as_ref().expect(label);
+    assert_eq!(
+      &*server.host, "127.0.0.1",
+      "{label} host changed on the wire"
+    );
+    assert!(
+      matches!(server.host, std::borrow::Cow::Borrowed(_)),
+      "{label} host must borrow the static literal, not allocate"
+    );
+  }
+  assert_eq!(servers.bridge.as_ref().unwrap().port, 1337);
+  assert_eq!(servers.msgpack.as_ref().unwrap().port, 1338);
+  assert_eq!(servers.websocket.as_ref().unwrap().port, 1339);
+  assert!(servers.ipc.is_none(), "the IPC path is the caller's to add");
+}
+
+/// The version is the one the caller passed, and stays owned.
+#[test]
+fn snapshot_version_is_the_callers() {
+  let snapshot = StateSnapshot::new("9.9.9", StateServers::default(), Vec::new());
+  assert_eq!(&*snapshot.app_version, "9.9.9");
+}

@@ -3,10 +3,38 @@
 //! Snapshots persist dirty-gated on a cadence (never per publish) into
 //! the configured state dir, so external tooling can read presence
 //! without joining the bridge.
-
 use super::bridge::Shared;
 use super::replay::ReplayCache;
 use super::state::{StateActivity, StateServer, StateServers, StateSnapshot, write_snapshot};
+use std::borrow::Cow;
+
+/// Loopback host every bridge front-end is recorded under in a snapshot.
+const LOOPBACK_HOST: &str = "127.0.0.1";
+
+/// The snapshot's server table: the three bridge front-ends, all on
+/// loopback, plus the IPC socket path when the transport is up.
+///
+/// Extracted so the host choice is testable: it borrows the constant, so
+/// rebuilding a snapshot per persist allocates nothing for it. The ports
+/// come from the caller, as does the IPC path (the one value that is owned
+/// here, because it is not a constant).
+pub fn state_servers(json_port: u16, msgpack_port: u16, ws_port: Option<u16>) -> StateServers {
+  StateServers {
+    bridge: Some(StateServer {
+      host: Cow::Borrowed(LOOPBACK_HOST),
+      port: json_port,
+    }),
+    msgpack: Some(StateServer {
+      host: Cow::Borrowed(LOOPBACK_HOST),
+      port: msgpack_port,
+    }),
+    websocket: ws_port.map(|port| StateServer {
+      host: Cow::Borrowed(LOOPBACK_HOST),
+      port,
+    }),
+    ipc: None,
+  }
+}
 
 impl Shared {
   /// Write the snapshot when dirty (spawn_blocking: sync temp+rename+fsync
@@ -16,21 +44,8 @@ impl Shared {
     let Some(path) = self.state_path.clone() else {
       return;
     };
-    let servers = StateServers {
-      bridge: Some(StateServer {
-        host: "127.0.0.1".to_string(),
-        port: self.json_port,
-      }),
-      msgpack: Some(StateServer {
-        host: "127.0.0.1".to_string(),
-        port: self.msgpack_port,
-      }),
-      websocket: self.ws_port.map(|port| StateServer {
-        host: "127.0.0.1".to_string(),
-        port,
-      }),
-      ipc: self.ipc_path.clone(),
-    };
+    let mut servers = state_servers(self.json_port, self.msgpack_port, self.ws_port);
+    servers.ipc = self.ipc_path.clone();
     let activities = state_activities(&self.cache.lock().unwrap_or_else(|e| e.into_inner()));
     let snapshot = StateSnapshot::new(&self.app_version, servers, activities);
     let result = tokio::task::spawn_blocking(move || write_snapshot(&path, &snapshot)).await;
