@@ -10,6 +10,7 @@ use std::sync::Arc;
 use crate::bundle::{DetectablesBundle, SortedIndex, bare_exe, path_variants_into};
 use crate::server::ProcessServer;
 use crate::types::{DetectSource, Exec, ScannedEntry, ScannedHit};
+use rsrpc_types::AppId;
 
 /// Read one process's cmdline into an `Exec` (Linux). `None` for kernel
 /// threads, zombies, vanished or unreadable pids — the caller just skips
@@ -37,7 +38,42 @@ pub struct ExecScratch {
   path: String,
   cmdline: Vec<u8>,
   args: String,
+  /// `/proc/<pid>/environ` body for the AppId lookup: the only
+  /// multi-kilobyte read of the scan. Reused across pids so the buffer
+  /// keeps its capacity instead of regrowing per newly-seen process.
+  #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+  environ: Vec<u8>,
+  /// Consecutive ticks where the live process count sat well under the
+  /// slot count, so a single transient spike does not pin the extra
+  /// slots (and their string buffers) for the rest of the session.
+  pub(crate) low_ticks: u8,
 }
+
+/// Both scratch sets the scan loop owns per thread, grouped so the match
+/// entry point takes one parameter instead of two (and stays under the
+/// clippy argument limit).
+///
+/// They stay separate types (different fields, different readers): this
+/// grouping is a call-shape convenience, not a merge — [`ExecScratch`]
+/// also serves the exec reader on its own.
+#[derive(Default)]
+pub struct ScanScratch {
+  /// Match-path buffers (name/folder normalization, Steam path, stat).
+  pub match_scratch: MatchScratch,
+  /// Exec-path buffers (cmdline, args, environ, `/proc` path).
+  pub exec_scratch: ExecScratch,
+}
+
+/// Consecutive low-occupancy ticks before the slot list is compacted.
+///
+/// Long enough that a momentary spike never triggers a realloc, short
+/// enough that a sustained drop (build finished, game exited) releases
+/// the surplus within ~40 s at the base cadence.
+///
+/// Read by the `/proc` sweep and its tests, so it is dead weight on
+/// targets that list processes through `sysinfo`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const SLOT_LOW_TICKS: u8 = 8;
 
 // Per-pid allocation reuse for the scan tick: `read_exec` intermediates
 // live in caller-owned `ExecScratch` buffers (one set per thread) and
@@ -123,23 +159,36 @@ pub(crate) fn os_matches(os: &str) -> bool {
 /// every game process it launches, including non-Steam shortcuts).
 /// Callers read this lazily: environ is the most expensive read of the
 /// scan, so only misses pay for it.
+///
+/// The scratch supplies both buffers — `path` for the `/proc/<pid>` prefix
+/// and `environ` for the body — so a miss (every non-Steam process) costs
+/// no allocation of its own, and a hit keeps the buffer sized for the
+/// next one.
 #[cfg(target_os = "linux")]
-pub(crate) fn read_steam_app_id(pid: u64) -> Option<String> {
+pub(crate) fn read_steam_app_id(pid: u64, scratch: &mut ExecScratch) -> Option<String> {
   // Bounded: 256 KiB covers any legitimate environ (SteamAppId lives
   // near the front); larger means hostile or broken, and reading it
   // whole per new pid would multiply per tick.
   const MAX_ENVIRON_BYTES: u64 = 256 * 1024;
-  let path = format!("/proc/{pid}/environ");
+
   // NOTE: no metadata size check — /proc files report st_size 0 (see above).
-  let file = std::fs::File::open(&path).ok()?;
-  let mut env = Vec::new();
+  use std::fmt::Write as _;
   use std::io::Read;
+
+  // Same buffer the exec reader reuses: cleared and refilled per pid.
+  scratch.path.clear();
+  write!(scratch.path, "/proc/{pid}/environ").ok()?;
+  let file = std::fs::File::open(&scratch.path).ok()?;
+
+  scratch.environ.clear();
   file
     .take(MAX_ENVIRON_BYTES + 1)
-    .read_to_end(&mut env)
+    .read_to_end(&mut scratch.environ)
     .ok()?;
-  env.truncate(usize::try_from(MAX_ENVIRON_BYTES).unwrap_or(usize::MAX));
-  for entry in env.split(|b| *b == 0) {
+  scratch
+    .environ
+    .truncate(usize::try_from(MAX_ENVIRON_BYTES).unwrap_or(usize::MAX));
+  for entry in scratch.environ.split(|b| *b == 0) {
     if let Some(id) = entry.strip_prefix(b"SteamAppId=")
       && let Ok(id) = std::str::from_utf8(id)
     {
@@ -154,8 +203,13 @@ pub(crate) fn read_steam_app_id(pid: u64) -> Option<String> {
 
 /// No environ AppIds outside Linux (Steam matching there was already
 /// limited to the exe/name paths).
+///
+/// The scratch is carried for a uniform signature with the Linux reader
+/// above: the call-site hands its buffer down on every platform instead
+/// of spelling the call out twice, and none of these targets has an
+/// environ to read into it.
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn read_steam_app_id(_pid: u64) -> Option<String> {
+pub(crate) fn read_steam_app_id(_pid: u64, _scratch: &mut ExecScratch) -> Option<String> {
   None
 }
 
@@ -195,22 +249,25 @@ pub fn app_id_from_args(arguments: Option<&str>) -> Option<&str> {
 /// are not being played, so matches on them are discarded and the scan
 /// treats them as absent (clears). Checked lazily, only for matched
 /// processes: one tiny `stat` read per hit, never per scan.
+///
+/// `stat` is the caller's reuse buffer (see [`MatchScratch::stat`]):
+/// cleared and refilled here, so a hit costs no allocation of its own.
 #[cfg(target_os = "linux")]
-pub fn is_suspended(pid: u64) -> bool {
+pub fn is_suspended(pid: u64, stat: &mut String) -> bool {
   // Capped like every other `/proc` read (`stat` is tiny, but the cap
   // documents the rule has no exceptions).
   use std::io::Read;
-  let mut stat = String::new();
+  stat.clear();
   std::fs::File::open(format!("/proc/{pid}/stat"))
-    .and_then(|file| file.take(8 * 1024).read_to_string(&mut stat).map(|_| stat))
+    .and_then(|file| file.take(8 * 1024).read_to_string(stat).map(|_| ()))
     .ok()
-    .and_then(|stat| parse_stat_state(&stat))
+    .and_then(|()| parse_stat_state(stat))
     .is_some_and(|state| state == 'T' || state == 't')
 }
 
 /// Stubbed on non-Linux (Steam matching there is already limited).
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn is_suspended(_pid: u64) -> bool {
+pub(crate) fn is_suspended(_pid: u64, _stat: &mut String) -> bool {
   false
 }
 
@@ -266,6 +323,15 @@ const FORBIDDEN_NAME_CHARS: [char; 9] = ['<', '>', ':', '"', '/', '\\', '|', '?'
 pub struct MatchScratch {
   pub lowered: String,
   pub norm_out: String,
+  /// Canonical Steam path for the prefix check (lowercase, `/`
+  /// separators, leading `/`): reused across processes so a miss costs
+  /// no allocation. Only touched on the Steam-library tail.
+  pub steam_path: String,
+  /// `/proc/<pid>/stat` body for the suspended check: tiny, but read for
+  /// every aux hit (0-3 per tick), so it pays to reuse the buffer rather
+  /// than build a fresh `String` (plus the path) per hit. Cleared before
+  /// every read so a failed one can never leave a stale line to parse.
+  pub stat: String,
 }
 
 /// Refill `out` with the normalized form of `name`, reusing both
@@ -344,26 +410,56 @@ pub fn exe_stem(normalized_path: &str) -> &str {
 /// choke point for every aux hit (appid/stem/folder), mirroring the scan
 /// loop's post-match check for AC hits. Stamps the observation onto the
 /// shared slim entry (no clone).
-fn live_or_none(obj: &Arc<ScannedEntry>, pid: u64, source: DetectSource) -> Option<ScannedHit> {
-  if is_suspended(pid) {
+///
+/// `stat` is the shared reuse buffer for the suspension read.
+fn live_or_none(
+  obj: &Arc<ScannedEntry>,
+  pid: u64,
+  source: DetectSource,
+  stat: &mut String,
+) -> Option<ScannedHit> {
+  if is_suspended(pid, stat) {
     tracing::debug!("[Process Scanner] Ignoring suspended process (pid {pid})");
     return None;
   }
   Some(ScannedHit::stamp(obj.clone(), pid, source))
 }
 
+/// Cap on remembered application ids per boot.
+///
+/// The set exists only to log a first sighting once, not to remember every
+/// id a long-lived daemon ever saw: a daemon that detects a thousand
+/// distinct games over weeks would otherwise grow this set forever.
+const MAX_SEEN_IDS: usize = 1024;
+
 /// First sightings this boot: entries of `detected` not yet in `seen`
 /// (which is updated in place). The scan loop logs these at INFO so a
 /// silent daemon is distinguishable from a blind one without a debug
 /// build; the bridge still owns publish/dedup logging downstream.
+///
+/// `seen` is bounded: past `MAX_SEEN_IDS` it is dropped whole rather
+/// than growing without limit, so a repeat INFO may surface after enough
+/// id churn. That is the accepted trade for constant memory — the log
+/// line is diagnostic, never state.
 pub fn first_sightings<'a>(
   seen: &mut HashSet<String>,
   detected: &'a [ScannedHit],
 ) -> Vec<&'a ScannedHit> {
-  detected
-    .iter()
-    .filter(|game| seen.insert(game.entry.id.to_string()))
-    .collect()
+  if seen.len() >= MAX_SEEN_IDS {
+    seen.clear();
+  }
+  let mut first = Vec::new();
+  for game in detected {
+    // `contains` first: the common case is a game already seen this boot,
+    // and building the key only for `insert` to discard it allocated for
+    // nothing.
+    if seen.contains(game.entry.id.as_ref()) {
+      continue;
+    }
+    seen.insert(game.entry.id.to_string());
+    first.push(game);
+  }
+  first
 }
 
 /// Drop scan results whose application id is ignored, preserving order.
@@ -390,11 +486,14 @@ pub fn apply_ignore_list(
 /// line must contain them (parity with arrpc/pog5-rsrpc, e.g. TF2
 /// `-game tf`); then the suspended check + timestamp stamp via
 /// `live_or_none`.
+///
+/// `stat` is the shared reuse buffer for the suspension read.
 fn finish_direct_hit(
   obj: &Arc<ScannedEntry>,
   exe_index: usize,
   process: &Exec,
   source: DetectSource,
+  stat: &mut String,
 ) -> Option<ScannedHit> {
   // A hit without executables (or a stale index) is corrupt input, not a
   // game: skip the process instead of panicking the scan.
@@ -404,7 +503,7 @@ fn finish_direct_hit(
     let has_args = process
       .arguments
       .as_ref()
-      .is_some_and(|args| args.contains(exec_args));
+      .is_some_and(|args| args.contains(&**exec_args));
     if !has_args {
       tracing::debug!(
         "[Process Scanner] Argument mismatch for pid {}, skipping",
@@ -414,7 +513,7 @@ fn finish_direct_hit(
     }
   }
 
-  live_or_none(obj, process.pid, source)
+  live_or_none(obj, process.pid, source, stat)
 }
 
 /// Steam's non-Steam shortcut range: ids Steam itself assigns when a
@@ -440,6 +539,7 @@ pub fn match_steam_id(
   detectable_list: &[Arc<ScannedEntry>],
   custom: &[Arc<ScannedEntry>],
   source: DetectSource,
+  stat: &mut String,
 ) -> Option<ScannedHit> {
   let appid = steam_app_id?;
   if let Some(&idx) = steam_map.get(appid) {
@@ -449,7 +549,7 @@ pub fn match_steam_id(
       obj.name,
       appid
     );
-    return live_or_none(obj, pid, source);
+    return live_or_none(obj, pid, source, stat);
   }
   // Custom override with a bare steam SKU (no executables to index):
   // the provenance travels through — a library-inherited app id matched
@@ -465,7 +565,7 @@ pub fn match_steam_id(
         obj.name,
         appid
       );
-      return live_or_none(obj, pid, source);
+      return live_or_none(obj, pid, source, stat);
     }
   }
   None
@@ -481,6 +581,7 @@ pub fn match_name_or_folder(
   name_map_nodot: &SortedIndex,
   detectable_list: &[Arc<ScannedEntry>],
   norm_out: &mut String,
+  stat: &mut String,
 ) -> Option<ScannedHit> {
   let stem = exe_stem(process_path);
   if name_matchable(stem)
@@ -492,7 +593,7 @@ pub fn match_name_or_folder(
       obj.name,
       stem
     );
-    return live_or_none(obj, pid, DetectSource::ExeStem);
+    return live_or_none(obj, pid, DetectSource::ExeStem, stat);
   }
 
   // Install-folder fallback (Hydra / non-Steam shortcuts / renamed exes):
@@ -519,7 +620,7 @@ pub fn match_name_or_folder(
         obj.name,
         folder
       );
-      return live_or_none(obj, pid, DetectSource::Folder);
+      return live_or_none(obj, pid, DetectSource::Folder, stat);
     }
   }
 
@@ -546,7 +647,7 @@ pub fn match_name_or_folder(
         obj.name,
         folder
       );
-      return live_or_none(obj, pid, DetectSource::Folder);
+      return live_or_none(obj, pid, DetectSource::Folder, stat);
     }
   }
 
@@ -579,8 +680,8 @@ impl ProcessServer {
     bundle: &DetectablesBundle,
   ) -> Option<(Arc<ScannedEntry>, usize)> {
     let mat = bundle.ac.find(reversed_path)?;
-    let exe_index = bundle.indexes[mat.pattern().as_usize()];
-    Some((bundle.list[exe_index[0]].clone(), exe_index[1]))
+    let pair = bundle.indexes[mat.pattern().as_usize()].resolve();
+    Some((bundle.list[pair.0].clone(), pair.1))
   }
 
   /// Custom-overrides half of [`ProcessServer::ac_probe`].
@@ -591,8 +692,8 @@ impl ProcessServer {
   ) -> Option<(Arc<ScannedEntry>, usize)> {
     let custom_ac = bundle.custom_ac.as_ref()?;
     let mat = custom_ac.find(reversed_path)?;
-    let exe_index = bundle.custom_indexes[mat.pattern().as_usize()];
-    Some((bundle.custom[exe_index[0]].clone(), exe_index[1]))
+    let pair = bundle.custom_indexes[mat.pattern().as_usize()].resolve();
+    Some((bundle.custom[pair.0].clone(), pair.1))
   }
 
   /// Proton fallback probe (main DB `win32` entries on Linux): same shape
@@ -606,8 +707,8 @@ impl ProcessServer {
   ) -> Option<(Arc<ScannedEntry>, usize)> {
     let automaton = bundle.proton_ac.as_ref()?;
     let mat = automaton.find(reversed_path)?;
-    let exe_index = bundle.proton_indexes[mat.pattern().as_usize()];
-    Some((bundle.list[exe_index[0]].clone(), exe_index[1]))
+    let pair = bundle.proton_indexes[mat.pattern().as_usize()].resolve();
+    Some((bundle.list[pair.0].clone(), pair.1))
   }
 
   /// Shared variant loop: try `path` plus its 64-bit-stripped variants
@@ -669,7 +770,7 @@ impl ProcessServer {
     variant_bufs: &mut [String; 5],
     reversed_path: &mut String,
     obs_open: &mut bool,
-    match_scratch: &mut MatchScratch,
+    scratch: &mut ScanScratch,
   ) -> Option<ScannedHit> {
     // Process path with consistent slashes (original case: the
     // automata match ASCII case-insensitively). Borrowed until a
@@ -749,21 +850,22 @@ impl ProcessServer {
         // maps, stem/folder heuristics). Paid only on misses — the hot
         // AC path above never allocates it. Reuses the caller's buffer:
         // char-wise ASCII fold, byte-identical to `to_ascii_lowercase`.
-        match_scratch.lowered.clear();
-        match_scratch
+        scratch.match_scratch.lowered.clear();
+        scratch
+          .match_scratch
           .lowered
           .extend(process_path.chars().map(|c| c.to_ascii_lowercase()));
-        let lowered = match_scratch.lowered.as_str();
+        let lowered = scratch.match_scratch.lowered.as_str();
         // The AppId comes memoized (one environ read per process
         // lifetime); cmdline fallback when environ is unreadable
         // (sandboxed Proton runtimes hide it from service contexts).
-        let app_id = self.cached_app_id(process.pid);
+        let app_id = self.cached_app_id(process.pid, &mut scratch.exec_scratch);
         let (app_id, via_cmdline) = match app_id {
           Some(id) => (Some(id), false),
           // Owned copy: only paid when environ is unreadable (sandboxed
           // Proton), so the common paths stay borrow-only.
           None => (
-            app_id_from_args(process.arguments.as_deref()).map(|id| id.to_string()),
+            app_id_from_args(process.arguments.as_deref()).map(AppId::from),
             true,
           ),
         };
@@ -783,6 +885,7 @@ impl ProcessServer {
           &bundle.list,
           &bundle.custom,
           DetectSource::SteamAppId,
+          &mut scratch.match_scratch.stat,
         ) {
           return Some(hit);
         }
@@ -801,7 +904,8 @@ impl ProcessServer {
             &bundle.name_map,
             &bundle.name_map_nodot,
             &bundle.list,
-            &mut match_scratch.norm_out,
+            &mut scratch.match_scratch.norm_out,
+            &mut scratch.match_scratch.stat,
           )
         {
           return Some(hit);
@@ -812,12 +916,19 @@ impl ProcessServer {
         if let Some((obj, exe_index)) =
           self.probe_variants(&process_path, variant_bufs, reversed_path, bundle, true)
         {
-          return finish_direct_hit(&obj, exe_index, process, DetectSource::ProtonAutomaton);
+          return finish_direct_hit(
+            &obj,
+            exe_index,
+            process,
+            DetectSource::ProtonAutomaton,
+            &mut scratch.match_scratch.stat,
+          );
         }
         // Steam's own word: the process runs under a known install dir,
         // so it inherits that entry's AppId. Beats name guessing below,
         // loses to a DB-declared path above.
-        if let Some(library_appid) = self.steam_prefix_app_id(lowered)
+        if let Some(library_appid) =
+          self.steam_prefix_app_id_into(lowered, &mut scratch.match_scratch.steam_path)
           && let Some(hit) = match_steam_id(
             Some(&library_appid),
             process.pid,
@@ -825,6 +936,7 @@ impl ProcessServer {
             &bundle.list,
             &bundle.custom,
             DetectSource::SteamLibrary,
+            &mut scratch.match_scratch.stat,
           )
         {
           tracing::debug!(
@@ -845,12 +957,19 @@ impl ProcessServer {
           &bundle.name_map,
           &bundle.name_map_nodot,
           &bundle.list,
-          &mut match_scratch.norm_out,
+          &mut scratch.match_scratch.norm_out,
+          &mut scratch.match_scratch.stat,
         );
       }
     };
 
-    finish_direct_hit(&obj, exe_index, process, found_source)
+    finish_direct_hit(
+      &obj,
+      exe_index,
+      process,
+      found_source,
+      &mut scratch.match_scratch.stat,
+    )
   }
 
   /// Single reversed-path AC probe (main DB, then custom overrides).
@@ -936,6 +1055,61 @@ mod reuse_tests {
     );
     assert!(slot.path.capacity() >= path_cap);
     assert!(scratch.cmdline.capacity() >= cmd_cap);
+  }
+
+  /// D5: `read_steam_app_id` reads environ into the scratch's own buffer
+  /// and builds its path in the scratch's path buffer, so a miss — the
+  /// common case, every non-Steam process — costs no allocation at all
+  /// beyond the returned `Option`.
+  ///
+  /// environ is kilobytes and the only read of the scan that big: it
+  /// runs once per newly-seen pid, but a fresh `Vec` (plus the `format!`
+  /// of the path) was paid every time, with the buffer growing back up
+  /// to its real size each call instead of keeping the capacity.
+  ///
+  /// The reuse check is about capacity, not pointers: `read_to_end`
+  /// legitimately grows the buffer on the first call, so the assertion is
+  /// that the second call neither reallocates nor shrinks it. `path` is
+  /// the stronger half — same `String`, refilled with `write!`.
+  #[test]
+  fn steam_app_id_read_reuses_the_exec_scratch() {
+    // Self pid is deterministic (present, readable) and its own environ
+    // is irrelevant: what matters is that both buffers survive the call.
+    // Whether it carries a SteamAppId is environment-dependent, so the
+    // assertions below are the reuse contract, not the lookup result.
+    let pid = self_pid();
+    let mut scratch = ExecScratch::default();
+
+    let _ = read_steam_app_id(pid, &mut scratch);
+    let path_ptr = scratch.path.as_ptr();
+    let path_cap = scratch.path.capacity();
+    let env_ptr = scratch.environ.as_ptr();
+    let env_cap = scratch.environ.capacity();
+
+    let _ = read_steam_app_id(pid, &mut scratch);
+
+    assert!(
+      std::ptr::eq(path_ptr, scratch.path.as_ptr()),
+      "path buffer moved: the environ read must reuse it"
+    );
+    assert!(
+      std::ptr::eq(env_ptr, scratch.environ.as_ptr()),
+      "environ buffer moved: the read must reuse it"
+    );
+    assert!(scratch.path.capacity() >= path_cap, "path buffer shrank");
+    assert!(scratch.environ.capacity() >= env_cap, "environ shrank");
+    // The reuse target is the scratch, so it must have been touched: an
+    // implementation that falls back to its own buffers leaves these
+    // empty while still passing every pointer check above.
+    assert_eq!(
+      scratch.path,
+      format!("/proc/{pid}/environ"),
+      "the read must build its path in the scratch"
+    );
+    assert!(
+      !scratch.environ.is_empty(),
+      "the read must land its bytes in the scratch"
+    );
   }
 
   /// `process_list_into` reuses the Vec backing and every slot across
@@ -1072,9 +1246,9 @@ mod tick2_tests {
     let entry = Arc::new(ScannedEntry {
       id: "12345".into(),
       name: "Source Game".into(),
-      executables: Vec::new(),
-      steam_ids: vec!["12345".into()],
-      aliases: Vec::new(),
+      executables: Box::new([]),
+      steam_ids: Box::new(["12345".into()]),
+      aliases: Box::new([]),
     });
     let steam_map = SortedIndex::build(vec![("12345".into(), 0)]);
     let hit = match_steam_id(
@@ -1084,6 +1258,7 @@ mod tick2_tests {
       &[entry],
       &[],
       DetectSource::SteamAppId,
+      &mut String::new(),
     )
     .expect("appid hits");
     assert_eq!(hit.source, DetectSource::SteamAppId);
@@ -1099,9 +1274,9 @@ mod tick2_tests {
     let entry = Arc::new(ScannedEntry {
       id: "12345".into(),
       name: "Source Game".into(),
-      executables: Vec::new(),
-      steam_ids: Vec::new(),
-      aliases: Vec::new(),
+      executables: Box::new([]),
+      steam_ids: Box::new([]),
+      aliases: Box::new([]),
     });
     let name_map = SortedIndex::build(vec![("source game".into(), 0)]);
     let empty = SortedIndex::build(Vec::new());
@@ -1116,6 +1291,7 @@ mod tick2_tests {
       &empty,
       &list,
       &mut norm_out,
+      &mut String::new(),
     )
     .expect("stem hits");
     assert_eq!(stem_hit.source, DetectSource::ExeStem);
@@ -1127,6 +1303,7 @@ mod tick2_tests {
       &empty,
       &list,
       &mut norm_out,
+      &mut String::new(),
     )
     .expect("folder hits");
     assert_eq!(folder_hit.source, DetectSource::Folder);
@@ -1143,9 +1320,9 @@ mod tick2_tests {
     let entry = Arc::new(ScannedEntry {
       id: "999".into(),
       name: "Custom Game".into(),
-      executables: Vec::new(),
-      steam_ids: vec!["999".into()],
-      aliases: Vec::new(),
+      executables: Box::new([]),
+      steam_ids: Box::new(["999".into()]),
+      aliases: Box::new([]),
     });
     let empty_map = SortedIndex::build(Vec::new());
     let hit = match_steam_id(
@@ -1155,6 +1332,7 @@ mod tick2_tests {
       &[],
       &[entry],
       DetectSource::SteamLibrary,
+      &mut String::new(),
     )
     .expect("custom sku hits");
     assert_eq!(hit.source, DetectSource::SteamLibrary);
@@ -1179,5 +1357,207 @@ mod tick2_tests {
     );
     assert!(std::ptr::eq(lower_ptr, lower.as_ptr()), "lower moved");
     assert!(scratch.norm_out.capacity() >= out_cap);
+  }
+
+  /// D6: the suspended check parses `/proc/<pid>/stat` into the scratch's
+  /// own buffer instead of building a fresh `String` per hit.
+  ///
+  /// The read is tiny (`stat` is a few hundred bytes) but it runs for
+  /// every aux hit — 0 to 3 per tick — and the previous code paid two
+  /// allocations each time: a `String::new()` plus the `format!` of the
+  /// path. Letting the scratch own the buffer makes repeat checks free.
+  ///
+  /// The empty-buffer case matters as much as the steady state: a check
+  /// that fails to fill the scratch (unreadable pid) must leave it clear,
+  /// not leave last tick's bytes behind for the next parse to misread.
+  #[cfg(target_os = "linux")]
+  #[test]
+  fn stat_scratch_is_reused_across_suspension_checks() {
+    let pid = u64::from(std::process::id());
+    let mut scratch = MatchScratch::default();
+
+    // A readable pid fills the scratch; that is the reuse target.
+    let _ = is_suspended(pid, &mut scratch.stat);
+    assert!(
+      !scratch.stat.is_empty(),
+      "the check must parse into the scratch buffer"
+    );
+    let stat_ptr = scratch.stat.as_ptr();
+    let stat_cap = scratch.stat.capacity();
+
+    for _ in 0..3 {
+      let _ = is_suspended(pid, &mut scratch.stat);
+      assert!(
+        std::ptr::eq(stat_ptr, scratch.stat.as_ptr()),
+        "stat buffer moved"
+      );
+      assert!(scratch.stat.capacity() >= stat_cap, "stat buffer shrank");
+    }
+
+    // An unreadable pid reuses the same buffer and clears it, so a later
+    // check can never parse the previous pid's line.
+    let _ = is_suspended(u64::MAX, &mut scratch.stat);
+    assert!(
+      std::ptr::eq(stat_ptr, scratch.stat.as_ptr()),
+      "failed checks must not reallocate"
+    );
+    assert!(
+      scratch.stat.is_empty(),
+      "a failed read must clear the scratch, not leave stale bytes"
+    );
+  }
+}
+
+#[cfg(test)]
+mod first_sightings_tests {
+  use super::*;
+
+  /// A detected hit for `id` (pid is irrelevant here).
+  fn hit(id: &str) -> ScannedHit {
+    ScannedHit {
+      entry: Arc::new(ScannedEntry {
+        id: id.into(),
+        name: "Game".into(),
+        executables: Box::new([]),
+        steam_ids: Box::new([]),
+        aliases: Box::new([]),
+      }),
+      pid: 1,
+      start: 0,
+      source: DetectSource::Automaton,
+    }
+  }
+
+  /// The set bounds memory instead of remembering every id a long-lived
+  /// daemon ever saw. Dropping it whole means a repeat INFO can surface
+  /// after churn — the accepted trade for constant memory.
+  #[test]
+  fn seen_ids_stay_bounded_across_id_churn() {
+    let mut seen: HashSet<String> = HashSet::new();
+    // Well past the cap, in distinct batches so the clear is reached
+    // repeatedly rather than once.
+    for batch in 0..(MAX_SEEN_IDS * 3 / 64 + 2) {
+      let batch: Vec<ScannedHit> = (0..64).map(|i| hit(&format!("game-{batch}-{i}"))).collect();
+      let _ = first_sightings(&mut seen, &batch);
+      assert!(
+        seen.len() <= MAX_SEEN_IDS,
+        "seen grew to {} past the cap of {MAX_SEEN_IDS}",
+        seen.len()
+      );
+    }
+  }
+
+  /// An id already seen yields no first sighting, and does not allocate a
+  /// key just to have the insert discard it.
+  #[test]
+  fn repeat_ids_are_not_first_sightings() {
+    let mut seen: HashSet<String> = HashSet::new();
+    let batch = vec![hit("a"), hit("b"), hit("a")];
+    let first = first_sightings(&mut seen, &batch);
+    assert_eq!(first.len(), 2);
+    assert_eq!(first[0].entry.id.as_ref(), "a");
+    assert_eq!(first[1].entry.id.as_ref(), "b");
+    // Second pass over the same corpus: nothing is new.
+    assert!(first_sightings(&mut seen, &batch).is_empty());
+  }
+}
+
+// `/proc`-only: `process_list_into` is the Linux sweep and the slot
+// release it drives is measured through it, so the module is gated the
+// same way as `reuse_tests` above.
+#[cfg(all(test, target_os = "linux"))]
+mod slot_compaction_tests {
+  use super::*;
+
+  /// A pre-seeded slot list far past any plausible live process count, so
+  /// every tick is a low-occupancy tick on any machine.
+  fn surplus_list(count: usize) -> Vec<Exec> {
+    (0..count)
+      .map(|i| Exec {
+        pid: i as u64 + 1,
+        path: "p".repeat(64),
+        arguments: Some("a".repeat(32)),
+      })
+      .collect()
+  }
+
+  /// Surplus slots survive below the threshold and are released exactly
+  /// when it is reached: a spike must not be punished for one quiet
+  /// moment, but a sustained drop must not pin slots forever.
+  #[test]
+  fn surplus_slots_are_released_only_after_sustained_low() {
+    // 4x the threshold, and well past a realistic process count: the
+    // premise (`live * 2 < slots`) holds on any machine this runs on.
+    let surplus = SLOT_LOW_TICKS as usize * 512;
+    let mut processes = surplus_list(surplus);
+    let mut scratch = ExecScratch::default();
+
+    let live = ProcessServer::process_list_into(&mut processes, &mut scratch).unwrap_or(0);
+    if live * 2 >= surplus {
+      // More live processes than the surplus (a huge host): the premise
+      // fails, so this test has nothing to say. Never a false failure.
+      return;
+    }
+
+    // Tick 1: the collapse is seen, nothing released yet.
+    assert_eq!(processes.len(), surplus, "tick 1 must not release");
+    assert_eq!(scratch.low_ticks, 1);
+
+    // Ticks 2..threshold: still retained.
+    for expected in 2..SLOT_LOW_TICKS {
+      ProcessServer::process_list_into(&mut processes, &mut scratch).expect("tick lists");
+      assert_eq!(
+        scratch.low_ticks, expected,
+        "counter climbs one per low tick"
+      );
+      assert_eq!(
+        processes.len(),
+        surplus,
+        "surplus must survive under the threshold"
+      );
+    }
+
+    // The threshold tick: released, and the counter resets. Released to
+    // *this* tick's fill count, not the first tick's: the process count
+    // drifts between ticks on a loaded host, so comparing against `live`
+    // here would flake for a reason the test does not care about.
+    let released_to =
+      ProcessServer::process_list_into(&mut processes, &mut scratch).expect("release tick");
+    assert_eq!(scratch.low_ticks, 0, "counter resets after a release");
+    assert_eq!(
+      processes.len(),
+      released_to,
+      "the list should sit at the live count"
+    );
+  }
+
+  /// A healthy tick resets the counter, so spike-calm-spike-calm never
+  /// compacts.
+  #[test]
+  fn low_ticks_reset_on_a_healthy_tick() {
+    // Two pre-seeded slots: the sweep fills them and grows to exactly its
+    // own live count, so occupancy is high by construction.
+    let mut processes = vec![Exec::default(), Exec::default()];
+    let mut scratch = ExecScratch {
+      low_ticks: 5,
+      ..ExecScratch::default()
+    };
+
+    if let Ok(filled) = ProcessServer::process_list_into(&mut processes, &mut scratch) {
+      assert!(filled >= 2, "the sweep must fill its own slots");
+      // The list covers every filled slot and sits at most one slot ahead
+      // of the fill cursor: `process_list_into` pushes a slot *before*
+      // reading it, so a read that fails for the last directory entry
+      // leaves `len == filled + 1`. That last case is not a bug and not
+      // rare under load (a process exiting between `readdir` and its
+      // `read`), which is why the previous `len == filled` assertion
+      // flaked.
+      assert!(
+        processes.len() >= filled && processes.len() <= filled + 1,
+        "list sits at the live count (plus at most one unreadable slot), got len={} filled={filled}",
+        processes.len()
+      );
+      assert_eq!(scratch.low_ticks, 0, "high occupancy resets the counter");
+    }
   }
 }

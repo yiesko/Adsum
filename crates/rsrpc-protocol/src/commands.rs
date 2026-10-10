@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -7,7 +8,7 @@ use serde_json::Value;
 use serde_with::skip_serializing_none;
 use tungstenite::Utf8Bytes;
 
-use rsrpc_types::cmd::{ActivityCmd, ActivityPayload};
+use rsrpc_types::cmd::{Activity, ActivityCmd, ActivityPayload};
 use rsrpc_types::user::RpcUser;
 use rsrpc_types::{AppId, SocketId};
 
@@ -15,7 +16,9 @@ use rsrpc_types::{AppId, SocketId};
 #[derive(Serialize)]
 pub struct ProcessActivity {
   pub application_id: AppId,
-  pub name: String,
+  /// Refcounted like `ScannedGame::name`: the payload builder clones it
+  /// per publish, and a `String` there copied the game name every time.
+  pub name: Arc<str>,
   pub timestamps: ProcessTimestamps,
   pub r#type: u32,
   pub metadata: HashMap<String, String>,
@@ -64,6 +67,12 @@ pub struct CachedActivity {
   /// (in-memory only — never serialized onto the wire). `None` for
   /// clears and unclassified payloads.
   pub provenance: Option<ActivityProvenance>,
+  /// The pid this card belongs to, recorded at construction.
+  ///
+  /// The replay cache needs it for ghost reaping, and the snapshot needs
+  /// it for its listing; both used to parse it back out of the serialized
+  /// JSON to learn something the builder already knew.
+  pub pid: u64,
 }
 
 /// Where a published card came from: detection matcher or SDK client,
@@ -72,7 +81,11 @@ pub struct CachedActivity {
 pub struct ActivityProvenance {
   /// Matcher source (`automaton`, `steam-app-id`, …) or `"sdk"` for
   /// client-published activities.
-  pub source: String,
+  ///
+  /// A `Cow` because both producers hand over a `'static` identifier — a
+  /// matcher's wire string, or the literal `"sdk"` — so a publish never
+  /// allocates to say where the card came from.
+  pub source: Cow<'static, str>,
   /// Process age in ms at first publish (`None` when the start time
   /// was unreadable, always for SDK activities).
   pub latency_ms: Option<u64>,
@@ -95,6 +108,7 @@ pub fn empty_cached(pid: u64, socket_id: SocketId) -> Option<Arc<CachedActivity>
     is_clear: true,
     activity_json: Bytes::new(),
     provenance: None,
+    pid,
   }))
 }
 
@@ -104,13 +118,17 @@ pub fn empty_cached(pid: u64, socket_id: SocketId) -> Option<Arc<CachedActivity>
 /// the outer id must not share a fingerprint.
 ///
 /// Returns `None` when there is no activity (a clear).
+///
+/// The bytes come back as [`Bytes`] so every later holder — the flood
+/// guard, the cached payload — keeps a strong reference to one buffer
+/// instead of re-copying the serialization.
 #[must_use]
-pub fn activity_fingerprint(cmd: &mut ActivityCmd) -> Option<Vec<u8>> {
+pub fn activity_fingerprint(cmd: &mut ActivityCmd) -> Option<Bytes> {
   cmd.fix();
   let application_id = cmd.application_id.clone();
   let activity = cmd.args.as_mut()?.activity.as_mut()?;
   activity.application_id = application_id;
-  serde_json::to_vec(activity).ok()
+  serde_json::to_vec(activity).ok().map(Bytes::from)
 }
 
 /// Turn a `SET_ACTIVITY` command into the bridge payload in both protocols.
@@ -121,27 +139,37 @@ pub fn activity_fingerprint(cmd: &mut ActivityCmd) -> Option<Vec<u8>> {
 /// detection. A missing fingerprint degrades to always-changed, never to
 /// a dropped broadcast.
 ///
+/// Takes the fingerprint as [`Bytes`] and stores it as it is: no copy of
+/// the serialization is made on the way in.
+///
+/// Consumes `cmd`: the activity moves into the payload instead of being
+/// cloned for it. Callers that still need the command afterwards (logs,
+/// the SDK handoff, clear resume) read those facts before handing it over —
+/// this function is the last thing that runs before the fan-out.
+///
 /// Returns `None` when the command cannot be converted into a valid payload
 /// (e.g. it is missing its arguments entirely).
 #[must_use]
 pub fn cached_activity(
-  cmd: &mut ActivityCmd,
-  fingerprint: Option<Vec<u8>>,
+  mut cmd: ActivityCmd,
+  fingerprint: Option<Bytes>,
 ) -> Option<Arc<CachedActivity>> {
   cmd.fix();
 
-  let args = cmd.args.as_mut()?;
+  // Owned command: take the activity out instead of cloning it. The
+  // application id moves too — nothing else reads it afterwards.
+  let mut args = cmd.args.take()?;
 
   if args.activity.is_none() {
     let pid = args.pid.unwrap_or_default();
     return empty_cached(pid, SocketId::from(pid.to_string()));
   }
 
-  let activity = args.activity.as_mut()?;
-  activity.application_id = cmd.application_id.clone();
+  let mut activity = args.activity.take()?;
+  activity.application_id = cmd.application_id;
 
   let payload = ActivityPayload {
-    activity: Some(activity.clone()),
+    activity: Some(activity),
     pid: args.pid,
     socket_id: Some(args.pid.unwrap_or(0).to_string()),
   };
@@ -152,10 +180,11 @@ pub fn cached_activity(
     // Reached only when `args.activity` is `Some`: the serialized body
     // carries a real activity object, never null.
     is_clear: false,
-    activity_json: fingerprint.map(Bytes::from).unwrap_or_default(),
+    activity_json: fingerprint.unwrap_or_default(),
     // Provenance is stamped by the bridge caller (generic vs SDK paths
     // know their source); the protocol layer leaves it empty.
     provenance: None,
+    pid: args.pid.unwrap_or_default(),
   }))
 }
 
@@ -185,6 +214,39 @@ fn error_fallback_json(cmd: &str, evt: Option<&str>) -> String {
   }
 }
 
+/// Borrowed reply envelope: `{cmd, data, evt, nonce}`, the shape every
+/// reply on this path shares.
+///
+/// Serializing by reference avoids the intermediate `Value` tree a
+/// `json!` macro builds for each reply — one tree and one final String
+/// instead of two trees and a String. `data` is generic so each caller
+/// passes either a borrowed value, a fixed-shape struct, or `&Value::NULL`
+/// for a literal null.
+#[derive(Serialize)]
+struct Reply<'a, D> {
+  cmd: &'a str,
+  data: D,
+  evt: Option<&'a str>,
+  nonce: &'a Value,
+}
+
+/// JSON null, for replies whose `data` is literally null.
+static NULL_DATA: Value = Value::Null;
+
+/// `data` for the subscribe acknowledgement: the event the client asked
+/// for, echoed, or null when it named none.
+#[derive(Serialize)]
+struct SubscribeData<'a> {
+  evt: Option<&'a str>,
+}
+
+/// `data` for an error reply: the code and human message.
+#[derive(Serialize)]
+struct ErrorData<'a> {
+  code: u16,
+  message: &'a str,
+}
+
 /// Events this server can actually dispatch: `READY` (on connect),
 /// `ERROR` (command failures) and `CURRENT_USER_UPDATE` (bridge identity
 /// changes via `SET_USER`/`RESET_USER`). Everything else in the official
@@ -197,12 +259,14 @@ fn error_fallback_json(cmd: &str, evt: Option<&str>) -> String {
 /// (`ENTITLEMENT_CREATE`, `ENTITLEMENT_DELETE`).
 #[must_use]
 pub fn subscribe_ack(cmd: &ActivityCmd) -> String {
-  serde_json::to_string(&serde_json::json!({
-    "cmd": cmd.cmd,
-    "data": { "evt": cmd.evt },
-    "evt": null,
-    "nonce": cmd.nonce,
-  }))
+  serde_json::to_string(&Reply {
+    cmd: &cmd.cmd,
+    data: SubscribeData {
+      evt: cmd.evt.as_deref(),
+    },
+    evt: None,
+    nonce: &cmd.nonce,
+  })
   .unwrap_or_else(|_| error_fallback_json(&cmd.cmd, Some("ERROR")))
 }
 
@@ -211,15 +275,15 @@ pub fn subscribe_ack(cmd: &ActivityCmd) -> String {
 /// response is "an RPC user object or null").
 #[must_use]
 pub fn user_response(cmd: &ActivityCmd, user: Option<&RpcUser>) -> String {
-  let data = user
-    .and_then(|user| serde_json::to_value(user).ok())
-    .unwrap_or(Value::Null);
-  serde_json::to_string(&serde_json::json!({
-    "cmd": cmd.cmd,
-    "data": data,
-    "evt": null,
-    "nonce": cmd.nonce,
-  }))
+  // `data` is the user object itself or null; borrowing the server's own
+  // value avoids rebuilding the envelope around it.
+  let data = user.and_then(|user| serde_json::to_value(user).ok());
+  serde_json::to_string(&Reply {
+    cmd: &cmd.cmd,
+    data: data.as_ref().unwrap_or(&NULL_DATA),
+    evt: None,
+    nonce: &cmd.nonce,
+  })
   .unwrap_or_else(|_| error_fallback_json(&cmd.cmd, Some("ERROR")))
 }
 
@@ -228,14 +292,13 @@ pub fn user_response(cmd: &ActivityCmd, user: Option<&RpcUser>) -> String {
 /// user object itself, per the official event shape.
 #[must_use]
 pub fn current_user_update(user: &RpcUser) -> String {
-  let data = serde_json::to_value(user).unwrap_or(Value::Null);
-  serde_json::json!({
-    "cmd": "DISPATCH",
-    "evt": "CURRENT_USER_UPDATE",
-    "data": data,
-    "nonce": null,
+  serde_json::to_string(&Reply {
+    cmd: "DISPATCH",
+    data: user,
+    evt: Some("CURRENT_USER_UPDATE"),
+    nonce: &NULL_DATA,
   })
-  .to_string()
+  .unwrap_or_else(|_| String::from("{}"))
 }
 
 /// Official error for a known command that has no backend here (OAuth,
@@ -296,12 +359,12 @@ pub fn unsupported_command(cmd: &str) -> Option<(u16, &'static str)> {
 /// mirroring arRPC's `{cmd, data: {code, message}, evt: "ERROR", nonce}`.
 #[must_use]
 pub fn rpc_error(cmd: &str, nonce: &Value, code: u16, message: &str) -> String {
-  serde_json::to_string(&serde_json::json!({
-    "cmd": cmd,
-    "data": { "code": code, "message": message },
-    "evt": "ERROR",
-    "nonce": nonce,
-  }))
+  serde_json::to_string(&Reply {
+    cmd,
+    data: ErrorData { code, message },
+    evt: Some("ERROR"),
+    nonce,
+  })
   .unwrap_or_else(|_| error_fallback_json(cmd, Some("ERROR")))
 }
 
@@ -312,14 +375,33 @@ pub fn rpc_error(cmd: &str, nonce: &Value, code: u16, message: &str) -> String {
 /// bridge clients there is nothing more to report).
 #[must_use]
 pub fn generic_ack(cmd: &ActivityCmd) -> String {
-  serde_json::to_string(&serde_json::json!({
-    "cmd": cmd.cmd,
-    "data": null,
-    "evt": null,
-    "nonce": cmd.nonce,
-  }))
+  serde_json::to_string(&Reply {
+    cmd: &cmd.cmd,
+    data: &NULL_DATA,
+    evt: None,
+    nonce: &cmd.nonce,
+  })
   .unwrap_or_else(|_| error_fallback_json(&cmd.cmd, None))
 }
+
+/// The `data` object of a `SET_ACTIVITY` echo: the activity's own fields
+/// followed by the command's `application_id`.
+///
+/// The id is emitted from the command rather than from the activity, so
+/// [`set_activity_response`] clears the activity's copy first — otherwise
+/// `flatten` writes the activity's `application_id` and this field writes
+/// the command's, and the reply contains the key twice.
+///
+/// No `skip_serializing_if` on the id: when the command carries none the
+/// echo must say `"application_id": null`, which `None` gives for free,
+/// not omit the key.
+#[derive(Serialize)]
+struct ActivityEcho<'a> {
+  #[serde(flatten)]
+  activity: &'a Activity,
+  application_id: Option<&'a str>,
+}
+
 /// Build the official-shaped confirmation reply for a `SET_ACTIVITY` command.
 ///
 /// The reply echoes `cmd`/`nonce` and carries `data` with the (fixed)
@@ -332,34 +414,48 @@ pub fn generic_ack(cmd: &ActivityCmd) -> String {
 /// `application_id` (known from the handshake, absent from what the game
 /// sent) is attached as a routing enrichment; unknown keys tolerate it.
 /// Returns `None` when the command has no arguments.
+///
+/// Takes `&mut` because the echo's `application_id` is the command's, not
+/// the activity's: the activity's own copy is dropped first so the field
+/// below is the only one emitted (see the echo envelope below).
 #[must_use]
-pub fn set_activity_response(cmd: &ActivityCmd) -> Option<String> {
+pub fn set_activity_response(cmd: &mut ActivityCmd) -> Option<String> {
+  // The echo's `application_id` is the outer command's id, verbatim —
+  // `null` when the command carries none — overriding whatever the
+  // activity itself sent. Take the activity's own copy out so the DTO
+  // field below is the only source: left in, `flatten` would write the
+  // key a second time and the game would see two `application_id`s.
+  // Dropping it also costs nothing: the string is discarded, not cloned.
+  if let Some(activity) = cmd.args.as_mut().and_then(|args| args.activity.as_mut()) {
+    activity.application_id = None;
+  }
+
   let args = cmd.args.as_ref()?;
+  let data = args.activity.as_ref().map(|activity| ActivityEcho {
+    activity,
+    application_id: cmd.application_id.as_deref(),
+  });
 
-  let data = match args.activity.as_ref() {
-    Some(activity) => {
-      let mut data = serde_json::to_value(activity).ok()?;
-      if let Some(obj) = data.as_object_mut() {
-        obj.insert(
-          "application_id".to_string(),
-          cmd
-            .application_id
-            .clone()
-            .map(Value::String)
-            .unwrap_or(Value::Null),
-        );
-      }
-      data
-    }
-    None => Value::Null,
-  };
+  // Envelope and activity are serialized by reference, straight into the
+  // reply. The previous build round-tripped the activity through a
+  // `serde_json::Value` (a whole `Map`) just to overwrite one key, then
+  // serialized that tree — on every publish. Keys inside `data` now
+  // follow declaration order instead of the alphabet, which the echo
+  // contract allows ("byte equivalent modulo key order").
+  #[derive(Serialize)]
+  struct Reply<'a> {
+    cmd: &'a str,
+    data: Option<ActivityEcho<'a>>,
+    evt: Option<&'a str>,
+    nonce: &'a Value,
+  }
 
-  serde_json::to_string(&serde_json::json!({
-    "cmd": cmd.cmd,
-    "data": data,
-    "evt": null,
-    "nonce": cmd.nonce,
-  }))
+  serde_json::to_string(&Reply {
+    cmd: &cmd.cmd,
+    data,
+    evt: None,
+    nonce: &cmd.nonce,
+  })
   .ok()
 }
 
@@ -378,7 +474,18 @@ pub fn set_activity_response(cmd: &ActivityCmd) -> Option<String> {
 pub struct RecentActivities {
   window: std::time::Duration,
   cap: usize,
-  entries: HashMap<(String, u64), (Vec<u8>, std::time::Instant)>,
+  /// Keyed by `(app_id, pid)`, hashed with `FxHash` like every other
+  /// table in the workspace: the keys come from our own parsed command,
+  /// not from an attacker-chosen login, so SipHash's DoS resistance buys
+  /// nothing and costs hashing on the flood path.
+  ///
+  /// The id is an [`AppId`] because the caller holds one (`ActivityCmd`
+  /// carries it refcounted): keying by it makes recording a refcount bump
+  /// instead of the `String` allocation a borrowed `&str` key forced on
+  /// every publish. `None` is its own slot — a command with no id is not
+  /// the same as one with an empty id, and neither is worth allocating a
+  /// sentinel for.
+  entries: rustc_hash::FxHashMap<(Option<AppId>, u64), (Bytes, std::time::Instant)>,
 }
 
 impl RecentActivities {
@@ -395,7 +502,7 @@ impl RecentActivities {
     Self {
       window,
       cap,
-      entries: HashMap::new(),
+      entries: rustc_hash::FxHashMap::default(),
     }
   }
 
@@ -411,28 +518,53 @@ impl RecentActivities {
     self.entries.is_empty()
   }
 
+  /// The payload recorded for `(app_id, pid)`, if any (tests and
+  /// diagnostics). Shares its buffer with the caller that tracked it.
+  #[must_use]
+  pub fn recorded(&self, app_id: Option<&AppId>, pid: u64) -> Option<&Bytes> {
+    self.entries.get(&(app_id.cloned(), pid)).map(|(fp, _)| fp)
+  }
+
+  /// The app id recorded for `(app_id, pid)`, if any.
+  ///
+  /// Shares its refcount with the caller: this is how a test proves the
+  /// key is borrowed rather than rebuilt. The probe clones the `Arc`, which
+  /// is a refcount bump — no allocation, which is the whole point.
+  #[must_use]
+  pub fn recorded_key(&self, app_id: Option<&AppId>, pid: u64) -> Option<&AppId> {
+    self
+      .entries
+      .get_key_value(&(app_id.cloned(), pid))
+      .and_then(|(key, _)| key.0.as_ref())
+  }
+
   /// `true` when this exact payload was already seen from `(app_id, pid)`
   /// inside the window — the caller should drop it without broadcasting.
   /// Records the payload otherwise. A `None` payload (a clear) always
   /// returns `false` and forgets the slot, so the next publish — even
   /// byte-identical to a pre-clear one — is forwarded.
+  ///
+  /// Borrows the fingerprint: the flood path passes the one it already
+  /// holds, and recording keeps a strong reference to the same buffer
+  /// instead of a second copy.
   pub fn should_drop(
     &mut self,
-    app_id: &str,
+    app_id: Option<&AppId>,
     pid: u64,
-    payload: Option<&[u8]>,
+    payload: Option<&Bytes>,
     now: std::time::Instant,
   ) -> bool {
-    // One allocation per call: build the key once, borrow it for probes,
-    // move it into the insert. (An `AppId` key would allocate identically
-    // here — callers hold `&str` — so the tuple stays `String`-keyed.)
-    let key = (app_id.to_string(), pid);
+    // One key per call, built once: the probe borrows it, the insert moves
+    // it. Cloning an `AppId` is a refcount bump, so tracking a publish
+    // allocates nothing for the key — the `&str` form this replaces paid a
+    // `String` on every call.
+    let key = (app_id.cloned(), pid);
     let Some(bytes) = payload else {
       self.entries.remove(&key);
       return false;
     };
     if let Some((last, at)) = self.entries.get(&key)
-      && last.as_slice() == bytes
+      && *last == *bytes
       && now.duration_since(*at) < self.window
     {
       return true;
@@ -450,7 +582,7 @@ impl RecentActivities {
         self.entries.remove(&victim);
       }
     }
-    self.entries.insert(key, (bytes.to_vec(), now));
+    self.entries.insert(key, (bytes.clone(), now));
     false
   }
 }
@@ -480,5 +612,38 @@ mod tests {
       serde_json::from_str(&null_frame).expect("null fallback is valid JSON");
     assert_eq!(null_parsed["cmd"], hostile);
     assert!(null_parsed["evt"].is_null());
+  }
+
+  /// The reply fallback is itself valid JSON: a failure to serialize the
+  /// real reply must never emit a broken frame to a lock-step client.
+  #[test]
+  fn error_fallback_stays_valid_json() {
+    for evt in [None, Some("ERROR")] {
+      let fallback = error_fallback_json("SET_ACTIVITY", evt);
+      let parsed: Value = serde_json::from_str(&fallback).expect("fallback must be valid JSON");
+      assert_eq!(parsed["cmd"], "SET_ACTIVITY");
+      assert_eq!(parsed["evt"], evt.map_or(Value::Null, |e| e.into()));
+    }
+  }
+
+  /// N20: the flood guard hashes with the workspace's `FxHashMap`, not
+  /// `std`'s `SipHash`.
+  ///
+  /// The guard runs once per publish over `(String, u64)` keys — small,
+  /// and derived from our own parsed command rather than from an
+  /// attacker-chosen login, so SipHash's DoS resistance buys nothing here
+  /// and costs hashing on the hot path. Every other table in the
+  /// workspace already uses `FxHash`.
+  ///
+  /// Structural, because the win is hashing cost: no behavioral assertion
+  /// can tell the two hashers apart, they just produce different bucket
+  /// orders. The helper's parameter type is the assertion — it stops
+  /// compiling if the field ever reverts.
+  #[test]
+  fn flood_guard_uses_the_workspace_hasher() {
+    // Compiles only for a `FxHashMap`.
+    fn assert_fx<K: Eq + std::hash::Hash, V>(_: &rustc_hash::FxHashMap<K, V>) {}
+    let guard = RecentActivities::default();
+    assert_fx(&guard.entries);
   }
 }

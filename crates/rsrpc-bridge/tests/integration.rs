@@ -45,6 +45,7 @@ async fn fixture() -> Fixture {
       game_tx: None,
       proc_tx: None,
       game_clients: None,
+      watch_shed: None,
     },
   )
   .await
@@ -97,6 +98,63 @@ fn set_activity(pid: u64, name: &str) -> rsrpc_types::cmd::ActivityCmd {
     "nonce": "n1",
   }))
   .unwrap()
+}
+
+/// A `SET_ACTIVITY` flood does not ratchet the heap.
+///
+/// The publish path is the one place every transient in the bridge goes
+/// through: envelope build, fingerprint, replay-cache insert, fan-out to
+/// N consumers. Each of those used to leave something behind, and the
+/// failures were cumulative rather than dramatic — which is why this
+/// measures *live* heap rather than RSS: glibc holds freed pages, so RSS
+/// stays put while `uordblks` returns to baseline on free. A ratchet shows
+/// up in the second number long before the first.
+///
+/// The activity carries a large payload and rotates app ids, so the
+/// replay cache cannot answer from an existing entry and every publish
+/// does the full work rather than being dropped by the flood guard.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_publish_flood_does_not_ratchet_the_heap() {
+  let fx = fixture().await;
+  // A big enough activity that a leak of one would dominate the reading.
+  let long_name = "n".repeat(4_096);
+  let rounds = 4_000u32;
+
+  // Warm up once: the first publish pays for every lazily-built table, and
+  // a baseline taken before that would make the test measure warm-up.
+  fx.ipc_tx.send(set_activity(0, &long_name)).await.unwrap();
+  drain_inputs().await;
+  let baseline = rsrpc_telemetry::heap_numbers().map(|(live, _)| live);
+
+  for round in 0..rounds {
+    // A fresh app id per round: the flood guard must not collapse these,
+    // and the replay cache must not answer from an earlier entry.
+    let mut cmd = set_activity(u64::from(round) + 1, &long_name);
+    cmd.application_id = Some(rsrpc_types::AppId::from(format!("flood-{round}")));
+    fx.ipc_tx.send(cmd).await.unwrap();
+  }
+  drain_inputs().await;
+
+  let Some(baseline) = baseline else {
+    // Off glibc-Linux there is no heap split to read; nothing to assert.
+    return;
+  };
+  let (live, _) = rsrpc_telemetry::heap_numbers().expect("still readable");
+  let slack = 8 * 1024 * 1024;
+  assert!(
+    live < baseline + slack,
+    "live heap grew by more than {slack} bytes across {rounds} publishes: \
+     {baseline} -> {live}"
+  );
+}
+
+/// Let every spawned task observe the published commands before the heap
+/// is read: the fan-out and the dirty-gated persist both run on tasks.
+async fn drain_inputs() {
+  for _ in 0..8 {
+    tokio::task::yield_now().await;
+  }
+  tokio::time::sleep(Duration::from_millis(50)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -214,10 +272,10 @@ async fn process_scan_publishes_generic_and_null_clears() {
   fx.proc_tx
     .send(ProcInput::Detected(ScannedGame {
       id: "game-9".into(),
-      name: "Scanned".to_string(),
+      name: "Scanned".into(),
       pid: 4242,
       start: 1_700_000_000,
-      source: "automaton".to_string(),
+      source: rsrpc_types::DetectSource::Automaton,
       process_start_ms: None,
     }))
     .await
@@ -246,10 +304,10 @@ async fn null_scan_clears_live_generic_exactly_once() {
   fx.proc_tx
     .send(ProcInput::Detected(ScannedGame {
       id: "123456789".into(),
-      name: "LiveGeneric".to_string(),
+      name: "LiveGeneric".into(),
       pid: live,
       start: 1_700_000_000,
-      source: "automaton".to_string(),
+      source: rsrpc_types::DetectSource::Automaton,
       process_start_ms: None,
     }))
     .await
@@ -316,6 +374,7 @@ async fn shutdown_removes_state_file() {
       game_tx: None,
       proc_tx: None,
       game_clients: None,
+      watch_shed: None,
     },
   )
   .await
@@ -404,10 +463,10 @@ async fn null_scan_keeps_live_pid_cards() {
   fx.proc_tx
     .send(ProcInput::Detected(ScannedGame {
       id: "barrier".into(),
-      name: "Barrier".to_string(),
+      name: "Barrier".into(),
       pid: live,
       start: 1_700_000_000,
-      source: "automaton".to_string(),
+      source: rsrpc_types::DetectSource::Automaton,
       process_start_ms: None,
     }))
     .await
@@ -487,6 +546,42 @@ async fn raw_broadcast_counts_dead_consumers() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+/// A raw broadcast is serialized once and served to every consumer on both
+/// encodings: sharing the refcounted payload must not drop, duplicate or
+/// corrupt a frame for anyone (the pre-fix code deep-copied the payload
+/// per consumer, which this pins as an equality contract).
+async fn raw_broadcast_reaches_every_consumer_identically() {
+  let fx = fixture().await;
+  let mut json_a = connect(fx.json_port, "?format=json").await;
+  let mut json_b = connect(fx.json_port, "?format=json").await;
+  let mut pack = connect(fx.msgpack_port, "?format=msgpack").await;
+  assert_eq!(read_json(&mut json_a).await["evt"], "READY");
+  assert_eq!(read_json(&mut json_b).await["evt"], "READY");
+  assert_eq!(read_msgpack(&mut pack).await["evt"], "READY");
+
+  let deep_link: rsrpc_types::cmd::ActivityCmd = serde_json::from_value(serde_json::json!({
+    "cmd": "DEEP_LINK",
+    "nonce": "shared-frame",
+    "data": { "nonce": "shared-frame" },
+  }))
+  .unwrap();
+  fx.game_tx.send(deep_link).await.unwrap();
+
+  let a = read_json(&mut json_a).await;
+  let b = read_json(&mut json_b).await;
+  let m = read_msgpack(&mut pack).await;
+
+  assert_eq!(a["cmd"], "DEEP_LINK");
+  assert_eq!(a, b, "both JSON consumers must see the identical frame");
+  assert_eq!(
+    a["data"], m["data"],
+    "msgpack consumer must see the same payload"
+  );
+
+  fx.bridge.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 /// The census line reports live consumers, queues and RSS.
 async fn census_line_reports_live_counts() {
   let fx = fixture().await;
@@ -560,10 +655,10 @@ async fn session_transitions_emit_census_lines() {
   fx.proc_tx
     .send(ProcInput::Detected(ScannedGame {
       id: "game-7".into(),
-      name: "Session".to_string(),
+      name: "Session".into(),
       pid: u64::from(std::process::id()),
       start: 1_700_000_000,
-      source: "automaton".to_string(),
+      source: rsrpc_types::DetectSource::Automaton,
       process_start_ms: None,
     }))
     .await
@@ -667,6 +762,7 @@ async fn configured_extra_origin_is_allowed() {
       game_tx: None,
       proc_tx: None,
       game_clients: None,
+      watch_shed: None,
     },
   )
   .await
@@ -712,5 +808,45 @@ async fn refused_origin_pipelined_set_user_changes_nothing() {
     Err(_) => {}
     Ok(other) => panic!("refused client changed the user: {other:?}"),
   }
+  fx.bridge.shutdown().await;
+}
+
+/// Consumers that keep reading survive round after round of fan-out.
+///
+/// A live consumer must never be pruned: the send succeeded, so the
+/// dead-detection must key on the *failed* send. Collecting on success
+/// instead passes the "no consumers" early return and every existing test
+/// that checks delivery, and only shows up as an empty consumer map after
+/// the first broadcast — which is what this pins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn healthy_consumers_survive_repeated_broadcasts() {
+  let fx = fixture().await;
+  let mut json = connect(fx.json_port, "?format=json").await;
+  let mut pack = connect(fx.msgpack_port, "?format=msgpack").await;
+  assert_eq!(read_json(&mut json).await["evt"], "READY");
+  assert_eq!(read_msgpack(&mut pack).await["evt"], "READY");
+
+  // Several distinct publishes, each drained as it arrives: every one is a
+  // successful send for both consumers, so neither may be pruned.
+  for i in 0..3u64 {
+    fx.ipc_tx
+      .send(set_activity(500 + i, &format!("Round {i}")))
+      .await
+      .unwrap();
+    let got = read_json(&mut json).await;
+    assert_eq!(got["activity"]["name"], format!("Round {i}"));
+    let got_pack = read_msgpack(&mut pack).await;
+    assert_eq!(got_pack["activity"]["name"], format!("Round {i}"));
+  }
+
+  // Still registered after all that traffic (a pruned consumer's next
+  // publish would time out here).
+  fx.ipc_tx
+    .send(set_activity(900, "Still alive"))
+    .await
+    .unwrap();
+  let got = read_json(&mut json).await;
+  assert_eq!(got["activity"]["name"], "Still alive");
+
   fx.bridge.shutdown().await;
 }

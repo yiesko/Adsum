@@ -21,6 +21,16 @@ pub enum RsrpcError {
     source: serde_json::Error,
   },
 
+  /// A database body parsed cleanly but broke a structural cap: entry
+  /// count, per-entry executables/aliases/SKUs, or a field length.
+  ///
+  /// Distinct from [`InvalidJson`](Self::InvalidJson): the bytes are valid
+  /// JSON and the entries decode, they are just not a database worth
+  /// building. Callers treat it exactly like a parse failure and keep the
+  /// database they already hold.
+  #[error("database exceeds structural limits: {0}")]
+  DatabaseTooLarge(&'static str),
+
   /// Database file missing or unreadable.
   #[error("rpcserver could not find file {0:?}: {1}", path, source)]
   UnreadableFile {

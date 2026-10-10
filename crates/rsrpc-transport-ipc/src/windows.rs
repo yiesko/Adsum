@@ -14,8 +14,10 @@ use interprocess::local_socket::{Listener, ListenerNonblockingMode, ListenerOpti
 use interprocess::os::windows::local_socket::{ListenerOptionsExt, NamedPipe};
 use interprocess::os::windows::security_descriptor::SecurityDescriptor;
 use rsrpc_protocol::error::{Result, RsrpcError};
+use rsrpc_types::AppId;
 use rsrpc_types::cmd::ActivityCmd;
 use rsrpc_types::user::RpcUser;
+use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -32,9 +34,9 @@ const PIPE_BASE: &str = r"\\.\pipe\discord-ipc";
 /// Per-connection protocol state plus shared handles.
 struct ConnFacilitator {
   handshake: bool,
-  client_id: String,
+  client_id: AppId,
   pid: u64,
-  nonce: String,
+  nonce: Value,
   user: Arc<Mutex<RpcUser>>,
   sink: EventSink,
   /// Pids published on this connection, oldest first (bounded).
@@ -46,9 +48,9 @@ impl ConnFacilitator {
   fn fresh(user: Arc<Mutex<RpcUser>>, sink: EventSink) -> Self {
     Self {
       handshake: false,
-      client_id: String::new(),
+      client_id: AppId::from(""),
       pid: 0,
-      nonce: String::new(),
+      nonce: Value::Null,
       user,
       sink,
       published_pids: Vec::new(),
@@ -66,11 +68,11 @@ impl IpcFacilitator for ConnFacilitator {
     self.handshake = handshake;
   }
   /// Application id from the handshake (empty until then).
-  fn client_id(&self) -> String {
+  fn client_id(&self) -> AppId {
     self.client_id.clone()
   }
   /// Store the handshake application id.
-  fn set_client_id(&mut self, client_id: String) {
+  fn set_client_id(&mut self, client_id: AppId) {
     self.client_id = client_id;
   }
   /// Last pid seen on this connection (0 until the first activity).
@@ -82,11 +84,11 @@ impl IpcFacilitator for ConnFacilitator {
     self.pid = pid;
   }
   /// Latest command nonce (lock-step replies echo it back).
-  fn nonce(&self) -> String {
+  fn nonce(&self) -> Value {
     self.nonce.clone()
   }
   /// Store the latest command nonce.
-  fn set_nonce(&mut self, nonce: String) {
+  fn set_nonce(&mut self, nonce: Value) {
     self.nonce = nonce;
   }
   /// Current identity rendered as the READY payload.

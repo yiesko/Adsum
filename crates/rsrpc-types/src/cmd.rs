@@ -3,6 +3,8 @@ use serde_json::Value;
 use serde_with::skip_serializing_none;
 use std::collections::HashMap;
 
+use crate::AppId;
+
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct ActivityPayload {
   pub activity: Option<Activity>,
@@ -11,11 +13,16 @@ pub struct ActivityPayload {
   pub socket_id: Option<String>,
 }
 
+/// One game command as it arrives from a client.
+///
+/// `application_id` is refcounted like the rest of the id surface
+/// ([`AppId`]): the command is cloned per publish on the bridge path, and
+/// a `String` there copied the id every time.
 #[skip_serializing_none]
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "snake_case")]
 pub struct ActivityCmd {
-  pub application_id: Option<String>,
+  pub application_id: Option<AppId>,
   pub cmd: String,
   pub args: Option<ActivityCmdArgs>,
   pub data: Option<HashMap<String, Value>>,
@@ -70,33 +77,33 @@ impl ActivityCmd {
   pub fn fix_buttons(&mut self) {
     // If `buttons` are an array of objects, we need to map the labels to `buttons` (as a string array) and the urls to `metadata.button_urls` (as an array of strings)
     if let Some(activity) = self.args.as_mut().and_then(|args| args.activity.as_mut())
-      && let Some(buttons) = activity.buttons.as_mut()
+      && let Some(buttons) = activity.buttons.take()
     {
-      let mut button_urls: Vec<String> = vec![];
-      let mut button_labels: Vec<Value> = vec![];
+      let mut button_urls: Vec<String> = Vec::with_capacity(buttons.len());
+      let mut button_labels: Vec<Value> = Vec::with_capacity(buttons.len());
 
-      for b in buttons.iter() {
+      for b in buttons {
         match b {
           // Already a plain label, keep it as-is
-          Value::String(_) => button_labels.push(b.clone()),
-          Value::Object(map) => {
-            if let Some(label) = map.get("label") {
-              button_labels.push(label.clone());
+          Value::String(_) => button_labels.push(b),
+          Value::Object(mut map) => {
+            if let Some(label) = map.remove("label") {
+              button_labels.push(label);
             }
-            if let Some(url) = map.get("url").and_then(|url| url.as_str()) {
+            if let Some(url) = map.remove("url").as_ref().and_then(|url| url.as_str()) {
               button_urls.push(url.to_string());
             }
           }
-          other => button_labels.push(other.clone()),
+          other => button_labels.push(other),
         }
       }
 
       // Only attach metadata when there are actual urls to attach
       if !button_urls.is_empty() {
-        activity.metadata = Some(Metadata {
-          button_urls: Some(button_urls),
-          ..activity.metadata.clone().unwrap_or_default()
-        });
+        // Modify in place: the old code rebuilt the whole `Metadata` from a
+        // clone of itself, duplicating every field to change one.
+        let metadata = activity.metadata.get_or_insert_default();
+        metadata.button_urls = Some(button_urls);
       }
 
       activity.buttons = Some(button_labels);
@@ -189,7 +196,10 @@ pub struct Activity {
   pub platform: Option<String>,
   pub supported_platforms: Option<Vec<String>>,
   pub timestamps: Option<Timestamps>,
-  pub application_id: Option<String>,
+  /// Application id the activity itself was published under. Serde-
+  /// transparent over [`AppId`], so the wire byte is the same plain
+  /// string it always was.
+  pub application_id: Option<AppId>,
   pub details: Option<String>,
   /// URL opened when clicking the details text (official, max 256 chars).
   pub details_url: Option<String>,

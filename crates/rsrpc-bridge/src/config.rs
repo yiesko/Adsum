@@ -52,6 +52,22 @@ pub struct BridgeConfig {
   pub persist_interval: Duration,
   /// Replay rebroadcast cadence.
   pub refresh_interval: Duration,
+  /// Cap on concurrent consumers per server; `None` inherits the `rsrpc-ws`
+  /// default.
+  pub max_connections: Option<usize>,
+  /// Bound for each server's global event queue; `None` inherits the
+  /// `rsrpc-ws` default.
+  pub event_queue: Option<usize>,
+  /// Bound for each consumer's outbound queue; `None` inherits the
+  /// `rsrpc-ws` default.
+  pub per_client_queue: Option<usize>,
+  /// Cap for a single incoming message; `None` inherits the `rsrpc-ws`
+  /// default. Passing `Some(None)` is not expressible here: an uncapped
+  /// message is not recommended for a bridge.
+  pub max_message_size: Option<usize>,
+  /// Cap for a single incoming frame; `None` inherits the `rsrpc-ws`
+  /// default.
+  pub max_frame_size: Option<usize>,
 }
 
 impl BridgeConfig {
@@ -76,6 +92,11 @@ impl BridgeConfig {
       allowed_origins: Vec::new(),
       persist_interval: DEFAULT_PERSIST_INTERVAL,
       refresh_interval: DEFAULT_REFRESH_INTERVAL,
+      max_connections: None,
+      event_queue: None,
+      per_client_queue: None,
+      max_message_size: None,
+      max_frame_size: None,
     }
   }
 
@@ -126,11 +147,103 @@ impl BridgeConfig {
     self
   }
 
-  /// Replay rebroadcast cadence. Must be non-zero.
+  /// Replay rebroadcast cadency. Must be non-zero.
   #[must_use]
   pub fn refresh_interval(mut self, interval: Duration) -> Self {
     self.refresh_interval = interval;
     self
+  }
+
+  /// Cap on concurrent consumers per server.
+  #[must_use]
+  pub fn max_connections(mut self, n: usize) -> Self {
+    self.max_connections = Some(n);
+    self
+  }
+
+  /// Bound for each server's global event queue.
+  #[must_use]
+  pub fn event_queue(mut self, n: usize) -> Self {
+    self.event_queue = Some(n);
+    self
+  }
+
+  /// Bound for each consumer's outbound queue.
+  #[must_use]
+  pub fn per_client_queue(mut self, n: usize) -> Self {
+    self.per_client_queue = Some(n);
+    self
+  }
+
+  /// Cap for a single incoming message.
+  #[must_use]
+  pub fn max_message_size(mut self, n: usize) -> Self {
+    self.max_message_size = Some(n);
+    self
+  }
+
+  /// Cap for a single incoming frame.
+  #[must_use]
+  pub fn max_frame_size(mut self, n: usize) -> Self {
+    self.max_frame_size = Some(n);
+    self
+  }
+
+  /// Queue and size budget the bridge hands to both servers. `None` fields
+  /// fall back to the `rsrpc-ws` defaults, which are already a conservative
+  /// loopback budget.
+  pub(crate) fn server_bounds(&self) -> ServerBounds {
+    ServerBounds {
+      max_connections: self.max_connections,
+      event_queue: self.event_queue,
+      per_client_queue: self.per_client_queue,
+      max_message_size: self.max_message_size,
+      max_frame_size: self.max_frame_size,
+    }
+  }
+}
+
+/// Queue and size budget applied to both bridge servers.
+///
+/// Every field is optional so an unset value inherits the `rsrpc-ws`
+/// default rather than silently uncapping the server.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ServerBounds {
+  max_connections: Option<usize>,
+  event_queue: Option<usize>,
+  per_client_queue: Option<usize>,
+  max_message_size: Option<usize>,
+  max_frame_size: Option<usize>,
+}
+
+impl ServerBounds {
+  /// Apply the overrides to a builder, leaving unset fields at their
+  /// default.
+  #[must_use]
+  pub(crate) fn apply(
+    self,
+    builder: rsrpc_ws::ServerConfigBuilder,
+  ) -> rsrpc_ws::ServerConfigBuilder {
+    let builder = match self.max_connections {
+      Some(n) => builder.max_connections(n),
+      None => builder,
+    };
+    let builder = match self.event_queue {
+      Some(n) => builder.event_queue(n),
+      None => builder,
+    };
+    let builder = match self.per_client_queue {
+      Some(n) => builder.per_client_queue(n),
+      None => builder,
+    };
+    let builder = match self.max_message_size {
+      Some(n) => builder.max_message_size(Some(n)),
+      None => builder,
+    };
+    match self.max_frame_size {
+      Some(n) => builder.max_frame_size(Some(n)),
+      None => builder,
+    }
   }
 }
 
@@ -162,6 +275,60 @@ mod tests {
     assert_eq!(
       config.allowed_origins,
       vec!["https://my-client.example".to_string()]
+    );
+  }
+
+  /// The bridge's own bounds reach the server; unset fields keep the
+  /// `rsrpc-ws` default rather than uncapping anything.
+  #[test]
+  fn bridge_bounds_reach_the_server_config() {
+    let bounds = BridgeConfig::new(0, 0, 0, 0)
+      .max_connections(12)
+      .event_queue(34)
+      .per_client_queue(5)
+      .max_message_size(2048)
+      .max_frame_size(1024)
+      .server_bounds();
+
+    let cfg = bounds
+      .apply(rsrpc_ws::ServerConfig::builder(
+        "127.0.0.1:0".parse().unwrap(),
+      ))
+      .build()
+      .unwrap();
+    assert_eq!(cfg.max_connections, 12);
+    assert_eq!(cfg.event_queue, 34);
+    assert_eq!(cfg.per_client_queue, 5);
+    assert_eq!(cfg.max_message_size, Some(2048));
+    assert_eq!(cfg.max_frame_size, Some(1024));
+  }
+
+  /// A bare config leaves every bound at the server default.
+  #[test]
+  fn bridge_bounds_inherit_server_defaults() {
+    let cfg = BridgeConfig::new(0, 0, 0, 0)
+      .server_bounds()
+      .apply(rsrpc_ws::ServerConfig::builder(
+        "127.0.0.1:0".parse().unwrap(),
+      ))
+      .build()
+      .unwrap();
+    assert_eq!(
+      cfg.max_connections,
+      rsrpc_ws::config::DEFAULT_MAX_CONNECTIONS
+    );
+    assert_eq!(cfg.event_queue, rsrpc_ws::config::DEFAULT_EVENT_QUEUE);
+    assert_eq!(
+      cfg.per_client_queue,
+      rsrpc_ws::config::DEFAULT_PER_CLIENT_QUEUE
+    );
+    assert_eq!(
+      cfg.max_message_size,
+      Some(rsrpc_ws::config::DEFAULT_MAX_MESSAGE_SIZE)
+    );
+    assert_eq!(
+      cfg.max_frame_size,
+      Some(rsrpc_ws::config::DEFAULT_MAX_FRAME_SIZE)
     );
   }
 }

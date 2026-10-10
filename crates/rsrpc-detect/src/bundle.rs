@@ -12,6 +12,14 @@ use crate::db::DetectableActivity;
 use crate::scan::{name_matchable, normalize_name, os_matches};
 use crate::types::{OsName, ScannedEntry};
 
+/// 64-bit markers a process path may carry (parity with arrpc/pog5-rsrpc).
+///
+/// A path is matched against each in turn: `/usr/lib64/x64/game64.exe`
+/// strips down to `/usr/lib/x/game.exe` via `64`, and to
+/// `/usr/lib64//game64.exe` via `x64` — which is what lets a
+/// `/games/wow64.exe` process match a plain `wow.exe` database entry.
+const MARKERS: [&str; 4] = ["64", ".x64", "x64", "_64"];
+
 /// Sorted key→index table replacing a `HashMap` for the aux lookups: no
 /// buckets (~33B each in SwissTable), no hashing, no per-key `String`
 /// capacity field. Lookups happen only on match misses (rare per tick),
@@ -81,20 +89,63 @@ impl SortedIndex {
 /// Rationale: the scanner used to hold the automaton, the index table,
 /// the activity list and the aux maps under SEPARATE locks, replaced one
 /// at a time by the hourly refresh. A scan landing mid-swap then probed a
+/// Index pair into the generation: `[activity index, executable index]`.
+///
+/// Newtype, not a bare `[u32; 2]` alias, so the widening back to `usize`
+/// lives in one place ([`resolve`](PatternIndex::resolve)) rather than
+/// being repeated at every lookup — a type alias could not carry that
+/// method.
+///
+/// `u32` halves: the pair is a dense table over tens of thousands of
+/// entries, so 8 B instead of 16 B halves the table. The database is
+/// bounded far below `u32::MAX` (`refresh` caps the body at 64 MiB and
+/// the entry count is bounded), so a build that overflowed would already
+/// have failed earlier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PatternIndex([u32; 2]);
+
+impl PatternIndex {
+  /// The pair as `usize` indices, ready to index a slice with.
+  #[inline]
+  pub(crate) fn resolve(self) -> (usize, usize) {
+    (self.0[0] as usize, self.0[1] as usize)
+  }
+}
+
+/// Convert a (activity, executable) pair to the compact index form.
+///
+/// Truncating an index would mis-attribute a game or panic the scan
+/// thread, so it saturates and asserts instead: the database is bounded
+/// far below `u32::MAX` (body capped at 64 MiB, entry count bounded above
+/// ~50k), which makes this a build-time invariant, not a runtime path.
+/// A correct build therefore never asserts.
+fn pattern_index(activity_index: usize, exe_index: usize) -> PatternIndex {
+  let activity = u32::try_from(activity_index).unwrap_or(u32::MAX);
+  let exe = u32::try_from(exe_index).unwrap_or(u32::MAX);
+  debug_assert!(
+    activity < u32::MAX && exe < u32::MAX,
+    "database too large for u32 index pairs: activity {activity_index}, exe {exe_index}"
+  );
+  PatternIndex([activity, exe])
+}
+
 /// NEW automaton against OLD indexes: index-out-of-bounds panic (dead
 /// scan thread) or, worse, a silently mis-attributed game. With the whole
 /// generation behind ONE Arc, readers clone it once per tick (or per
 /// event) and can only ever observe a self-consistent snapshot; the
 /// writer builds the next generation off-thread and swaps the pointer.
 pub struct DetectablesBundle {
-  pub(crate) list: Vec<Arc<ScannedEntry>>,
+  /// Refcounted, not `Vec`: a rebuild clones this once (an Arc bump) instead
+  /// of bumping every entry's refcount individually — ~24k of them on each
+  /// database refresh or override append.
+  pub(crate) list: Arc<[Arc<ScannedEntry>]>,
   pub(crate) ac: AhoCorasick,
-  pub(crate) indexes: Vec<[usize; 2]>,
+  pub(crate) indexes: Vec<PatternIndex>,
   /// Proton fallback automaton (Linux only): `win32` executables from the
   /// main DB, probed after the native patterns and the authoritative Steam
   /// AppId, but before the stem/folder heuristics. Empty on other platforms.
   pub(crate) proton_ac: Option<AhoCorasick>,
-  pub(crate) proton_indexes: Vec<[usize; 2]>,
+  pub(crate) proton_indexes: Vec<PatternIndex>,
   /// Steam AppId (steam-distributor SKUs only) -> activity index.
   /// Lets us detect store games whose DB entry ships empty `executables`.
   /// Sorted vec, not a map: lookups only happen on match misses.
@@ -108,9 +159,9 @@ pub struct DetectablesBundle {
   /// `Q.U.B.E.`), which the exact walk skips as versions. Built by
   /// [`undotted_names`], same canonical-first ties.
   pub(crate) name_map_nodot: SortedIndex,
-  pub(crate) custom: Vec<Arc<ScannedEntry>>,
+  pub(crate) custom: Arc<[Arc<ScannedEntry>]>,
   pub(crate) custom_ac: Option<AhoCorasick>,
-  pub(crate) custom_indexes: Vec<[usize; 2]>,
+  pub(crate) custom_indexes: Vec<PatternIndex>,
 }
 
 impl DetectablesBundle {
@@ -119,7 +170,7 @@ impl DetectablesBundle {
   /// misses everything instead of panicking the daemon.
   fn empty() -> Self {
     Self {
-      list: Vec::new(),
+      list: Arc::from(Vec::new()),
       ac: build_ac_automaton(&[]).expect("[bug] empty automaton always builds"),
       indexes: Vec::new(),
       proton_ac: None,
@@ -127,11 +178,27 @@ impl DetectablesBundle {
       steam_map: SortedIndex::default(),
       name_map: SortedIndex::default(),
       name_map_nodot: SortedIndex::default(),
-      custom: Vec::new(),
+      custom: Arc::from(Vec::new()),
       custom_ac: None,
       custom_indexes: Vec::new(),
     }
   }
+}
+
+/// Exact upper bound for the name map: one slot per entry, plus one per
+/// alias.
+///
+/// The alternative was to reserve twice the entry count, which at ~24k
+/// entries buys over a megabyte of scratch for a table that holds a
+/// fraction of it. The vector lives only for the build and is dropped
+/// right after, so the slack is pure transient peak — paid at every
+/// database refresh and override append.
+pub fn name_map_bound(detectables: &[Arc<ScannedEntry>]) -> usize {
+  detectables.len()
+    + detectables
+      .iter()
+      .map(|entry| entry.aliases.len())
+      .sum::<usize>()
 }
 
 /// Auxiliary lookup maps over the main DB:
@@ -140,21 +207,44 @@ impl DetectablesBundle {
 /// conservative gate — exact, multi-word only — so a generic alias can
 /// never collide; canonical names are inserted first and win ties.
 pub fn build_aux_maps(detectables: &[Arc<ScannedEntry>]) -> (SortedIndex, SortedIndex) {
-  // Pre-sized from the entry count (steam ids ≤ entries in practice;
-  // names get one slot per entry plus room for aliases): no growth
-  // copies mid-build.
+  // Steam ids ≤ entries in practice.
   let mut steam: Vec<(Box<str>, usize)> = Vec::with_capacity(detectables.len());
-  let mut names: Vec<(Box<str>, usize)> = Vec::with_capacity(detectables.len() * 2);
-
   for (index, activity) in detectables.iter().enumerate() {
     for id in &activity.steam_ids {
       if !id.is_empty() {
         steam.push((id.clone(), index));
       }
     }
+  }
 
-    // Only matchable names participate in the exe-stem fallback, so generic
-    // stems (`fish`, `steam`, `game`) can never collide with `Fish`/`Steam`.
+  // Names reserve and fill in one place, so the bound cannot drift from
+  // what the table can actually hold (see `collect_names`).
+  let (steam_map, name_map) = (
+    SortedIndex::build(steam),
+    SortedIndex::build(collect_names(detectables)),
+  );
+  tracing::info!(
+    "[Process Scanner] Aux maps: {} steam ids, {} matchable names",
+    steam_map.len(),
+    name_map.len()
+  );
+  (steam_map, name_map)
+}
+
+/// Collect the name map's entries, reserving exactly what they can occupy.
+///
+/// Only matchable names participate in the exe-stem fallback, so generic
+/// stems (`fish`, `steam`, `game`) can never collide with
+/// `Fish`/`Steam`. Canonical names are inserted first and win ties.
+///
+/// The reservation is the exact bound rather than a multiple of the entry
+/// count: `len * 2` over-bought by the alias deficit — at ~24k entries
+/// that is most of a megabyte of scratch held only for the build. It is
+/// also why the bound and the fill live together here: split apart, the
+/// reserve can drift back to a guess nobody tests.
+fn collect_names(detectables: &[Arc<ScannedEntry>]) -> Vec<(Box<str>, usize)> {
+  let mut names: Vec<(Box<str>, usize)> = Vec::with_capacity(name_map_bound(detectables));
+  for (index, activity) in detectables.iter().enumerate() {
     let normalized = normalize_name(&activity.name);
     if name_matchable(&normalized) {
       names.push((normalized.into_boxed_str(), index));
@@ -166,14 +256,7 @@ pub fn build_aux_maps(detectables: &[Arc<ScannedEntry>]) -> (SortedIndex, Sorted
       }
     }
   }
-
-  let (steam_map, name_map) = (SortedIndex::build(steam), SortedIndex::build(names));
-  tracing::info!(
-    "[Process Scanner] Aux maps: {} steam ids, {} matchable names",
-    steam_map.len(),
-    name_map.len()
-  );
-  (steam_map, name_map)
+  names
 }
 
 /// De-dotted form for the folder-walk fallback tier: dots become
@@ -213,24 +296,47 @@ pub fn undotted_names(name_map: &SortedIndex) -> SortedIndex {
 /// `/games/wow.exe` which matches a `wow.exe` database entry.
 ///
 /// Writes into caller-owned buffers and returns how many are filled, so the
-/// per-process scan allocates nothing at steady state (buffers are reused
-/// across processes and scans; only marker hits allocate one temp string).
+/// per-process scan allocates nothing at steady state: buffers are reused
+/// across processes and scans, and the marker strip writes into the slot
+/// it will occupy (see `remove_marker_into` below).
 pub fn path_variants_into(path: &str, out: &mut [String; 5]) -> usize {
   out[0].clear();
   out[0].push_str(path);
   let mut count = 1;
-  for marker in ["64", ".x64", "x64", "_64"] {
-    if !path.contains(marker) {
+  for marker in MARKERS {
+    // Bound first: past the last slot there is nothing to write, and a
+    // strip here would be work whose result is dropped.
+    if !path.contains(marker) || count >= out.len() {
       continue;
     }
-    let variant = path.replace(marker, "");
-    if variant != path && !out[..count].contains(&variant) && count < out.len() {
-      out[count].clear();
-      out[count].push_str(&variant);
+    // Write into the slot it would occupy, then decide: the candidate and
+    // the already-written variants are disjoint ranges of `out`, so both
+    // can be borrowed at once for the dedup check.
+    let (filled, candidate) = out.split_at_mut(count);
+    let candidate = &mut candidate[0];
+    remove_marker_into(path, marker, candidate);
+    if *candidate != path && !filled.iter().any(|variant| variant == candidate) {
       count += 1;
     }
   }
   count
+}
+
+/// Remove **every** occurrence of `marker`, writing into `buf` (cleared
+/// first). Equivalent to `str::replace`, without its allocation.
+///
+/// This is what keeps `path_variants_into` allocation-free on the scan hot
+/// path: the per-process walk hits a marker on most 64-bit Linux
+/// processes — `/usr/lib64/...` alone matches — and a temp `String` per hit
+/// was an allocation per process per tick.
+pub(crate) fn remove_marker_into(path: &str, marker: &str, buf: &mut String) {
+  buf.clear();
+  let mut rest = path;
+  while let Some(at) = rest.find(marker) {
+    buf.push_str(&rest[..at]);
+    rest = &rest[at + marker.len()..];
+  }
+  buf.push_str(rest);
 }
 
 /// Exe file name when the normalized `argv[0]` carries no directories
@@ -250,9 +356,9 @@ pub fn bare_exe(normalized_path: &str) -> Option<&str> {
 /// the two separate walks this replaces — one normalization per exe.
 struct SplitPatterns {
   native_patterns: Vec<String>,
-  native_idx: Vec<[usize; 2]>,
+  native_idx: Vec<PatternIndex>,
   proton_patterns: Vec<String>,
-  proton_idx: Vec<[usize; 2]>,
+  proton_idx: Vec<PatternIndex>,
 }
 
 /// Walk the entries once, partitioning executables into the native set
@@ -297,11 +403,15 @@ fn collect_split_patterns(detectables: &[Arc<ScannedEntry>]) -> SplitPatterns {
       }
       if native {
         split.native_patterns.push(pattern.clone());
-        split.native_idx.push([activity_index, exe_index]);
+        split
+          .native_idx
+          .push(pattern_index(activity_index, exe_index));
       }
       if proton {
         split.proton_patterns.push(pattern);
-        split.proton_idx.push([activity_index, exe_index]);
+        split
+          .proton_idx
+          .push(pattern_index(activity_index, exe_index));
       }
     }
   }
@@ -311,7 +421,7 @@ fn collect_split_patterns(detectables: &[Arc<ScannedEntry>]) -> SplitPatterns {
 /// Custom-override patterns with no OS filter (user entries match anywhere).
 fn build_ac_patterns_allow_all_os(
   detectables: &[Arc<ScannedEntry>],
-) -> Result<(AhoCorasick, Vec<[usize; 2]>), aho_corasick::BuildError> {
+) -> Result<(AhoCorasick, Vec<PatternIndex>), aho_corasick::BuildError> {
   build_ac_patterns_with_os_filter(detectables, false)
 }
 
@@ -322,8 +432,8 @@ fn build_ac_patterns_allow_all_os(
 /// lands. Callers convert full [`DetectableActivity`] inputs once via
 /// [`ScannedEntry::from_activity`] before calling.
 pub(crate) fn build_bundle(
-  detectable: Vec<Arc<ScannedEntry>>,
-  custom: Vec<Arc<ScannedEntry>>,
+  detectable: Arc<[Arc<ScannedEntry>]>,
+  custom: Arc<[Arc<ScannedEntry>]>,
 ) -> Result<DetectablesBundle, aho_corasick::BuildError> {
   // One walk feeds both automata (see `collect_split_patterns`); each
   // source vector is dropped right after its automaton compiles, so the
@@ -358,7 +468,8 @@ pub(crate) fn build_bundle(
   let (custom_ac, custom_idx) = if custom.is_empty() {
     (None, Vec::new())
   } else {
-    let (ac, idx) = build_ac_patterns_allow_all_os(&custom)?;
+    let (ac, mut idx) = build_ac_patterns_allow_all_os(&custom)?;
+    idx.shrink_to_fit();
     (Some(ac), idx)
   };
   Ok(DetectablesBundle {
@@ -381,9 +492,9 @@ pub(crate) fn build_bundle(
 fn build_ac_patterns_with_os_filter(
   detectables: &[Arc<ScannedEntry>],
   enforce_os: bool,
-) -> Result<(AhoCorasick, Vec<[usize; 2]>), aho_corasick::BuildError> {
+) -> Result<(AhoCorasick, Vec<PatternIndex>), aho_corasick::BuildError> {
   let mut exe_patterns: Vec<String> = Vec::new();
-  let mut exe_indexes: Vec<[usize; 2]> = Vec::new();
+  let mut exe_indexes: Vec<PatternIndex> = Vec::new();
 
   for (activity_index, activity) in detectables.iter().enumerate() {
     for (exe_index, executable) in activity.executables.iter().enumerate() {
@@ -407,7 +518,7 @@ fn build_ac_patterns_with_os_filter(
         continue;
       }
       exe_patterns.push(pattern);
-      exe_indexes.push([activity_index, exe_index]);
+      exe_indexes.push(pattern_index(activity_index, exe_index));
     }
   }
 
@@ -464,7 +575,12 @@ pub(crate) fn initial_bundle(
     .into_iter()
     .map(|entry| Arc::new(ScannedEntry::from_owned(entry)))
     .collect();
-  let bundle = Arc::new(build_bundle(slim(detectable), custom).unwrap_or_else(|e| {
+  // Boxed once, here: everything downstream (the stored bundle plus every
+  // rebuild that carries the main list unchanged) clones a refcount
+  // instead of walking ~24k entries.
+  let detectable: Arc<[Arc<ScannedEntry>]> = slim(detectable).into();
+  let custom: Arc<[Arc<ScannedEntry>]> = custom.into();
+  let bundle = Arc::new(build_bundle(detectable, custom).unwrap_or_else(|e| {
     tracing::warn!(
       "[Process Scanner] Bundled database failed to build ({}), starting blind",
       e
@@ -494,8 +610,8 @@ mod tests {
           arguments: None,
         })
         .collect(),
-      steam_ids: Vec::new(),
-      aliases: Vec::new(),
+      steam_ids: Box::new([]),
+      aliases: Box::new([]),
     })
   }
 
@@ -504,18 +620,18 @@ mod tests {
   #[test]
   fn empty_exe_names_build_no_patterns() {
     let bundle = build_bundle(
-      vec![entry_with_exes(
+      Arc::from(vec![entry_with_exes(
         "1",
         OsName::Empty,
         &["", "\\", ">", "/", "game.exe"],
-      )],
-      vec![],
+      )]),
+      Arc::from(Vec::new()),
     )
     .expect("builds");
     // Only the real exe survives, with its index intact (every name that
     // normalizes to the match-all `"/"` contributes neither pattern nor
     // index).
-    assert_eq!(bundle.indexes, vec![[0, 4]]);
+    assert_eq!(bundle.indexes[0].resolve(), (0, 4));
     assert_eq!(bundle.ac.patterns_len(), 1);
   }
 
@@ -524,8 +640,11 @@ mod tests {
   /// see an unused binding under `-D warnings`.)
   #[test]
   fn proton_builder_ignores_empty_names() {
-    let _bundle =
-      build_bundle(vec![entry_with_exes("1", OsName::Win32, &[""])], vec![]).expect("builds");
+    let _bundle = build_bundle(
+      Arc::from(vec![entry_with_exes("1", OsName::Win32, &[""])]),
+      Arc::from(Vec::new()),
+    )
+    .expect("builds");
     #[cfg(target_os = "linux")]
     assert!(
       _bundle.proton_ac.is_none(),
@@ -541,14 +660,14 @@ mod tests {
     Arc::new(ScannedEntry {
       id: id.into(),
       name: id.into(),
-      executables: vec![ScannedExe {
+      executables: Box::new([ScannedExe {
         name: "setup.exe".into(),
         os: OsName::Win32,
         is_launcher: true,
         arguments: None,
-      }],
-      steam_ids: Vec::new(),
-      aliases: Vec::new(),
+      }]),
+      steam_ids: Box::new([]),
+      aliases: Box::new([]),
     })
   }
 
@@ -569,7 +688,8 @@ mod tests {
     // normalized patterns below (raw names can differ from what the
     // automaton stores).
     for pair in split.native_idx.iter().chain(split.proton_idx.iter()) {
-      let exe = &entries[pair[0]].executables[pair[1]];
+      let (activity, exe) = pair.resolve();
+      let exe = &entries[activity].executables[exe];
       assert!(!exe.is_launcher, "launcher leaked into patterns");
     }
     assert!(
@@ -583,7 +703,10 @@ mod tests {
     // Proton (Linux only) carries exactly the win32 non-launcher exes.
     #[cfg(target_os = "linux")]
     {
-      let native_at = |pair: &[usize; 2]| entries[pair[0]].executables[pair[1]].name.to_string();
+      let native_at = |pair: &PatternIndex| {
+        let (activity, exe) = pair.resolve();
+        entries[activity].executables[exe].name.to_string()
+      };
       assert_eq!(split.proton_idx.len(), 1);
       assert_eq!(native_at(&split.proton_idx[0]), "win.exe");
       // Native keeps linux + empty-OS, in walk order, excluding `/` drops.
@@ -602,5 +725,190 @@ mod tests {
     assert_eq!(split.native_patterns.len(), split.native_idx.len());
     #[cfg(target_os = "linux")]
     assert_eq!(split.proton_patterns.len(), split.proton_idx.len());
+  }
+
+  /// The marker strip is `str::replace` without its allocation.
+  ///
+  /// The hand-written loop is the whole risk here: dropping an occurrence,
+  /// or dropping one after a match that consumed a shared byte, would
+  /// silently change which database entry a process matches. Compared
+  /// against the standard library for every interesting shape — including
+  /// multiple occurrences in one path, which is what `/usr/lib64/x64/…`
+  /// gives.
+  #[test]
+  fn remove_marker_matches_str_replace() {
+    for (path, marker) in [
+      ("/games/wow64.exe", "64"),
+      ("/usr/lib64/x64/game64.exe", "64"),
+      ("/usr/lib64/x64/game64.exe", "x64"),
+      ("a.x64b.x64c", ".x64"),
+      ("no marker here", "x64"),
+      ("/games/wow.exe", "64"),
+      ("64", "64"),
+      ("", "64"),
+      ("646464", "64"),
+    ] {
+      let mut buf = String::new();
+      remove_marker_into(path, marker, &mut buf);
+      assert_eq!(buf, path.replace(marker, ""), "{path} minus {marker:?}");
+    }
+  }
+
+  /// Path variants still dedup, stay bounded, and lead with the raw path.
+  ///
+  /// `/usr/lib64/x64/game64.exe` matches two markers, and the `64` strip
+  /// removes **three** occurrences — including the one inside `x64`. That is
+  /// the shape a first-occurrence-only implementation gets wrong, and the
+  /// reason the previous test exists.
+  #[test]
+  fn path_variants_strip_every_marker_and_stay_bounded() {
+    let mut out: [String; 5] = Default::default();
+    let count = path_variants_into("/usr/lib64/x64/game64.exe", &mut out);
+
+    assert_eq!(out[0], "/usr/lib64/x64/game64.exe", "the raw path leads");
+    assert_eq!(count, 3, "one raw plus two distinct marker strips");
+    // Every `64` goes, the one inside `x64` included: `64` is a substring of
+    // `x64`, and `str::replace` removes all of them.
+    assert_eq!(out[1], "/usr/lib/x/game.exe");
+    assert_eq!(out[2], "/usr/lib64//game64.exe");
+    assert!(count <= out.len(), "never past the caller's slots");
+  }
+
+  /// A path with no markers yields exactly the raw path: no strip, no
+  /// dedup work, nothing written.
+  #[test]
+  fn a_plain_path_yields_itself() {
+    let mut out: [String; 5] = Default::default();
+    let count = path_variants_into("/games/terraria", &mut out);
+    assert_eq!(count, 1);
+    assert_eq!(out[0], "/games/terraria");
+  }
+
+  /// Slim entry fixture with caller-chosen alias count.
+  fn entry_with_aliases(aliases: usize) -> Arc<ScannedEntry> {
+    Arc::new(ScannedEntry {
+      id: "1".into(),
+      // Multi-word: the aux map's gate only admits matchable names, so a
+      // single-word fixture would reserve slots the fill never uses.
+      name: "how to fish".into(),
+      executables: Box::new([]),
+      steam_ids: Box::new([]),
+      aliases: (0..aliases)
+        .map(|i| format!("alias {i}").into_boxed_str())
+        .collect(),
+    })
+  }
+
+  /// The collected name table reserves its exact bound, not twice the
+  /// entry count.
+  ///
+  /// One slot per entry plus one per alias is the most the table can ever
+  /// hold, so reserving that is both slack-free and growth-free. The old
+  /// `len * 2` over-bought by the alias deficit: at ~24k entries with few
+  /// aliases that is most of a megabyte of scratch held only for the
+  /// duration of the build, paid at every refresh and override append.
+  ///
+  /// Asserted on `collect_names` — the function that both reserves and
+  /// fills — because a bound tested in isolation says nothing about the
+  /// call site. The alias counts are chosen so growth cannot land on the
+  /// bound by accident: with few aliases `len * 2` is already too big, and
+  /// with many it overshoots on the last doubling.
+  #[test]
+  fn collected_names_reserve_their_exact_bound() {
+    for (entries, aliases) in [(100usize, 0usize), (100, 5)] {
+      let fixtures: Vec<Arc<ScannedEntry>> =
+        (0..entries).map(|_| entry_with_aliases(aliases)).collect();
+      let names = collect_names(&fixtures);
+      let bound = name_map_bound(&fixtures);
+
+      assert_eq!(
+        names.len(),
+        bound,
+        "every reserved slot is filled ({entries} entries, {aliases} aliases)"
+      );
+      assert_eq!(
+        names.capacity(),
+        bound,
+        "the collected table must reserve exactly its bound, no doubling slack \
+         ({entries} entries, {aliases} aliases)"
+      );
+    }
+  }
+
+  /// The custom-override index releases its growth slack like the native
+  /// and Proton tables do.
+  ///
+  /// `custom_indexes` was the only stored table left holding amortized
+  /// doubling slack. The native and Proton ones get `shrink_to_fit` after
+  /// their source vectors are dropped, so the bundle's tables are exactly
+  /// their length; the custom one grew from empty with no bound and kept
+  /// whatever the last doubling left it.
+  #[test]
+  fn custom_index_releases_its_growth_slack() {
+    // Five entries force at least one doubling (`Vec` grows 4 → 8), so
+    // there is slack to release. One exe each: one pattern per entry.
+    let custom: Vec<Arc<ScannedEntry>> = (0..5)
+      .map(|i| entry_with_exes(&format!("c{i}"), OsName::Linux, &["custom.bin"]))
+      .collect();
+    let detectable: Vec<Arc<ScannedEntry>> = (0..3)
+      .map(|i| entry_with_exes(&format!("d{i}"), OsName::Linux, &["native.bin"]))
+      .collect();
+    let bundle =
+      build_bundle(Arc::from(detectable), Arc::from(custom)).expect("custom automaton builds");
+
+    assert!(
+      bundle.custom_indexes.len() >= 5,
+      "the custom patterns were built (got {})",
+      bundle.custom_indexes.len()
+    );
+    assert_eq!(
+      bundle.custom_indexes.capacity(),
+      bundle.custom_indexes.len(),
+      "the custom index must store exactly its length, not doubling slack"
+    );
+    // The sibling tables keep the same contract, so a later change cannot
+    // release one and forget the others.
+    assert_eq!(
+      bundle.indexes.capacity(),
+      bundle.indexes.len(),
+      "the native index must store exactly its length"
+    );
+  }
+}
+
+#[cfg(test)]
+mod pattern_index_tests {
+  use super::*;
+
+  /// The pair is 8 B, not 16: half the dense table.
+  #[test]
+  fn pattern_index_is_compact() {
+    assert_eq!(std::mem::size_of::<PatternIndex>(), 8);
+    // A pair of zeroes still carries its halves.
+    let pair = PatternIndex([0, 0]);
+    assert_eq!(pair.resolve(), (0, 0));
+  }
+
+  /// `resolve` widens without truncating, including at the extremes: a
+  /// lost high bit would index the wrong entry and mis-attribute a game.
+  #[test]
+  fn resolve_widens_without_truncation() {
+    for (activity, exe) in [
+      (0usize, 0usize),
+      (1, 7),
+      (u16::MAX as usize, u16::MAX as usize),
+      (u32::MAX as usize - 1, u32::MAX as usize - 1),
+    ] {
+      let pair = pattern_index(activity, exe);
+      assert_eq!(pair.resolve(), (activity, exe), "pair lost a high bit");
+    }
+  }
+
+  /// An out-of-range pair saturates and asserts: it must never silently
+  /// truncate to a valid-looking index.
+  #[test]
+  #[should_panic(expected = "database too large")]
+  fn overflow_pair_asserts_instead_of_truncating() {
+    let _ = pattern_index(usize::MAX, usize::MAX);
   }
 }

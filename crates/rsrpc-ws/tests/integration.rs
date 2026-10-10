@@ -453,3 +453,101 @@ async fn client_ids_are_unique_across_servers() {
   server_a.shutdown().await;
   server_b.shutdown().await;
 }
+
+/// A full global event queue backpressures every reader instead of
+/// dropping events.
+///
+/// All connections share one bounded queue, so a hub that stops draining
+/// stalls every connection's read loop — including one that only sends
+/// pings. That coupling is the price of a single queue, and it is
+/// deliberate: the alternative is either unbounded memory or silently
+/// dropped `Connect`/`Message`/`Disconnect` events, and the order of
+/// those events is global by design.
+///
+/// Pinned so the queue is never "fixed" by dropping on a full channel:
+/// with capacity 1 and nothing draining, three messages still arrive in
+/// order once the hub catches up.
+#[tokio::test]
+async fn a_full_event_queue_backpressures_and_keeps_every_event() {
+  let config = rsrpc_ws::ServerConfig::builder("127.0.0.1:0".parse().unwrap())
+    .event_queue(1)
+    .build()
+    .unwrap();
+  let (server, mut hub) = rsrpc_ws::Server::bind(config).await.unwrap();
+  let addr = server.local_addr();
+
+  let mut ws = connect(addr).await;
+  let id = match next_event(&mut hub).await {
+    Event::Connect(id, _) => id,
+    other => panic!("expected Connect, got {other:?}"),
+  };
+
+  // Three messages with the queue at capacity 1 and no drain: the first is
+  // enqueued, the reader then parks on the next send, and the rest wait in
+  // the socket buffer.
+  for body in ["one", "two", "three"] {
+    ws.send(tungstenite::Message::Text(body.into()))
+      .await
+      .unwrap();
+    tokio::time::sleep(Duration::from_millis(25)).await;
+  }
+
+  // Draining the hub unparks the reader, which forwards the next message —
+  // nothing is dropped, and nothing overtakes.
+  for expected in ["one", "two", "three"] {
+    match next_event(&mut hub).await {
+      Event::Message(got_id, Message::Text(text)) => {
+        assert_eq!(got_id, id);
+        assert_eq!(text, expected, "events arrive in send order");
+      }
+      other => panic!("expected Message({expected}), got {other:?}"),
+    }
+  }
+
+  ws.close(None).await.unwrap();
+  let _ = server;
+}
+///
+/// `DisconnectReason::SlowConsumer` exists in the API but is never emitted,
+/// and the crate-level docs used to claim the opposite ("slow consumers are
+/// pruned"). Pruning on a full outbox would be a behavior change, not a
+/// docs fix, so the contract is pinned here: the outbox stays full, the
+/// connection stays open, and the disconnect that eventually arrives is the
+/// one the caller asked for.
+#[tokio::test]
+async fn a_full_outbox_is_reported_not_disconnected() {
+  let config = ServerConfig::builder("127.0.0.1:0".parse().unwrap())
+    .per_client_queue(1)
+    .build()
+    .unwrap();
+  let (server, mut hub) = Server::bind(config).await.unwrap();
+  let addr = server.local_addr();
+
+  // Never read from this client: the outbox fills and stays full.
+  let _ws = connect(addr).await;
+  let responder = match next_event(&mut hub).await {
+    Event::Connect(_, responder) => responder,
+    other => panic!("expected Connect, got {other:?}"),
+  };
+  let _ = responder.try_send(Message::from("first")); // fills the queue
+  assert!(
+    matches!(
+      responder.try_send(Message::from("overflow")),
+      Err(rsrpc_ws::TrySendError::Full)
+    ),
+    "an outbox at capacity reports Full"
+  );
+
+  // No disconnect of any kind: the flood itself must not take the
+  // connection down, whatever reason the server would label it with. The
+  // outbox stays full and the connection stays open; pruning is the
+  // caller's call, not the server's.
+  if let Ok(Some(Event::Disconnect(_, reason))) =
+    tokio::time::timeout(Duration::from_millis(50), hub.next()).await
+  {
+    panic!("a full outbox must not disconnect the client (got {reason:?})");
+  }
+
+  // The connection is still the caller's to prune.
+  responder.close(rsrpc_ws::CloseCode::Normal).await;
+}

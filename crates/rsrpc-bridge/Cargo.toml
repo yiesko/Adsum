@@ -36,6 +36,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "time", "macros", "sync"] }
+rsrpc-ws = { path = "../rsrpc-ws", features = ["test-util"] }
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
 serde_json.workspace = true

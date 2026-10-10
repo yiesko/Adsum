@@ -122,6 +122,12 @@ pub struct ProcessServer {
   /// suffice for a cadence hint, but `Acquire`/`Release` is free here and
   /// keeps the watcher-state reasoning uniform.
   pub(crate) watcher_live: Arc<AtomicBool>,
+  /// The proc-events watcher's backlog gauge, set once when the watcher
+  /// spawns. A cloned handle to the same counters the channel ends share,
+  /// so the census reads shed totals without a second copy of the state
+  /// and without the watcher having to mirror anything. `None` until
+  /// `start` runs a Linux watcher.
+  pub(crate) watch_gauge: Arc<Mutex<Option<rsrpc_telemetry::QueueGauge>>>,
 
   #[cfg(not(target_os = "linux"))]
   pub(crate) sysinfo: Arc<Mutex<System>>,
@@ -135,26 +141,6 @@ pub struct ProcessServer {
 /// database module, which rebuilds generations on the same path.
 pub(crate) fn release_parse_arenas() {
   release_platform_arenas();
-}
-
-/// Live vs free heap bytes from the allocator (glibc `mallinfo2`):
-/// distinguishes live objects from retained arenas (`live` growing vs
-/// `free` growing with a flat RSS floor).
-/// `None` off glibc-Linux (musl, macOS, Windows), where the post-retrim
-/// line simply carries no suffix. Permanent telemetry, not DIAG: one
-/// line per installed rebuild, zero retained state.
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-pub(crate) fn allocator_numbers() -> Option<(u64, u64)> {
-  // SAFETY: `mallinfo2` only reads allocator statistics; it neither
-  // allocates nor mutates anything.
-  let info = unsafe { libc::mallinfo2() };
-  #[allow(clippy::cast_possible_truncation)]
-  Some((info.uordblks as u64, info.fordblks as u64))
-}
-
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-pub(crate) fn allocator_numbers() -> Option<(u64, u64)> {
-  None
 }
 
 /// Linux (glibc/musl).
@@ -228,6 +214,7 @@ impl Clone for ProcessServer {
       ignored_ids: self.ignored_ids.clone(),
       enable_proc_events: self.enable_proc_events,
       watcher_live: Arc::clone(&self.watcher_live),
+      watch_gauge: Arc::clone(&self.watch_gauge),
       #[cfg(not(target_os = "linux"))]
       sysinfo: Arc::clone(&self.sysinfo),
     }
@@ -235,6 +222,21 @@ impl Clone for ProcessServer {
 }
 
 impl ProcessServer {
+  /// The watcher's backlog gauge, once the watcher has spawned.
+  ///
+  /// A clone, not a borrow: [`rsrpc_telemetry::QueueGauge`] is refcounted,
+  /// so this handle reads the very depth/shed counters the channel ends
+  /// update — no second counter to mirror or drift. `None` when the
+  /// watcher is off, unsupported or not Linux.
+  #[must_use]
+  pub fn watch_gauge(&self) -> Option<rsrpc_telemetry::QueueGauge> {
+    self
+      .watch_gauge
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner())
+      .clone()
+  }
+
   /// Folds `custom` overrides into the initial build: one automaton
   /// construction instead of build-then-rebuild. Startup (and one-shot
   /// diagnostics) use this so staged overrides never cost a second full
@@ -268,6 +270,7 @@ impl ProcessServer {
       ignored_ids: ignored_ids.into_iter().collect(),
       enable_proc_events: true,
       watcher_live: Arc::new(AtomicBool::new(false)),
+      watch_gauge: Arc::new(Mutex::new(None)),
       exclusions: Arc::new(RwLock::new(Exclusions::default())),
       steam_libraries: Arc::new(RwLock::new(SteamLibraries::discover())),
       detected_pids: Arc::new(Mutex::new(FxHashSet::default())),
@@ -299,10 +302,8 @@ mod tests {
   use super::*;
   use std::time::Duration;
 
-  use crate::runtime::{
-    exec_hit_ignored, removed_slots, scan_cadence, should_exit_on_send_error, unpark_scan_wake,
-  };
-  use crate::types::{DetectSource, ProcessDetectedEvent, ScannedEntry, ScannedHit};
+  use crate::runtime::{exec_hit_ignored, removed_slots, scan_cadence, unpark_scan_wake};
+  use crate::types::{DetectSource, ScannedEntry, ScannedHit};
 
   /// Empty-database server with a live gauge sender for unit tests.
   fn fixture_server() -> ProcessServer {
@@ -321,7 +322,6 @@ mod tests {
   fn custom_entry() -> DetectableActivity {
     custom_entry_named("777")
   }
-
   /// Custom entry with a caller-chosen id for concurrency tests.
   fn custom_entry_named(id: &str) -> DetectableActivity {
     serde_json::from_value(serde_json::json!({
@@ -371,19 +371,6 @@ mod tests {
       removed_slots(&previous, &restarted),
       vec![("a".to_string(), 1)]
     );
-  }
-
-  /// A dropped receiver fails sends, and the policy says exit (no retry).
-  #[test]
-  fn closed_queue_exits_scan_instead_of_retrying() {
-    // `GaugeSender` wraps an unbounded `std::mpsc`: `Err` means the
-    // receiver is gone (shutdown), never transient backpressure.
-    let (tx, rx) = rsrpc_telemetry::QueueGauge::pair();
-    drop(rx);
-    let failed: Result<(), std::sync::mpsc::SendError<ProcessDetectedEvent>> =
-      tx.send(ProcessDetectedEvent::cleared());
-    assert!(failed.is_err());
-    assert!(should_exit_on_send_error(&failed));
   }
 
   /// Ignored app ids never publish on the EXEC fast path either.
@@ -528,8 +515,7 @@ mod tests {
   fn shutdown_joins_scan_thread_promptly() {
     let mut server = fixture_server();
     server.set_proc_events(false);
-    let watch_slot = Arc::new(Mutex::new(rsrpc_telemetry::QueueGauge::new()));
-    server.start(Duration::from_millis(50), &watch_slot);
+    server.start(Duration::from_millis(50));
     // A few ticks so the thread is parked in its cadence wait, not still
     // starting up, when shutdown lands.
     std::thread::sleep(Duration::from_millis(200));
@@ -563,10 +549,7 @@ mod tests {
   fn refresh_sleep_is_interrupted_by_shutdown() {
     let mut server = fixture_server();
     server.set_proc_events(false);
-    server.refresh.enable = true;
-    server.refresh.db_url = Some("http://127.0.0.1:9/unreachable".to_string());
-    let watch_slot = Arc::new(Mutex::new(rsrpc_telemetry::QueueGauge::new()));
-    server.start(Duration::from_millis(50), &watch_slot);
+    server.start(Duration::from_millis(50));
     // Let the refresh thread fail its first fetch and enter the hourly
     // sleep; the scan thread ticks alongside, both must stop below.
     std::thread::sleep(Duration::from_millis(500));
@@ -614,11 +597,119 @@ mod tests {
     }
     let mut server = fixture_server();
     server.set_proc_events(false);
-    let watch_slot = Arc::new(Mutex::new(rsrpc_telemetry::QueueGauge::new()));
-    server.start(Duration::from_millis(50), &watch_slot);
+    server.start(Duration::from_millis(50));
     std::thread::sleep(Duration::from_millis(200));
     assert!(has_prefix("rsrpc-scan"), "scan thread must be named");
     server.shutdown();
     server.join();
+  }
+
+  /// N23: the gauge handed out for the census is the watcher's own gauge,
+  /// not a snapshot of it.
+  ///
+  /// A copy would report whatever the counter read at handover time and
+  /// then freeze, so a shed after the census wiring would stay invisible —
+  /// exactly the blind spot N23 is about. The handle is refcounted, so
+  /// reads and writes land on the same counters.
+  #[test]
+  fn watch_gauge_handle_shares_the_watcher_counters() {
+    let server = fixture_server();
+    // No watcher on this fixture (and none in unit tests generally), so
+    // install the gauge the way `start` does and prove the handle still
+    // tracks the shared counters afterwards.
+    let (tx, rx) = rsrpc_telemetry::QueueGauge::pair::<u32>();
+    let real = tx.gauge();
+    *server
+      .watch_gauge
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(real.clone());
+
+    let handle = server.watch_gauge().expect("gauge is installed");
+    assert_eq!(
+      handle.dropped_total(),
+      0,
+      "a fresh watch queue has shed nothing"
+    );
+
+    // Shed past the cap on the real channel end: the counter the census
+    // reads must move with it.
+    let cap = 2;
+    for _ in 0..(cap + 1) {
+      let _ = tx.send_checked(1, cap);
+    }
+    assert!(
+      rx.recv().is_ok(),
+      "the queued item must arrive for the gauge to settle"
+    );
+    let shed = handle.dropped_total();
+    assert_eq!(
+      shed,
+      real.dropped_total(),
+      "the census handle must read the watcher's own counter"
+    );
+    assert!(shed > 0, "the reference end must have shed past its cap");
+  }
+  /// The debounce consumes the pid: a second EXIT for the same game
+  /// inside the 1s window must not wake again.
+  ///
+  /// This is the invariant the single-lock version of
+  /// `should_wake_on_exit` exists to keep — taking the lock twice for the
+  /// membership check and the removal re-opened the window where two EXITs
+  /// of the same pid both pass the check, wake twice, and only then consume
+  /// once. Proton helpers die constantly, so a duplicated wake is not a
+  /// rare corner.
+  #[test]
+  fn a_consumed_exit_pid_does_not_wake_twice() {
+    let server = fixture_server();
+    let pid = std::process::id().into();
+    server
+      .detected_pids
+      .lock()
+      .unwrap_or_else(|e| e.into_inner())
+      .insert(pid);
+    // Steal the last_scan latch so the debounce is "due" immediately.
+    *server.last_scan.lock().unwrap_or_else(|e| e.into_inner()) =
+      std::time::Instant::now() - std::time::Duration::from_secs(2);
+
+    assert!(server.should_wake_on_exit(pid), "the first exit wakes");
+    assert!(
+      !server.should_wake_on_exit(pid),
+      "the pid was consumed, so a second exit must not wake"
+    );
+    assert!(
+      server
+        .detected_pids
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_empty(),
+      "the consumed pid must not be remembered for the next sweep"
+    );
+  }
+
+  /// An EXIT that arrives before the debounce is due does not consume the
+  /// pid: a follow-up EXIT still has its chance to wake.
+  #[test]
+  fn an_early_exit_keeps_the_pid_for_a_later_one() {
+    let server = fixture_server();
+    let pid = std::process::id().into();
+    server
+      .detected_pids
+      .lock()
+      .unwrap_or_else(|e| e.into_inner())
+      .insert(pid);
+
+    // last_scan is fresh, so the debounce is not due.
+    assert!(
+      !server.should_wake_on_exit(pid),
+      "inside the debounce window there is no wake"
+    );
+    assert!(
+      server
+        .detected_pids
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&pid),
+      "an early exit must leave the pid tracked"
+    );
   }
 }

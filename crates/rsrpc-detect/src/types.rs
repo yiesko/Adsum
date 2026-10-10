@@ -74,12 +74,16 @@ impl ProcessDetectedEvent {
 /// code reads unchanged. Text rides as `Box<str>` (16B, no capacity
 /// field) instead of `String` (24B): ~11k executables × 2 string fields
 /// is real money, and these never grow after the build.
+///
+/// `Exec.arguments` (the scan tick's per-process slot) stays a `String`:
+/// `read_exec_into` recycles that buffer with `mem::take`, which a
+/// `Box<str>` cannot take part in. Only this build-once field boxes.
 #[derive(Clone, Debug)]
 pub struct ScannedExe {
   pub name: Box<str>,
   pub os: OsName,
   pub is_launcher: bool,
-  pub arguments: Option<String>,
+  pub arguments: Option<Box<str>>,
 }
 
 /// Executable OS: the database only ever carries three values (`win32`
@@ -150,9 +154,13 @@ impl OsName {
 pub struct ScannedEntry {
   pub id: Box<str>,
   pub name: Box<str>,
-  pub executables: Vec<ScannedExe>,
-  pub steam_ids: Vec<Box<str>>,
-  pub aliases: Vec<Box<str>>,
+  /// Boxed slices, not `Vec`: the generation is built once and then never
+  /// grows, shrinks or mutates these. `Box<[T]>` drops the excess capacity
+  /// a `Vec` may carry and shrinks each field by a pointer on 64-bit,
+  /// which matters across ~24k entries.
+  pub executables: Box<[ScannedExe]>,
+  pub steam_ids: Box<[Box<str>]>,
+  pub aliases: Box<[Box<str>]>,
 }
 
 impl ScannedEntry {
@@ -173,9 +181,10 @@ impl ScannedEntry {
               name: exe.name.clone().into_boxed_str(),
               os: OsName::from_os(&exe.os),
               is_launcher: exe.is_launcher,
-              arguments: exe.arguments.clone(),
+              arguments: exe.arguments.as_deref().map(Box::<str>::from),
             })
-            .collect()
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
         })
         .unwrap_or_default(),
       steam_ids: activity
@@ -188,7 +197,8 @@ impl ScannedEntry {
             .filter_map(|sku| sku.id.clone())
             .filter(|id| !id.is_empty())
             .map(|id| id.into_boxed_str())
-            .collect()
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
         })
         .unwrap_or_default(),
       aliases: activity
@@ -197,7 +207,8 @@ impl ScannedEntry {
         .unwrap_or_default()
         .into_iter()
         .map(|alias| alias.into_boxed_str())
-        .collect(),
+        .collect::<Vec<_>>()
+        .into_boxed_slice(),
     }
   }
 
@@ -216,9 +227,10 @@ impl ScannedEntry {
           name: exe.name.into_boxed_str(),
           os: OsName::from_string(exe.os),
           is_launcher: exe.is_launcher,
-          arguments: exe.arguments,
+          arguments: exe.arguments.map(String::into_boxed_str),
         })
-        .collect(),
+        .collect::<Vec<_>>()
+        .into_boxed_slice(),
       steam_ids: activity
         .third_party_skus
         .unwrap_or_default()
@@ -227,53 +239,28 @@ impl ScannedEntry {
         .filter_map(|sku| sku.id)
         .filter(|id| !id.is_empty())
         .map(|id| id.into_boxed_str())
-        .collect(),
+        .collect::<Vec<_>>()
+        .into_boxed_slice(),
       aliases: activity
         .aliases
         .unwrap_or_default()
         .into_iter()
         .map(|alias| alias.into_boxed_str())
-        .collect(),
+        .collect::<Vec<_>>()
+        .into_boxed_slice(),
     }
   }
 }
 
 /// Which matcher classified the process: the provenance asked for when
-/// a detection needs explaining. `Copy` and allocation-free by design —
-/// it travels on every hit without touching the hot path's budget.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum DetectSource {
-  /// Database-declared path (Aho-Corasick on the process path).
-  Automaton,
-  /// Bare exe joined with the process working directory.
-  CwdJoined,
-  /// `win32` (Proton) database entries.
-  ProtonAutomaton,
-  /// Authoritative store id (Steam/Proton environ, or cmdline fallback).
-  SteamAppId,
-  /// Install directory inherited from a known Steam library.
-  SteamLibrary,
-  /// Executable stem equal to a multi-word game name.
-  ExeStem,
-  /// Install folder carrying the title.
-  Folder,
-}
-
-impl DetectSource {
-  /// Stable log identifier for journal correlation.
-  #[must_use]
-  pub fn as_str(self) -> &'static str {
-    match self {
-      Self::Automaton => "automaton",
-      Self::CwdJoined => "cwd-joined",
-      Self::ProtonAutomaton => "proton-automaton",
-      Self::SteamAppId => "steam-app-id",
-      Self::SteamLibrary => "steam-library",
-      Self::ExeStem => "exe-stem",
-      Self::Folder => "folder",
-    }
-  }
-}
+/// a detection needs explaining.
+///
+/// Re-exported from `rsrpc-types` so every existing `crate::types::`
+/// import and `pub use` keeps resolving. It lives there because the value
+/// crosses the scanner/bridge boundary inside `ScannedGame`, and the
+/// bridge deliberately does not depend on the detector — see
+/// [`rsrpc_types::DetectSource`] for the rationale.
+pub use rsrpc_types::DetectSource;
 
 /// One classified game: the shared slim entry plus the observation (pid +
 /// epoch-millis start). Replaces stamping pid/timestamp onto a full-struct
@@ -315,9 +302,11 @@ pub fn epoch_ms() -> u64 {
     .unwrap_or(0)
 }
 
-const _: () = assert!(std::mem::size_of::<ScannedEntry>() <= 104);
+// 3 x Vec (24 B) became 3 x Box<[T]> (16 B): 24 B off per entry.
+const _: () = assert!(std::mem::size_of::<ScannedEntry>() <= 80);
 
-const _: () = assert!(std::mem::size_of::<ScannedExe>() <= 72);
+// `Option<String>` (24 B) became `Option<Box<str>>` (16 B).
+const _: () = assert!(std::mem::size_of::<ScannedExe>() <= 64);
 
 /// Callback invoked with the scan state after every scan tick (e.g. the
 /// OBS-open flag for streamer-mode tooling).

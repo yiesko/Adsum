@@ -11,12 +11,29 @@ use rsrpc_types::SocketId;
 
 /// Clear-payload fixture carrying a chosen pid in its JSON body.
 fn cached_with(pid_json: &str) -> CachedActivity {
+  // The field mirrors the body, exactly as the real builders do: they now
+  // record the pid instead of leaving the cache to parse it back out.
+  let pid: u64 = pid_json.parse().unwrap_or(0);
   CachedActivity {
     json: tungstenite::Utf8Bytes::from(format!(r#"{{"activity":null,"pid":{pid_json}}}"#)),
     msgpack: bytes::Bytes::new(),
     is_clear: true,
     activity_json: bytes::Bytes::new(),
     provenance: None,
+    pid,
+  }
+}
+
+/// A payload whose body is unusable *and* which records no pid: the
+/// socket-id fallback path.
+fn cached_broken() -> CachedActivity {
+  CachedActivity {
+    json: tungstenite::Utf8Bytes::from_static("not json"),
+    msgpack: bytes::Bytes::new(),
+    is_clear: true,
+    activity_json: bytes::Bytes::new(),
+    provenance: None,
+    pid: 0,
   }
 }
 
@@ -32,13 +49,7 @@ fn body_pid_wins_over_numeric_socket_id() {
 /// Unparseable bodies fall back to the numeric socket id.
 #[test]
 fn numeric_socket_id_used_when_body_unusable() {
-  let broken = CachedActivity {
-    json: tungstenite::Utf8Bytes::from_static("not json"),
-    msgpack: bytes::Bytes::new(),
-    is_clear: true,
-    activity_json: bytes::Bytes::new(),
-    provenance: None,
-  };
+  let broken = cached_broken();
   assert_eq!(
     cache_entry_pid(&SocketId::from("4242"), &broken),
     Some(4242)
@@ -64,12 +75,26 @@ fn rejects_zero_and_garbage() {
   // authoritative, so this entry resolves to pid 9.
   let payload = cached_with("9");
   assert_eq!(cache_entry_pid(&SocketId::from("0"), &payload), Some(9));
-  let broken = CachedActivity {
-    json: tungstenite::Utf8Bytes::from_static("not json"),
+  let broken = cached_broken();
+  assert_eq!(cache_entry_pid(&SocketId::from("app"), &broken), None);
+}
+
+/// The recorded pid resolves without touching the JSON at all: a body
+/// that would not parse still yields its pid, which is what removes the
+/// re-parse from the ghost-reap path.
+#[test]
+fn recorded_pid_needs_no_json() {
+  // A body that is not even valid JSON, but the builder knew the pid.
+  let payload = CachedActivity {
+    json: tungstenite::Utf8Bytes::from_static(""),
     msgpack: bytes::Bytes::new(),
     is_clear: true,
     activity_json: bytes::Bytes::new(),
     provenance: None,
+    pid: 4242,
   };
-  assert_eq!(cache_entry_pid(&SocketId::from("app"), &broken), None);
+  assert_eq!(
+    cache_entry_pid(&SocketId::from("not-a-pid"), &payload),
+    Some(4242)
+  );
 }

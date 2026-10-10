@@ -119,6 +119,18 @@ impl Server {
     let listener = TcpListener::bind(config.bind).await.map_err(Error::Bind)?;
     let local_addr = listener.local_addr().map_err(Error::Runtime)?;
 
+    // One bounded queue for every connection's events.
+    //
+    // The coupling is deliberate but not free: while this queue is full,
+    // every connection's read loop is parked on `send`, including the ones
+    // that only send pings — one stalled hub consumer stalls all of them.
+    // A per-connection queue would remove that coupling, at the cost of
+    // unbounded memory across `max_connections` queues or dropped
+    // `Connect`/`Disconnect` events. Neither is acceptable here: connection
+    // events are how the caller tracks slots, and their order is global by
+    // design. Bounded global queue with backpressure is the trade this
+    // takes, and the integration test pins that it backpressures rather
+    // than drops.
     let (event_tx, event_rx) = mpsc::channel(config.event_queue);
     let token = CancellationToken::new();
     let semaphore = Arc::new(Semaphore::new(config.max_connections));

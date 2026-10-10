@@ -268,12 +268,39 @@ fn common_prefix(library: &str, installdir: &str) -> String {
 /// leading `/`. Windows contributes `\`-separated library and process
 /// paths; without this, cached keys and queries never share a form
 /// there and no prefix ever matches.
+///
+/// Prefer [`canonical_steam_path_into`] on any repeated path: this
+/// allocating form is for one-off and cold callers only.
 fn canonical_steam_path(raw: &str) -> String {
-  let mut out = raw.replace('\\', "/").to_lowercase();
-  if !out.starts_with('/') {
-    out.insert(0, '/');
-  }
+  let mut out = String::with_capacity(raw.len() + 1);
+  canonical_steam_path_into(raw, &mut out);
   out
+}
+
+/// Canonical form written into `dst`, which is cleared first.
+///
+/// One pass, no allocation of its own: the previous
+/// `raw.replace('\\', "/").to_lowercase()` built two `String`s (one for
+/// the separator swap, one for the case fold) for every process that
+/// missed the automaton and fell through to the Steam prefix check.
+/// `char::to_lowercase` is `Copy`-free but yields `ToLowercase`, so the
+/// fold is streaming rather than a second buffer.
+fn canonical_steam_path_into(raw: &str, dst: &mut String) {
+  dst.clear();
+  dst.reserve(raw.len() + 1);
+  for ch in raw.chars() {
+    if ch == '\\' {
+      dst.push('/');
+    } else {
+      // Streaming fold: no intermediate lowercased String.
+      for lower in ch.to_lowercase() {
+        dst.push(lower);
+      }
+    }
+  }
+  if !dst.starts_with('/') {
+    dst.insert(0, '/');
+  }
 }
 
 /// Change marker for one library: steamapps dir mtime, manifest count,
@@ -587,11 +614,20 @@ impl SteamLibraries {
   /// `/`), so native Windows paths match the cached keys.
   #[inline]
   pub fn match_prefix(&self, path: &str) -> Option<&str> {
-    let normalized_path = canonical_steam_path(path);
+    let mut normalized = String::with_capacity(path.len() + 1);
+    self.match_prefix_into(path, &mut normalized)
+  }
+
+  /// Same match, canonicalizing into a caller-owned buffer so the hot
+  /// path (every process that misses the automaton) allocates nothing.
+  /// The returned id borrows from `self`, not from `scratch`.
+  #[inline]
+  pub fn match_prefix_into(&self, path: &str, scratch: &mut String) -> Option<&str> {
+    canonical_steam_path_into(path, scratch);
     let mut best: Option<&str> = None;
     let mut best_len = 0;
     for (prefix, appid) in &self.dirs {
-      if prefix.len() > best_len && normalized_path.starts_with(prefix.as_str()) {
+      if prefix.len() > best_len && scratch.as_str().starts_with(prefix.as_str()) {
         best = Some(appid.as_str());
         best_len = prefix.len();
       }
@@ -1207,4 +1243,80 @@ mod tests {
     );
     let _ = std::fs::remove_dir_all(&dir);
   }
+}
+
+#[cfg(test)]
+mod canonical_tests {
+  use super::*;
+
+  /// The buffer form is byte-identical to the allocating one: it must not
+  /// quietly become a different canonicalization, or cached keys and
+  /// queries would stop matching.
+  #[test]
+  fn canonical_into_matches_allocating_form() {
+    for raw in [
+      "/home/u/.steam/steam/steamapps/common/Game",
+      "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Game",
+      "relative/path",
+      "ALREADY/LOWER",
+      "MiXeD\\\\Case/Path",
+      "/leading",
+      "trailing/",
+      "",
+      "日本語/パス",
+      "École/LÉGENDE",
+    ] {
+      let mut buf = String::new();
+      canonical_steam_path_into(raw, &mut buf);
+      assert_eq!(buf, canonical_steam_path(raw), "mismatch for {raw:?}");
+    }
+  }
+
+  /// The buffer form reuses the destination instead of allocating: same
+  /// buffer pointer across calls once it is warm.
+  #[test]
+  fn canonical_into_reuses_the_destination() {
+    let mut buf = String::with_capacity(64);
+    canonical_steam_path_into("/a/very/much/longer/path/than/before", &mut buf);
+    let ptr = buf.as_ptr();
+    canonical_steam_path_into("short", &mut buf);
+    assert_eq!(buf.as_ptr(), ptr, "destination reallocated");
+  }
+}
+
+/// `match_prefix_into` agrees with the allocating form and reuses the
+/// caller's buffer: two prefixes of different length must let the
+/// longest win, exactly as before.
+#[test]
+fn match_prefix_into_matches_allocating_form() {
+  let mut dirs = HashMap::new();
+  dirs.insert("/opt/games/a/".to_string(), "111".to_string());
+  dirs.insert("/opt/games/".to_string(), "222".to_string());
+  let libs = SteamLibraries {
+    dirs,
+    ..Default::default()
+  };
+
+  let mut scratch = String::new();
+  for path in [
+    "/opt/games/a/game.exe",
+    "/opt/games/b/game.exe",
+    "/elsewhere/game.exe",
+    "",
+  ] {
+    assert_eq!(
+      libs.match_prefix_into(path, &mut scratch),
+      libs.match_prefix(path),
+      "mismatch for {path:?}"
+    );
+  }
+  // Longest prefix wins, and the id borrows from the map not the scratch.
+  assert_eq!(
+    libs.match_prefix_into("/opt/games/a/x", &mut scratch),
+    Some("111")
+  );
+  assert_eq!(
+    libs.match_prefix_into("/opt/games/b/x", &mut scratch),
+    Some("222")
+  );
 }

@@ -40,15 +40,14 @@ pub struct DetectableSummary {
 /// # Errors
 ///
 /// Returns [`RsrpcError::InvalidJson`] when neither shape parses (a
-/// fetched-but-garbage body: callers fall back to the bundled snapshot).
+/// fetched-but-garbage body: callers fall back to the bundled snapshot),
+/// or a structural-limit error when the body decodes past a cap.
+///
+/// The label says which shape decoded (`direct` or `trimmed`); the parse
+/// itself is [`rsrpc_detect::db::parse_database`], shared with the hourly
+/// refresh so a cap holds on both.
 pub fn parse_body(body: &str) -> Result<(Vec<DetectableActivity>, &'static str)> {
-  if let Ok(parsed) = serde_json::from_str::<Vec<DetectableActivity>>(body) {
-    return Ok((parsed, "direct"));
-  }
-  let trimmed = db::trim_detectable_value(body)?;
-  let parsed: Vec<DetectableActivity> =
-    serde_json::from_value(trimmed).map_err(|err| RsrpcError::InvalidJson { source: err })?;
-  Ok((parsed, "trimmed"))
+  db::parse_database(body)
 }
 
 /// Read a database file, then [`parse_body`].

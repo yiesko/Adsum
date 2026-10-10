@@ -5,7 +5,9 @@ use std::io::{Cursor, Read, Write};
 use libfuzzer_sys::fuzz_target;
 use rsrpc_transport_ipc::EventSink;
 use rsrpc_transport_ipc::frame::{IpcFacilitator, MAX_IPC_PAYLOAD, PacketType, handle_stream};
+use rsrpc_types::AppId;
 use rsrpc_types::user::RpcUser;
+use serde_json::Value;
 
 // Per-connection state with a drain-free sink: the queue is oversized so
 // `emit_clear` never parks on a full channel mid-run.
@@ -22,20 +24,20 @@ impl IpcFacilitator for FuzzFacilitator {
   fn set_handshake(&mut self, handshake: bool) {
     self.handshake = handshake;
   }
-  fn client_id(&self) -> String {
-    String::new()
+  fn client_id(&self) -> AppId {
+    AppId::from("")
   }
-  fn set_client_id(&mut self, _client_id: String) {}
+  fn set_client_id(&mut self, _client_id: AppId) {}
   fn pid(&self) -> u64 {
     self.pid
   }
   fn set_pid(&mut self, pid: u64) {
     self.pid = pid;
   }
-  fn nonce(&self) -> String {
-    String::new()
+  fn nonce(&self) -> Value {
+    Value::Null
   }
-  fn set_nonce(&mut self, _nonce: String) {}
+  fn set_nonce(&mut self, _nonce: Value) {}
   fn user_payload(&self) -> String {
     "{}".to_string()
   }

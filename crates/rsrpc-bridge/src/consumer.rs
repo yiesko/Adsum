@@ -9,10 +9,11 @@
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
+use bytes::Bytes;
 use rsrpc_protocol::commands::CachedActivity;
-use rsrpc_protocol::query::query_params;
+use rsrpc_protocol::query::query_param;
 use rsrpc_types::cmd::ActivityCmd;
-use rsrpc_ws::{ClientId, Message, Responder};
+use rsrpc_ws::{ClientId, Message, Responder, TextBytes};
 use rustc_hash::FxHashMap;
 
 use super::bridge::Shared;
@@ -30,7 +31,7 @@ impl BridgeProtocol {
   /// The protocol requested by the consumer's `format=` query parameter,
   /// falling back to the per-port default when absent.
   pub(crate) fn from_query(uri: &str, default: BridgeProtocol) -> BridgeProtocol {
-    match query_params(uri).get("format").map(String::as_str) {
+    match query_param(uri, "format") {
       Some("msgpack") | Some("messagepack") => BridgeProtocol::MsgPack,
       Some("json") => BridgeProtocol::Json,
       _ => default,
@@ -38,24 +39,80 @@ impl BridgeProtocol {
   }
 }
 
-/// Send a JSON string, encoding it to MessagePack when the consumer speaks
-/// MessagePack. Returns whether the frame was queued.
-pub(crate) fn send_message(responder: &Responder, data: &str, protocol: BridgeProtocol) -> bool {
+/// One outbound frame, encoded once and shared by every consumer it is
+/// sent to.
+///
+/// The JSON text is what the producers already hold. MessagePack is
+/// derived from it on first use and cached, so a broadcast to K
+/// MessagePack consumers pays one parse and one encode instead of K —
+/// which is what re-encoding per consumer used to cost on a path that
+/// sends the same bytes to all of them.
+pub(crate) struct Frame {
+  json: TextBytes,
+  msgpack_cell: std::sync::OnceLock<Option<Bytes>>,
+  /// How many times the MessagePack form was derived. Test-only: the
+  /// `OnceLock` already makes "at most one" structural, and this makes it
+  /// *observable* so a regression that derives eagerly (or per consumer)
+  /// fails a test instead of passing silently.
+  #[cfg(test)]
+  derivations: std::sync::atomic::AtomicUsize,
+}
+
+impl Frame {
+  /// Borrow a JSON string as a frame. No encoding happens here.
+  pub(crate) fn new(json: impl Into<TextBytes>) -> Self {
+    Self {
+      json: json.into(),
+      msgpack_cell: std::sync::OnceLock::new(),
+      #[cfg(test)]
+      derivations: std::sync::atomic::AtomicUsize::new(0),
+    }
+  }
+
+  /// The MessagePack form, derived once and cached (success or failure).
+  fn msgpack(&self) -> Option<&Bytes> {
+    let cell = &self.msgpack_cell;
+    let derived = cell.get_or_init(|| {
+      #[cfg(test)]
+      self
+        .derivations
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+      encode_msgpack(&self.json)
+    });
+    derived.as_ref()
+  }
+
+  /// Derivations so far (test-only).
+  #[cfg(test)]
+  fn derivations(&self) -> usize {
+    self.derivations.load(std::sync::atomic::Ordering::Relaxed)
+  }
+}
+
+/// Derive the MessagePack form from a JSON text: one parse, one encode.
+///
+/// A failure is cached too (as `None`) so a malformed frame is not
+/// re-parsed for every consumer — the producer's own serializer makes
+/// that unreachable in practice, but the fan-out should not depend on it.
+fn encode_msgpack(json: &str) -> Option<Bytes> {
+  let value: serde_json::Value = serde_json::from_str(json).ok()?;
+  rmp_serde::to_vec_named(&value).ok().map(Bytes::from)
+}
+
+/// Send one pre-encoded frame to a consumer, in the encoding it speaks.
+///
+/// The MessagePack form is derived from the frame's JSON on the first
+/// MessagePack consumer and reused by the rest, so a fan-out encodes once.
+/// Returns whether the frame was queued.
+pub(crate) fn send_frame(responder: &Responder, frame: &Frame, protocol: BridgeProtocol) -> bool {
   match protocol {
     BridgeProtocol::Json => responder
-      .try_send(Message::Text(data.to_string().into()))
+      .try_send(Message::Text(frame.json.clone()))
       .is_ok(),
-    BridgeProtocol::MsgPack => {
-      if let Ok(value) = serde_json::from_str::<serde_json::Value>(data)
-        && let Ok(bytes) = rmp_serde::to_vec_named(&value)
-      {
-        responder
-          .try_send(Message::Binary(bytes::Bytes::from(bytes)))
-          .is_ok()
-      } else {
-        false
-      }
-    }
+    BridgeProtocol::MsgPack => frame
+      .msgpack()
+      .and_then(|bytes| responder.try_send(Message::Binary(bytes.clone())).ok())
+      .is_some(),
   }
 }
 
@@ -75,6 +132,22 @@ pub(crate) fn send_cached(
   }
 }
 
+/// One registered consumer: its responder plus the encoding it speaks.
+///
+/// These three facts used to live in three maps keyed by the same id, so
+/// every message took three locks to answer "who is this and what do they
+/// speak", and a prune had to touch two more maps or leave protocol entries
+/// pinned forever. One map means one lock.
+#[derive(Clone, Debug)]
+pub(crate) struct Consumer {
+  pub(crate) responder: Responder,
+  pub(crate) protocol: BridgeProtocol,
+}
+
+/// Locked view of the consumer map: one guard for everything a message
+/// needs.
+pub(crate) type ConsumerMap = Mutex<FxHashMap<ClientId, Consumer>>;
+
 impl Shared {
   /// Whether this id completed a Connect registration. Refused origins
   /// are closed without registering, but a pipelined frame can still
@@ -82,41 +155,31 @@ impl Shared {
   /// so control paths must check this instead of trusting arrival order.
   pub(crate) fn is_registered(&self, id: ClientId) -> bool {
     self
-      .consumer_protocol
+      .consumers
       .lock()
       .unwrap_or_else(|e| e.into_inner())
       .contains_key(&id)
   }
 
-  /// Client map for one bridge encoding.
-  pub(crate) fn clients_for(
-    &self,
-    protocol: BridgeProtocol,
-  ) -> &Mutex<FxHashMap<ClientId, Responder>> {
-    match protocol {
-      BridgeProtocol::Json => &self.json_clients,
-      BridgeProtocol::MsgPack => &self.msgpack_clients,
-    }
-  }
-
   /// Encoding a consumer speaks: the resolved `format=` override recorded
   /// at connect, falling back to the port default for unknown ids (which
-  /// cannot happen: every insert is paired with a table entry).
+  /// cannot happen: every insert is paired with an entry).
   pub(crate) fn protocol_for(&self, id: ClientId, default: BridgeProtocol) -> BridgeProtocol {
     self
-      .consumer_protocol
+      .consumers
       .lock()
       .unwrap_or_else(|e| e.into_inner())
       .get(&id)
-      .copied()
+      .map(|consumer| consumer.protocol)
       .unwrap_or(default)
   }
 
   /// Flood guard: byte-identical republishes inside the window are
   /// dropped — before any broadcast, cache write or log line.
   /// Takes the precomputed fingerprint so dropped publishes never pay
-  /// for the envelope build.
-  pub(crate) fn flood_dropped(&self, cmd: &ActivityCmd, fingerprint: Option<&[u8]>) -> bool {
+  /// for the envelope build. Borrows it: the flood guard records a
+  /// strong reference to the same buffer rather than a copy.
+  pub(crate) fn flood_dropped(&self, cmd: &ActivityCmd, fingerprint: Option<&Bytes>) -> bool {
     let args = cmd.args.as_ref();
     let pid = args.and_then(|args| args.pid).unwrap_or_default();
     self
@@ -124,7 +187,7 @@ impl Shared {
       .lock()
       .unwrap_or_else(|e| e.into_inner())
       .should_drop(
-        cmd.application_id.as_deref().unwrap_or(""),
+        cmd.application_id.as_ref(),
         pid,
         fingerprint,
         std::time::Instant::now(),
@@ -134,85 +197,91 @@ impl Shared {
   /// Send one payload to every connected consumer, pruning dead ones so a
   /// stuck client cannot pin memory (its queued frames) forever.
   pub(crate) fn send_to_all(&self, payload: &CachedActivity) {
-    let mut json_clients = self.json_clients.lock().unwrap_or_else(|e| e.into_inner());
-    let mut msgpack_clients = self
-      .msgpack_clients
-      .lock()
-      .unwrap_or_else(|e| e.into_inner());
-    if json_clients.is_empty() && msgpack_clients.is_empty() {
+    let mut consumers = self.consumers.lock().unwrap_or_else(|e| e.into_inner());
+    if consumers.is_empty() {
       tracing::debug!("[bridge] No consumers connected, skipping");
       return;
     }
-    for (clients, payload) in [
-      (&mut json_clients, Message::Text(payload.json.clone())),
-      (
-        &mut msgpack_clients,
-        Message::Binary(payload.msgpack.clone()),
-      ),
-    ] {
-      // try_send never blocks: a full outbox reports Full here and the
-      // slot is released now, not pinned until a lagging Disconnect.
-      let dead: Vec<ClientId> = clients
-        .iter()
-        .filter_map(|(id, responder)| responder.try_send(payload.clone()).err().map(|_| *id))
-        .collect();
-      self
-        .dropped_broadcasts
-        .fetch_add(dead.len() as u64, Ordering::Relaxed);
-      for id in dead {
-        tracing::warn!("[bridge] Pruning dead consumer {id}");
-        clients.remove(&id);
-        // Paired table: every insert writes both, so every prune clears
-        // both — otherwise dead ids pin protocol entries forever.
-        self
-          .consumer_protocol
-          .lock()
-          .unwrap_or_else(|e| e.into_inner())
-          .remove(&id);
-      }
+    // try_send never blocks: a full outbox reports Full here and the slot is
+    // released now, not pinned until a lagging Disconnect. The failed send
+    // is what marks the consumer dead.
+    let dead: Vec<ClientId> = consumers
+      .iter()
+      .filter_map(|(id, consumer)| {
+        let message = match consumer.protocol {
+          BridgeProtocol::Json => Message::Text(payload.json.clone()),
+          BridgeProtocol::MsgPack => Message::Binary(payload.msgpack.clone()),
+        };
+        consumer.responder.try_send(message).err().map(|_| *id)
+      })
+      .collect();
+    self
+      .dropped_broadcasts
+      .fetch_add(dead.len() as u64, Ordering::Relaxed);
+    for id in dead {
+      tracing::warn!("[bridge] Pruning dead consumer {id}");
+      consumers.remove(&id);
     }
   }
 
   /// Broadcast a non-activity event as-is, serializing once per encoding.
   /// A frame that cannot encode is dropped loudly (not silently).
+  ///
+  /// Each encoding is serialized exactly once and handed to a refcounted
+  /// payload, so the per-consumer clone is an O(1) refcount bump instead of
+  /// a deep copy of the whole frame (`mem-zero-copy`).
   pub(crate) fn broadcast_raw(&self, cmd: &ActivityCmd) {
-    let mut json_clients = self.json_clients.lock().unwrap_or_else(|e| e.into_inner());
-    let mut msgpack_clients = self
-      .msgpack_clients
-      .lock()
-      .unwrap_or_else(|e| e.into_inner());
-    if json_clients.is_empty() && msgpack_clients.is_empty() {
+    let mut consumers = self.consumers.lock().unwrap_or_else(|e| e.into_inner());
+    if consumers.is_empty() {
       tracing::debug!("[bridge] No consumers connected, skipping");
       return;
     }
-    let json_payload = if json_clients.is_empty() {
-      None
-    } else {
+    // Serialized once per encoding, and only when a consumer actually
+    // speaks it: the check is "does anyone speak this" rather than "is this
+    // map empty", which is what one map makes natural.
+    let wants_json = consumers
+      .values()
+      .any(|c| c.protocol == BridgeProtocol::Json);
+    let wants_msgpack = consumers
+      .values()
+      .any(|c| c.protocol == BridgeProtocol::MsgPack);
+    let json_payload: Option<TextBytes> = if wants_json {
       match serde_json::to_string(cmd) {
-        Ok(payload) => Some(payload),
+        Ok(payload) => Some(TextBytes::from(payload)),
         Err(err) => {
           tracing::debug!("[bridge] Dropping unserializable fan-out frame: {err}");
           None
         }
       }
-    };
-    let msgpack_payload = if msgpack_clients.is_empty() {
-      None
     } else {
+      None
+    };
+    let msgpack_payload: Option<Bytes> = if wants_msgpack {
       match rmp_serde::to_vec_named(cmd) {
-        Ok(payload) => Some(payload),
+        Ok(payload) => Some(Bytes::from(payload)),
         Err(err) => {
           tracing::debug!("[bridge] Dropping unserializable fan-out frame: {err}");
           None
         }
       }
+    } else {
+      None
     };
-    if let Some(payload) = json_payload {
-      let dead: Vec<ClientId> = json_clients
+    for (protocol, payload) in [
+      (BridgeProtocol::Json, json_payload.map(Message::Text)),
+      (
+        BridgeProtocol::MsgPack,
+        msgpack_payload.map(Message::Binary),
+      ),
+    ] {
+      let Some(payload) = payload else { continue };
+      let dead: Vec<ClientId> = consumers
         .iter()
-        .filter_map(|(id, responder)| {
-          responder
-            .try_send(Message::Text(payload.clone().into()))
+        .filter(|(_, consumer)| consumer.protocol == protocol)
+        .filter_map(|(id, consumer)| {
+          consumer
+            .responder
+            .try_send(payload.clone())
             .err()
             .map(|_| *id)
         })
@@ -222,40 +291,60 @@ impl Shared {
         .fetch_add(dead.len() as u64, Ordering::Relaxed);
       for id in dead {
         tracing::warn!("[bridge] Pruning dead consumer {id}");
-        json_clients.remove(&id);
-        // Paired table (see `send_to_all`): prune both or dead ids pin
-        // protocol entries forever.
-        self
-          .consumer_protocol
-          .lock()
-          .unwrap_or_else(|e| e.into_inner())
-          .remove(&id);
+        consumers.remove(&id);
       }
     }
-    if let Some(payload) = msgpack_payload {
-      let dead: Vec<ClientId> = msgpack_clients
-        .iter()
-        .filter_map(|(id, responder)| {
-          responder
-            .try_send(Message::Binary(bytes::Bytes::from(payload.clone())))
-            .err()
-            .map(|_| *id)
-        })
-        .collect();
-      self
-        .dropped_broadcasts
-        .fetch_add(dead.len() as u64, Ordering::Relaxed);
-      for id in dead {
-        tracing::warn!("[bridge] Pruning dead consumer {id}");
-        msgpack_clients.remove(&id);
-        // Paired table (see `send_to_all`): prune both or dead ids pin
-        // protocol entries forever.
-        self
-          .consumer_protocol
-          .lock()
-          .unwrap_or_else(|e| e.into_inner())
-          .remove(&id);
-      }
+  }
+}
+
+#[cfg(test)]
+mod frame_tests {
+  use super::*;
+
+  /// N3: the MessagePack form is derived once per frame, however many
+  /// consumers read it.
+  ///
+  /// A broadcast used to parse the JSON and re-encode it for every
+  /// MessagePack consumer, so the cost scaled with the consumer count on
+  /// a path that sends the same bytes to all of them. The derivation
+  /// counter is what makes that observable — a cached-buffer pointer check
+  /// cannot fail, because returning `&Bytes` from `&self` already forces a
+  /// stable address.
+  #[test]
+  fn msgpack_is_derived_once_for_every_consumer() {
+    let frame = Frame::new(r#"{"cmd":"CURRENT_USER_UPDATE","data":{"user":{"id":"7"}}}"#);
+    for _ in 0..4 {
+      assert!(frame.msgpack().is_some(), "encodes");
     }
+    assert_eq!(
+      frame.derivations(),
+      1,
+      "four consumers must cost one derive, not four"
+    );
+  }
+
+  /// A frame nobody sends over MessagePack must not derive it at all:
+  /// encoding eagerly would charge every ACK — one JSON consumer — for
+  /// bytes nobody reads.
+  #[test]
+  fn an_unsent_msgpack_form_is_never_derived() {
+    let frame = Frame::new(r#"{"cmd":"ACK","data":null}"#);
+    assert_eq!(frame.derivations(), 0, "nothing derived yet");
+    assert!(
+      frame.msgpack_cell.get().is_none(),
+      "the cell stays empty until a MessagePack consumer asks"
+    );
+  }
+
+  /// The derived bytes are the same value the JSON carries: caching must
+  /// not change the wire form a consumer sees.
+  #[test]
+  fn derived_msgpack_round_trips_the_json_value() {
+    let json = r#"{"cmd":"CURRENT_USER_UPDATE","data":{"user":{"id":"7"}}}"#;
+    let frame = Frame::new(json);
+    let bytes = frame.msgpack().expect("encodes");
+    let back: serde_json::Value = rmp_serde::from_slice(bytes).expect("valid MessagePack");
+    let want: serde_json::Value = serde_json::from_str(json).expect("valid JSON");
+    assert_eq!(back, want);
   }
 }

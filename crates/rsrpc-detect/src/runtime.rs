@@ -13,16 +13,13 @@ use std::time::Duration;
 
 use super::proc_start::process_start_ms;
 use super::refresh::{FetchOutcome, fetch_detectable_etag};
-use super::scan::{ExecScratch, MatchScratch, apply_ignore_list, first_sightings};
+use super::scan::{ScanScratch, apply_ignore_list, first_sightings};
 // Linux-only: the /proc reader does not exist on other targets.
 #[cfg(target_os = "linux")]
 use super::scan::read_exec_into;
-use super::server::{ProcessServer, allocator_numbers, release_parse_arenas};
+use super::server::{ProcessServer, release_parse_arenas};
 use super::types::{Exec, ProcessDetectedEvent, ScannedHit, epoch_ms};
-// Linux-only (`spawn_proc_watcher` return type); the other use below is
-// fully qualified.
-#[cfg(target_os = "linux")]
-use rsrpc_telemetry::QueueGauge;
+use rsrpc_telemetry::SendChecked;
 
 /// Re-entrancy guard for [`ProcessServer::scan_for_processes`]: acquired
 /// atomically, released on drop (all exit paths, panics included).
@@ -102,14 +99,180 @@ pub(crate) fn spawn_worker(
 
 /// Whether a failed `event_sender.send` must end the calling thread.
 ///
-/// The sender wraps an unbounded `std::mpsc`: `Err` means the receiver is
-/// gone (shutdown), never transient backpressure — retrying would spin
-/// `scan_for_processes` forever after shutdown. The EXEC fast path already
-/// breaks; the polling loop must do the same.
-pub(crate) fn should_exit_on_send_error<T>(
-  result: &Result<(), std::sync::mpsc::SendError<T>>,
+/// The rule that makes the snapshot lane safe under a lossy channel.
+///
+/// The old order recorded the new table in `last_emitted` **before**
+/// sending its events. With an unbounded channel that was invisible
+/// (sends only fail when the receiver is gone, which ends the thread), so
+/// the bug was latent. The moment a send can be dropped — a bounded
+/// channel, `send_checked` shedding past its cap — the new state is
+/// recorded while the event that carries it is lost, and the next tick
+/// computes its delta against the new table: the vanished slot never gets
+/// its `Removed`, and the consumer is left holding a card it was told to
+/// forget (a ghost clear) or never told about (a ghost card).
+///
+/// So the table is only recorded once every event of the tick reached the
+/// channel. A shed tick leaves the previous table in place and is
+/// re-emitted whole on the next tick — the same self-healing the flood
+/// guard already relies on, and downstream dedups repeats per app id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotDelivery {
+  /// Every event of the tick was accepted: the caller may record the new
+  /// table as emitted.
+  Complete,
+  /// At least one event was shed: the consumer still holds the previous
+  /// table, so the caller must keep it and let the next tick re-emit.
+  Shed,
+  /// The receiver is gone (shutdown).
+  Closed,
+}
+
+/// Backlog budget for the snapshot lane's events.
+///
+/// Events are tiny (`ScannedHit` is 32 B plus an `Arc`), the lane feeds a
+/// bridge pump that drains continuously, and a shed is repaired by the
+/// next tick — so this is a budget that bounds the *blast radius* of a
+/// stalled consumer, not a queue that must never fill.
+pub(crate) const SNAPSHOT_EVENT_CAP: usize = 128;
+
+/// Send one snapshot's events (removals, then detections, then the
+/// empty-table clear) and report whether the tick was fully delivered.
+///
+/// Stops early on a shed: piling more events onto a full backlog cannot
+/// make the tick complete, and the next tick re-emits from the previous
+/// table anyway.
+pub(crate) fn deliver_snapshot(
+  sender: &rsrpc_telemetry::GaugeSender<ProcessDetectedEvent>,
+  removed: &[(String, u64)],
+  detected: &[ScannedHit],
+  cleared: bool,
+) -> SnapshotDelivery {
+  for (id, pid) in removed {
+    match sender.send_checked(
+      ProcessDetectedEvent::Removed {
+        id: id.clone().into_boxed_str(),
+        pid: *pid,
+      },
+      SNAPSHOT_EVENT_CAP,
+    ) {
+      SendChecked::Sent => {}
+      SendChecked::Shed => return SnapshotDelivery::Shed,
+      SendChecked::Closed => return SnapshotDelivery::Closed,
+    }
+  }
+  for game in detected {
+    match sender.send_checked(
+      ProcessDetectedEvent::detected(game.clone()),
+      SNAPSHOT_EVENT_CAP,
+    ) {
+      SendChecked::Sent => {}
+      SendChecked::Shed => return SnapshotDelivery::Shed,
+      SendChecked::Closed => return SnapshotDelivery::Closed,
+    }
+  }
+  if cleared {
+    match sender.send_checked(ProcessDetectedEvent::cleared(), SNAPSHOT_EVENT_CAP) {
+      SendChecked::Sent => {}
+      SendChecked::Shed => return SnapshotDelivery::Shed,
+      SendChecked::Closed => return SnapshotDelivery::Closed,
+    }
+  }
+  SnapshotDelivery::Complete
+}
+
+/// Backlog budget for the EXEC fast path's publication. Matches the
+/// snapshot lane: events are tiny, the consumer drains continuously, and
+/// a shed is repaired by the forced full emission `scan_dirty` triggers.
+///
+/// The EXEC fast path is a netlink watcher, so both this and the
+/// publisher below are dead weight off Linux.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const EXEC_EVENT_CAP: usize = 128;
+
+/// Publish one EXEC classification, capacity-checked.
+///
+/// A shed is **not** a failure: the caller sets `scan_dirty` before
+/// publishing, so a lost hint costs one poll interval and then the whole
+/// table is re-emitted. Reporting it as a success is what lets the lane
+/// carry on instead of tearing itself down over a dropped best-effort
+/// event. Only a gone receiver ends the lane — with no receiver there is
+/// nothing to drain and nothing to repair.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn publish_exec_hit(
+  sender: &rsrpc_telemetry::GaugeSender<ProcessDetectedEvent>,
+  hit: ScannedHit,
+  cap: usize,
 ) -> bool {
-  result.is_err()
+  match sender.send_checked(ProcessDetectedEvent::detected(hit), cap) {
+    SendChecked::Sent | SendChecked::Shed => true,
+    SendChecked::Closed => false,
+  }
+}
+
+/// Advance the snapshot lane for one tick: compute the delta against the
+/// recorded table, deliver it, and record the new table **only when the
+/// delivery was complete**.
+///
+/// This is the whole E2 fix, isolated so the ordering is testable without
+/// a channel. `deliver` is injected so a test can force each outcome; the
+/// delta is always computed from the *recorded* table, which is what makes
+/// a shed tick self-healing rather than a silent loss.
+pub(crate) fn advance_snapshot_lane<F>(
+  last_emitted: &mut Vec<(String, u64)>,
+  snapshot: Vec<(String, u64)>,
+  deliver: F,
+) -> SnapshotDelivery
+where
+  F: FnOnce(&[(String, u64)]) -> SnapshotDelivery,
+{
+  let removed = removed_slots(last_emitted, &snapshot);
+  let delivery = deliver(&removed);
+  if matches!(delivery, SnapshotDelivery::Complete) {
+    *last_emitted = snapshot;
+  }
+  delivery
+}
+
+/// The sender wraps an unbounded `std::mpsc`, so a plain `send` only
+/// fails when the receiver is gone — which is why the lane uses
+/// [`publish_exec_hit`] and [`deliver_snapshot`], both of which report
+/// that case as shutdown and every other outcome as delivered-or-shed.
+#[cfg(test)]
+mod send_outcome_tests {
+  use super::super::types::ScannedEntry;
+  use super::*;
+
+  /// A gone receiver is the only send outcome that ends a lane: everything
+  /// else is either delivered or shed-and-repaired.
+  #[test]
+  fn a_gone_receiver_is_the_only_stopping_outcome() {
+    let (tx, rx) = rsrpc_telemetry::QueueGauge::pair::<ProcessDetectedEvent>();
+    drop(rx);
+    assert_eq!(
+      deliver_snapshot(&tx, &[], &[], true),
+      SnapshotDelivery::Closed,
+      "a gone receiver stops the snapshot lane"
+    );
+    assert!(
+      !publish_exec_hit(&tx, placeholder_hit(), EXEC_EVENT_CAP),
+      "a gone receiver stops the exec lane"
+    );
+  }
+
+  fn placeholder_hit() -> ScannedHit {
+    ScannedHit {
+      entry: Arc::new(ScannedEntry {
+        id: "1".into(),
+        name: "G".into(),
+        executables: Box::new([]),
+        steam_ids: Box::new([]),
+        aliases: Box::new([]),
+      }),
+      pid: 1,
+      start: 0,
+      source: rsrpc_types::DetectSource::Automaton,
+    }
+  }
 }
 
 /// `(app id, pid)` pairs present in the previous snapshot but absent now.
@@ -255,19 +418,17 @@ pub(crate) fn exec_hit_ignored(ignored_ids: &HashSet<String>, hit: &ScannedHit) 
   ignored_ids.contains(hit.entry.id.as_ref())
 }
 
-/// Spawn the netlink dispatch (Linux): EXEC classifies one process and
-/// emits hits at once; EXIT of a tracked game unparks the scan loop for
-/// an immediate natural clear. Setup failure (or a dead receiver on
-/// shutdown) ends the thread quietly — polling carries on.
-/// Spawn the netlink watcher + dispatch threads. Returns the shared watch
-/// backlog gauge so the resource census can read it (the pair itself stays
-/// inside: `start` hands the gauge up to the daemon).
+/// Spawn the netlink watcher + dispatch threads. Returns the watcher's
+/// backlog gauge so the caller can store it where the census reads depth
+/// and shed totals (see `ProcessServer::watch_gauge`).
 #[cfg(target_os = "linux")]
-fn spawn_proc_watcher(server: &ProcessServer) -> QueueGauge {
+fn spawn_proc_watcher(server: &ProcessServer) -> rsrpc_telemetry::QueueGauge {
   use rsrpc_proc_events::{ProcEvent, watch};
   use rsrpc_telemetry::QueueGauge;
 
   let (tx, rx) = QueueGauge::pair();
+  // Read the gauge before the sender moves into the watcher thread: it is
+  // a refcounted handle, so this clone still sees every shed.
   let gauge = tx.gauge();
   let dispatch = server.clone();
   spawn_worker(
@@ -278,10 +439,9 @@ fn spawn_proc_watcher(server: &ProcessServer) -> QueueGauge {
       let mut reversed_path = String::with_capacity(256);
       // EXEC reuse buffers, owned by this loop: one `Exec` slot plus the
       // read scratch, refilled per event instead of allocated per event.
-      // `match_scratch` same idea for the classification tail.
+      // The classification tail reuses the same grouped scratch.
       let mut exec_slot = Exec::default();
-      let mut exec_scratch = ExecScratch::default();
-      let mut match_scratch = MatchScratch::default();
+      let mut scratch = ScanScratch::default();
       loop {
         // Exit at once when shutdown landed during the previous message
         // handling: the bounded wait below would otherwise park up to a
@@ -304,7 +464,7 @@ fn spawn_proc_watcher(server: &ProcessServer) -> QueueGauge {
         };
         match event {
           ProcEvent::Exec(pid) => {
-            if !read_exec_into(pid, &mut exec_slot, &mut exec_scratch) {
+            if !read_exec_into(pid, &mut exec_slot, &mut scratch.exec_scratch) {
               tracing::debug!("[Process Scanner] exec event: pid {pid} unreadable, skipping");
               continue;
             }
@@ -322,7 +482,7 @@ fn spawn_proc_watcher(server: &ProcessServer) -> QueueGauge {
               &mut variant_bufs,
               &mut reversed_path,
               &mut obs_open,
-              &mut match_scratch,
+              &mut scratch,
             ) {
               // Coexistence parity with the polling path: ignored IDs never
               // publish, even on the event-driven fast path.
@@ -350,13 +510,11 @@ fn spawn_proc_watcher(server: &ProcessServer) -> QueueGauge {
               dispatch
                 .scan_dirty
                 .store(true, std::sync::atomic::Ordering::Release);
-              // Receiver gone means shutdown: end the thread, polling dies
-              // with the daemon anyway.
-              if should_exit_on_send_error(
-                &dispatch
-                  .event_sender
-                  .send(ProcessDetectedEvent::detected(hit)),
-              ) {
+              // Best-effort publication: a shed backstops through
+              // `scan_dirty` (set above), which forces the next tick to
+              // re-emit the whole table. Only a gone receiver ends the
+              // thread.
+              if !publish_exec_hit(&dispatch.event_sender, hit, EXEC_EVENT_CAP) {
                 break;
               }
             }
@@ -446,16 +604,11 @@ fn spawn_proc_watcher(server: &ProcessServer) -> QueueGauge {
 }
 
 impl ProcessServer {
-  /// Start scan/refresh/watch threads. `watch_slot` receives the watch
-  /// backlog gauge once the watcher spawns (stays detached when the
-  /// watcher is disabled/unsupported, or on duplicate start).
-  pub fn start(
-    &self,
-    scan_interval: Duration,
-    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] watch_slot: &Arc<
-      Mutex<rsrpc_telemetry::QueueGauge>,
-    >,
-  ) {
+  /// Start scan/refresh threads.
+  ///
+  /// The watcher's gauge is stored on the server, where the census reads
+  /// depth and shed totals through [`ProcessServer::watch_gauge`].
+  pub fn start(&self, scan_interval: Duration) {
     // Double-start is a caller bug: ignore fail-safe instead of leaking
     // a second scan/dispatch/watch generation.
     if self.started.swap(true, std::sync::atomic::Ordering::AcqRel) {
@@ -583,7 +736,7 @@ impl ProcessServer {
                     break;
                   }
                   release_parse_arenas();
-                  match allocator_numbers() {
+                  match rsrpc_telemetry::heap_numbers() {
                     Some((live, free)) => tracing::info!(
                       "[Process Scanner] post-retrim rss={:.1}MB (alloc live={:.1}MB free={:.1}MB)",
                       rsrpc_telemetry::rss_bytes().unwrap_or(0) as f64 / 1_048_576.0,
@@ -635,13 +788,10 @@ impl ProcessServer {
       // one without a debug build.
       let mut first_tick = true;
       // Tick reuse buffers, owned by this loop: the process list backing,
-      // every `Exec` slot and the read scratch survive across ticks, so a
-      // warm tick allocates nothing per process (see `read_exec_into`).
-      // `match_scratch` follows the same pattern one level down: the lowercased path and
-      // the normalized folder refill per classification.
+      // every `Exec` slot and both read scratches survive across ticks, so
+      // a warm tick allocates nothing per process (see `read_exec_into`).
       let mut tick_processes: Vec<Exec> = Vec::new();
-      let mut tick_scratch = ExecScratch::default();
-      let mut match_scratch = MatchScratch::default();
+      let mut tick_scratch = ScanScratch::default();
       // Run the process scan repeatedly (base cadence, stretched while idle)
       loop {
         // Directed shutdown: the unpark below only shortens the cadence
@@ -651,11 +801,7 @@ impl ProcessServer {
           break;
         }
         *clone.last_scan.lock().unwrap_or_else(|e| e.into_inner()) = std::time::Instant::now();
-        let mut detected = match clone.scan_for_processes(
-          &mut tick_processes,
-          &mut tick_scratch,
-          &mut match_scratch,
-        ) {
+        let mut detected = match clone.scan_for_processes(&mut tick_processes, &mut tick_scratch) {
           Ok(detected) => detected,
           Err(err) => {
             tracing::warn!(
@@ -716,15 +862,32 @@ impl ProcessServer {
         }
         // Track live game pids for the proc-events watcher: only THEIR
         // exits wake us early (a build storm's exits never cause a scan).
-        // Wholesale replace (not merge): a watcher insert racing this
-        // write can be dropped, but the next tick re-derives it from the
-        // live table while the game still runs — and a lost EXIT entry
-        // heals the same way. Bounded staleness (≤1 tick), no growth,
-        // no liveness probe per entry.
-        *clone
-          .detected_pids
-          .lock()
-          .unwrap_or_else(|e| e.into_inner()) = detected.iter().map(|game| game.pid).collect();
+        // Clear and refill (not wholesale replace): the set is rebuilt
+        // from the live table every tick anyway, so swapping in a fresh
+        // `HashSet` allocated a new table per tick for identical content.
+        // A watcher insert racing this write can be dropped, but the next
+        // tick re-derives it from the live table while the game still
+        // runs — and a lost EXIT entry heals the same way. Bounded
+        // staleness (≤1 tick), no growth, no liveness probe per entry.
+        //
+        // Capacity is kept honest too: after a process spike the table
+        // would otherwise sit at its high-water bucket count forever.
+        {
+          let mut pids = clone
+            .detected_pids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+          pids.clear();
+          pids.extend(detected.iter().map(|game| game.pid));
+          let target = if pids.capacity() > 64 && pids.len() * 4 < pids.capacity() {
+            (pids.len() * 2).max(16)
+          } else {
+            0
+          };
+          if target != 0 {
+            pids.shrink_to(target);
+          }
+        }
         // Forward on change only (see `last_emitted`): identical tables
         // are already fully represented downstream (`note_scan` entries
         // persist, `last_process` dedups), so skipping them changes
@@ -742,59 +905,26 @@ impl ProcessServer {
           .scan_dirty
           .swap(false, std::sync::atomic::Ordering::AcqRel);
         let emit = changed || forced;
-        // Slots vanished while others remain (A+B -> B): clear exactly
-        // those before republishing the rest. The empty-table clear below
-        // only fires when nothing remains, so without this the removed
-        // game would ghost while another continues.
-        let removed = if emit {
-          removed_slots(&last_emitted, &snapshot)
+        // Advance only when the tick emits: `advance_snapshot_lane` computes
+        // the delta from the recorded table, delivers it, and records the new
+        // one only when the delivery is complete.
+        let delivery = if emit {
+          advance_snapshot_lane(&mut last_emitted, snapshot, |removed| {
+            deliver_snapshot(&clone.event_sender, removed, &detected, detected.is_empty())
+          })
         } else {
-          Vec::new()
+          SnapshotDelivery::Complete
         };
-        if emit {
-          last_emitted = snapshot;
-        }
-        // A failed send means the receiver is gone (shutdown): the channel
-        // is unbounded, so there is no transient backpressure to retry.
-        // End the thread instead of spinning `scan_for_processes` forever.
-        if emit && !removed.is_empty() {
-          for (id, pid) in removed {
-            if should_exit_on_send_error(
-              &clone
-                .event_sender
-                .send(ProcessDetectedEvent::removed(id.into_boxed_str(), pid)),
-            ) {
-              tracing::warn!("[Process Scanner] Event receiver gone, shutting down scan");
-              return;
-            }
-          }
-        }
-        // Forward the changed table, one event per slot. Downstream
-        // publishes per app id and dedups repeats, so co-running games
-        // each own their card instead of only the first.
-        if emit && !detected.is_empty() {
-          for game in &detected {
-            if should_exit_on_send_error(
-              &clone
-                .event_sender
-                .send(ProcessDetectedEvent::detected(game.clone())),
-            ) {
-              tracing::warn!("[Process Scanner] Event receiver gone, shutting down scan");
-              return;
-            }
-          }
-        }
-
-        // If there are no detected processes, send an empty message —
-        // but only on the transition into emptiness (the bridge clears
-        // once and then ignores further nulls the same way). A forced
-        // emission of the empty table carries the EXEC-hole clear.
-        if emit
-          && detected.is_empty()
-          && should_exit_on_send_error(&clone.event_sender.send(ProcessDetectedEvent::cleared()))
-        {
+        if matches!(delivery, SnapshotDelivery::Closed) {
           tracing::warn!("[Process Scanner] Event receiver gone, shutting down scan");
           return;
+        }
+        if matches!(delivery, SnapshotDelivery::Shed) {
+          // The consumer still holds the previous table: `advance_snapshot_lane`
+          // did not record this one, so the next tick re-emits it whole.
+          // Nothing is lost, because `last_emitted` was never advanced past
+          // an undelivered tick.
+          tracing::debug!("[Process Scanner] Shed a snapshot event; next tick re-emits");
         }
 
         // Idle backoff: consecutive empty ticks stretch the cadence
@@ -833,17 +963,231 @@ impl ProcessServer {
 
     // Event-driven fast path (Linux): EXEC classifies one process at once,
     // EXIT of a tracked game wakes the scan above. Best-effort — setup
-    // failure keeps pure polling, silently.
+    // failure keeps pure polling, silently. The watcher's gauge stays
+    // inside: the census reads it directly, so nothing is plumbed up.
     #[cfg(target_os = "linux")]
     if self.enable_proc_events {
+      // Stored, not returned: the census reads it straight off the server.
       let gauge = spawn_proc_watcher(self);
-      *watch_slot
+      *self
+        .watch_gauge
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = gauge;
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(gauge);
     } else {
       tracing::info!(
         "[Process Scanner] proc-events watcher disabled by configuration, polling only"
       );
+    }
+  }
+}
+
+#[cfg(test)]
+mod exec_lane_tests {
+  use super::super::types::ScannedEntry;
+  use super::*;
+
+  /// A hit the channel accepts is published.
+  #[test]
+  fn an_accepted_exec_hit_is_published() {
+    let (tx, _rx) = rsrpc_telemetry::QueueGauge::pair::<ProcessDetectedEvent>();
+    assert!(
+      publish_exec_hit(&tx, placeholder_hit(), EXEC_EVENT_CAP),
+      "an accepted hit is published"
+    );
+  }
+
+  /// The semantic that makes the EXEC lane safe to bound: a shed is not an
+  /// error.
+  ///
+  /// The caller marks `scan_dirty` *before* publishing, so a lost fast-path
+  /// event costs one poll interval and then the whole table is re-emitted.
+  /// Reporting "published" for a shed is what lets the loop carry on
+  /// instead of tearing the thread down over a dropped best-effort hint.
+  #[test]
+  fn a_shed_exec_hit_is_not_an_error() {
+    let (tx, rx) = rsrpc_telemetry::QueueGauge::pair::<ProcessDetectedEvent>();
+    let cap = EXEC_EVENT_CAP;
+    // Saturate the backlog without draining, so the next send sheds.
+    while matches!(
+      tx.send_checked(ProcessDetectedEvent::Cleared, cap),
+      SendChecked::Sent
+    ) {}
+    assert!(
+      publish_exec_hit(&tx, placeholder_hit(), cap),
+      "a shed best-effort hint must not read as a failure"
+    );
+    assert!(
+      tx.gauge().dropped_total() > 0,
+      "the shed must be counted, so the census can see a backlogged lane"
+    );
+    drop(rx);
+  }
+
+  /// A gone receiver is shutdown: the caller must stop, not spin.
+  #[test]
+  fn a_gone_receiver_stops_the_exec_lane() {
+    let (tx, rx) = rsrpc_telemetry::QueueGauge::pair::<ProcessDetectedEvent>();
+    drop(rx);
+    assert!(
+      !publish_exec_hit(&tx, placeholder_hit(), EXEC_EVENT_CAP),
+      "a gone receiver is shutdown, not a shed"
+    );
+  }
+
+  /// One placeholder hit (pid/entry are irrelevant to the lane).
+  fn placeholder_hit() -> ScannedHit {
+    ScannedHit {
+      entry: Arc::new(ScannedEntry {
+        id: "1".into(),
+        name: "G".into(),
+        executables: Box::new([]),
+        steam_ids: Box::new([]),
+        aliases: Box::new([]),
+      }),
+      pid: 1,
+      start: 0,
+      source: rsrpc_types::DetectSource::Automaton,
+    }
+  }
+}
+
+#[cfg(test)]
+mod snapshot_lane_tests {
+  use super::super::types::ScannedEntry;
+  use super::*;
+  use rsrpc_types::DetectSource;
+
+  /// A delivery the channel accepts must read as complete, so the caller
+  /// may record the new table.
+  #[test]
+  fn accepted_events_report_a_complete_delivery() {
+    let (tx, _rx) = rsrpc_telemetry::QueueGauge::pair::<ProcessDetectedEvent>();
+    assert_eq!(
+      deliver_snapshot(&tx, &[], &[placeholder_hit()], true),
+      SnapshotDelivery::Complete,
+      "an empty channel accepts the tick's events"
+    );
+  }
+  /// The regression this guards: when the channel sheds, the delivery must
+  /// NOT read as complete.
+  ///
+  /// The old order recorded the new table *before* sending, so a lost
+  /// event was never re-sent — the consumer kept a table it had already
+  /// been told to forget, and the next tick's delta was computed against
+  /// the new one. That is the ghost clear (and the ghost card).
+  #[test]
+  fn a_shed_event_never_reports_complete() {
+    let (tx, rx) = rsrpc_telemetry::QueueGauge::pair::<ProcessDetectedEvent>();
+    // Saturate the backlog with real events, no receiver draining.
+    let cap = SNAPSHOT_EVENT_CAP;
+    while matches!(
+      tx.send_checked(ProcessDetectedEvent::Cleared, cap),
+      SendChecked::Sent
+    ) {}
+    let hit = placeholder_hit();
+    let delivered = deliver_snapshot(&tx, &[], &[hit], true);
+    assert_eq!(
+      delivered,
+      SnapshotDelivery::Shed,
+      "a shed event must be reported, never treated as delivered"
+    );
+    assert!(
+      matches!(delivered, SnapshotDelivery::Shed),
+      "redundant but explicit: only a shed delivery keeps the previous table"
+    );
+    drop(rx);
+  }
+
+  /// A gone receiver is shutdown, not a shed: the caller must end the
+  /// thread rather than re-emit forever.
+  #[test]
+  fn a_gone_receiver_reports_closed() {
+    let (tx, rx) = rsrpc_telemetry::QueueGauge::pair::<ProcessDetectedEvent>();
+    drop(rx);
+    assert_eq!(
+      deliver_snapshot(&tx, &[], &[placeholder_hit()], true),
+      SnapshotDelivery::Closed,
+      "a gone receiver is shutdown, not a shed"
+    );
+  }
+
+  /// The ordering the whole fix is about: a shed delivery must leave the
+  /// recorded table untouched.
+  ///
+  /// The old code assigned `last_emitted` *before* sending, so a lost
+  /// event was never re-sent and the consumer was left with a table it
+  /// had already been told to forget. This test drives the loop's own
+  /// advance step with an injected delivery, so it fails on that order —
+  /// the earlier tests only covered `deliver_snapshot`, and the injection
+  /// slipped straight past them.
+  #[test]
+  fn a_shed_tick_keeps_the_recorded_table() {
+    let mut recorded: Vec<(String, u64)> = vec![("a".into(), 1)];
+    let snapshot: Vec<(String, u64)> = vec![("b".into(), 2)];
+
+    let delivery = advance_snapshot_lane(&mut recorded, snapshot.clone(), |removed| {
+      assert_eq!(
+        removed,
+        &[("a".to_string(), 1)],
+        "delta from the recorded table"
+      );
+      SnapshotDelivery::Shed
+    });
+
+    assert_eq!(delivery, SnapshotDelivery::Shed);
+    assert_eq!(
+      recorded,
+      vec![("a".to_string(), 1)],
+      "a shed tick must not advance the recorded table"
+    );
+  }
+
+  /// The mirror image: a complete delivery records the new table, so the
+  /// next tick's delta starts from what the consumer actually holds.
+  #[test]
+  fn a_complete_tick_records_the_new_table() {
+    let mut recorded: Vec<(String, u64)> = vec![("a".into(), 1)];
+    let snapshot: Vec<(String, u64)> = vec![("b".into(), 2)];
+
+    let delivery = advance_snapshot_lane(&mut recorded, snapshot.clone(), |_| {
+      SnapshotDelivery::Complete
+    });
+
+    assert_eq!(delivery, SnapshotDelivery::Complete);
+    assert_eq!(recorded, snapshot, "a delivered tick must be recorded");
+  }
+
+  /// A shed delivery must leave the delta reproducible: with the previous
+  /// table still in place, the next tick computes the same removals
+  /// again. That is what makes "re-emit next tick" a repair instead of a
+  /// duplicate storm.
+  #[test]
+  fn a_shed_tick_recomputes_the_same_delta() {
+    let previous = vec![("a".to_string(), 1u64), ("b".to_string(), 2)];
+    let current = vec![("a".to_string(), 1u64)];
+    let mut first = removed_slots(&previous, &current);
+    let mut second = removed_slots(&previous, &current);
+    first.sort();
+    second.sort();
+    assert_eq!(
+      first, second,
+      "the delta must be reproducible when re-emitted"
+    );
+  }
+
+  /// One placeholder hit for the delivery tests (pid/entry are irrelevant).
+  fn placeholder_hit() -> ScannedHit {
+    ScannedHit {
+      entry: Arc::new(ScannedEntry {
+        id: "1".into(),
+        name: "G".into(),
+        executables: Box::new([]),
+        steam_ids: Box::new([]),
+        aliases: Box::new([]),
+      }),
+      pid: 1,
+      start: 0,
+      source: DetectSource::Automaton,
     }
   }
 }

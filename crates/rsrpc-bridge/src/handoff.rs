@@ -7,8 +7,9 @@
 //! comes from that same owner.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use rsrpc_types::AppId;
+use rsrpc_types::{AppId, DetectSource};
 
 /// One process-detected game, remembered so a clear can hand the slot back
 /// to generic detection (the scanner only emits on *changes*).
@@ -16,15 +17,17 @@ use rsrpc_types::AppId;
 pub struct ScannedGame {
   /// Discord application id of the detected game.
   pub id: AppId,
-  /// Human-readable game name for logs and generic cards.
-  pub name: String,
+  /// Human-readable game name for logs and generic cards. Refcounted
+  /// like the sibling `id`: the resume/clear chain clones it per hop, and
+  /// a deep `String` copy there was ~3 of the 4 allocations per detection.
+  pub name: Arc<str>,
   /// OS pid of the detected process.
   pub pid: u64,
   /// Process start time (Unix seconds) for card timestamps.
   pub start: u64,
-  /// Which matcher classified the process (log string form): travels to
-  /// generic payloads and snapshots for detection provenance.
-  pub source: String,
+  /// Which matcher classified the process: travels to generic payloads
+  /// and snapshots for detection provenance. `Copy`, so a hop is free.
+  pub source: DetectSource,
   /// Process start as epoch millis, when the detector could read it:
   /// snapshot latency is measured against this, never re-read.
   pub process_start_ms: Option<u64>,
@@ -294,10 +297,10 @@ mod tests {
   fn game(id: &str) -> ScannedGame {
     ScannedGame {
       id: AppId::from(id),
-      name: "Game".to_string(),
+      name: Arc::from("Game"),
       pid: 1234,
       start: 0,
-      source: "automaton".to_string(),
+      source: DetectSource::Automaton,
       process_start_ms: None,
     }
   }
@@ -384,10 +387,10 @@ mod tests {
 
     handoff.note_scan(Some(ScannedGame {
       id: AppId::from("2"),
-      name: "Other".to_string(),
+      name: Arc::from("Other"),
       pid: 9,
       start: 0,
-      source: "automaton".to_string(),
+      source: DetectSource::Automaton,
       process_start_ms: None,
     }));
     // A different game on screen: not ours to resume.

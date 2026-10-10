@@ -20,14 +20,16 @@ impl ProcessServer {
   /// store are one critical section under the writer lock, so concurrent
   /// refreshes and other custom edits can never overwrite each other
   /// from a stale snapshot. Scan readers stay lock-free (`ArcSwap`).
-  fn edit_custom(&self, edit: impl FnOnce(Vec<Arc<ScannedEntry>>) -> Vec<Arc<ScannedEntry>>) {
+  fn edit_custom(&self, edit: impl FnOnce(&[Arc<ScannedEntry>]) -> Vec<Arc<ScannedEntry>>) {
     let _writer = self.writer_lock.lock().unwrap_or_else(|e| e.into_inner());
     tracing::info!(
       "[Process Scanner] Updating Aho-Corasick patterns for custom detectable activities..."
     );
     let current = self.detectables.load_full();
-    let custom = edit(current.custom.clone());
-    let next = match build_bundle(current.list.clone(), custom) {
+    // Borrow the override list instead of cloning it, and clone the main
+    // list as a refcount bump rather than walking ~24k entries.
+    let custom = edit(&current.custom);
+    let next = match build_bundle(Arc::clone(&current.list), custom.into()) {
       Ok(next) => Arc::new(next),
       Err(e) => {
         tracing::warn!(
@@ -73,8 +75,8 @@ impl ProcessServer {
       .into_iter()
       .map(|entry| Arc::new(ScannedEntry::from_owned(entry)))
       .collect();
-    let detectable = slim;
-    let custom = self.detectables.load().custom.clone();
+    let detectable: Arc<[Arc<ScannedEntry>]> = slim.into();
+    let custom = Arc::clone(&self.detectables.load().custom);
     let next = match build_bundle(detectable, custom) {
       Ok(next) => Arc::new(next),
       Err(e) => {
@@ -119,24 +121,31 @@ impl ProcessServer {
     // Append to the custom list, since that's what is actually scanned.
     // Full public entries convert once to the slim scanner form here,
     // moving (not cloning) their strings.
-    self.edit_custom(|mut custom| {
-      custom.extend(
+    self.edit_custom(|custom| {
+      // The override list is small by construction, so copying it here is
+      // fine; the ~24k-entry main list is never copied on this path.
+      let mut next = Vec::with_capacity(custom.len() + detectable.len());
+      next.extend(custom.iter().cloned());
+      next.extend(
         detectable
           .into_iter()
           .map(|entry| Arc::new(ScannedEntry::from_owned(entry))),
       );
-      custom
+      next
     });
   }
 
   /// Drop a custom override by display name, rebuilding the generation.
   pub fn remove_detectable_by_name(&self, name: &str) {
-    self.edit_custom(|mut custom| {
-      custom.retain(|x| {
-        let current: &str = &x.name;
-        current != name
-      });
+    self.edit_custom(|custom| {
       custom
+        .iter()
+        .filter(|entry| {
+          let current: &str = &entry.name;
+          current != name
+        })
+        .cloned()
+        .collect()
     });
   }
 
@@ -153,5 +162,87 @@ impl ProcessServer {
   #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
   pub fn bundle(&self) -> Arc<DetectablesBundle> {
     self.detectables.load_full()
+  }
+}
+
+#[cfg(test)]
+mod arc_generation_tests {
+  use super::*;
+  use crate::refresh::RefreshConfig;
+  use crate::types::ProcessEventListeners;
+  use std::sync::Arc;
+
+  /// A server whose current generation is observed across a custom edit:
+  /// the main list must survive as the same allocation, not be re-walked.
+  fn server() -> ProcessServer {
+    let (tx, _rx) = rsrpc_telemetry::QueueGauge::pair();
+    ProcessServer::new_with_custom(
+      vec![],
+      vec![],
+      tx,
+      ProcessEventListeners::default(),
+      RefreshConfig::default(),
+      vec![],
+    )
+  }
+
+  fn activity(id: &str) -> DetectableActivity {
+    serde_json::from_value(serde_json::json!({
+      "id": id,
+      "name": format!("Game {id}"),
+      "hook": false,
+      "executables": [{"name": format!("{id}.exe"), "is_launcher": false, "os": "win32"}],
+      "third_party_skus": [],
+      "aliases": []
+    }))
+    .expect("fixture parses")
+  }
+
+  /// A custom-append rebuild carries the main list over as a refcount bump:
+  /// the same allocation is shared by the old and new generation, so a scan
+  /// tick that loaded the old one keeps reading valid entries and the rebuild
+  /// never walks ~24k of them.
+  #[test]
+  fn custom_rebuild_shares_the_main_list() {
+    let server = server();
+    // Seed a real main list, not the empty one `server()` builds.
+    let main: Vec<DetectableActivity> = (0..64).map(|i| activity(&i.to_string())).collect();
+    server.update_main_detectables(main);
+
+    let before = server.detectables.load();
+    let before_ptr = Arc::as_ptr(&before.list);
+    let before_len = before.list.len();
+    assert!(before_len > 0, "main list should have entries");
+
+    // Append an override: this rebuilds the whole generation.
+    server.append_detectables(vec![activity("custom-1")]);
+
+    let after = server.detectables.load();
+    // Same allocation, not a copy: this is the whole point of the Arc.
+    assert_eq!(
+      Arc::as_ptr(&after.list),
+      before_ptr,
+      "main list was re-walked instead of shared"
+    );
+    assert_eq!(after.list.len(), before_len);
+    // And the override landed.
+    assert_eq!(after.custom.len(), 1);
+  }
+
+  /// Removing every override falls back to an empty custom list without
+  /// touching the main list either.
+  #[test]
+  fn remove_override_keeps_sharing_the_main_list() {
+    let server = server();
+    let main: Vec<DetectableActivity> = (0..8).map(|i| activity(&i.to_string())).collect();
+    server.update_main_detectables(main);
+    server.append_detectables(vec![activity("custom-x")]);
+
+    let before_ptr = Arc::as_ptr(&server.detectables.load().list);
+    server.remove_detectable_by_name("Game custom-x");
+    let after = server.detectables.load();
+
+    assert_eq!(Arc::as_ptr(&after.list), before_ptr, "main list re-copied");
+    assert!(after.custom.is_empty(), "override should be gone");
   }
 }

@@ -210,31 +210,6 @@ impl<T> GaugeSender<T> {
   }
 }
 
-/// Common blocking-receive shape for the raw bounded receiver and the
-/// gauged one, so one loop serves both legs without duplicating its body.
-pub trait RecvQueue<T> {
-  /// Blocking receive.
-  ///
-  /// # Errors
-  ///
-  /// Returns [`mpsc::RecvError`] once every sender is gone (shutdown).
-  fn recv_q(&self) -> Result<T, mpsc::RecvError>;
-}
-
-impl<T> RecvQueue<T> for mpsc::Receiver<T> {
-  /// Plain blocking receive (no gauge to update).
-  fn recv_q(&self) -> Result<T, mpsc::RecvError> {
-    self.recv()
-  }
-}
-
-impl<T> RecvQueue<T> for GaugeReceiver<T> {
-  /// Blocking receive that also releases the backlog count.
-  fn recv_q(&self) -> Result<T, mpsc::RecvError> {
-    self.recv()
-  }
-}
-
 /// `mpsc::Receiver` that releases its backlog count on every receive.
 pub struct GaugeReceiver<T> {
   inner: mpsc::Receiver<T>,
@@ -288,6 +263,17 @@ impl<T> Drop for GaugeReceiver<T> {
   }
 }
 
+/// Page size in bytes, or `None` when `sysconf` refuses. Linux only;
+/// elsewhere there is no `/proc` to read, so callers report absence.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn page_size_bytes() -> Option<u64> {
+  // SAFETY: `sysconf` with `_SC_PAGESIZE` takes no pointer and has no
+  // failure mode beyond returning -1.
+  let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+  (page > 0).then_some(page as u64)
+}
+
 /// Resident set size in bytes, Linux only (`/proc/self/statm` resident
 /// field × page size). `None` elsewhere or when the kernel won't tell.
 #[cfg(target_os = "linux")]
@@ -295,13 +281,51 @@ impl<T> Drop for GaugeReceiver<T> {
 pub fn rss_bytes() -> Option<u64> {
   let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
   let resident_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
-  // SAFETY: `sysconf` with `_SC_PAGESIZE` takes no pointer and has no
-  // failure mode beyond returning -1.
-  let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-  if page <= 0 {
-    return None;
+  resident_pages.checked_mul(page_size_bytes()?)
+}
+
+/// Resident set high-water mark in bytes, Linux only (`VmHWM` from
+/// `/proc/self/status`).
+///
+/// The current RSS says where the process is now; this says the peak it
+/// ever reached. A memory change is not considered verified without both,
+/// because a floor that stays put while the peak climbs is a growth the
+/// current value cannot show. `None` elsewhere or when unreadable.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn rss_hwm_bytes() -> Option<u64> {
+  for line in std::fs::read_to_string("/proc/self/status").ok()?.lines() {
+    if let Some(rest) = line.strip_prefix("VmHWM:") {
+      let kib: u64 = rest.split_whitespace().next()?.parse().ok()?;
+      return kib.checked_mul(1024);
+    }
   }
-  resident_pages.checked_mul(page as u64)
+  None
+}
+
+/// Live vs free heap bytes from the allocator (glibc `mallinfo2`):
+/// distinguishes live objects from retained arenas — `live` growing is a
+/// real growth, `free` growing with a flat RSS floor is the allocator
+/// holding pages.
+///
+/// `None` off glibc-Linux (musl, macOS, Windows), where the census simply
+/// carries no split. Permanent telemetry, not DIAG: one line per census,
+/// zero retained state.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[must_use]
+pub fn heap_numbers() -> Option<(u64, u64)> {
+  // SAFETY: `mallinfo2` only reads allocator statistics; it neither
+  // allocates nor mutates anything.
+  let info = unsafe { libc::mallinfo2() };
+  #[allow(clippy::cast_possible_truncation)]
+  Some((info.uordblks as u64, info.fordblks as u64))
+}
+
+/// No `mallinfo2` off glibc: report absence rather than guessing.
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+#[must_use]
+pub fn heap_numbers() -> Option<(u64, u64)> {
+  None
 }
 
 /// Non-Linux targets have no cheap self-RSS source: report absence and let
@@ -312,13 +336,30 @@ pub fn rss_bytes() -> Option<u64> {
   None
 }
 
-/// One resource census: client counts plus queue depths.
+/// No `/proc` off Linux: report absence so the census renders `n/a`
+/// instead of guessing.
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn rss_hwm_bytes() -> Option<u64> {
+  None
+}
+
+/// One resource census: client counts, queue depths and memory.
 ///
 /// Constructible: census owners (the daemon core) build one per sample.
 #[derive(Debug, Clone)]
 pub struct StatsSnapshot {
   /// Resident bytes (`None` off-Linux or when unreadable).
   pub rss_bytes: Option<u64>,
+  /// Resident high-water mark, the peak the process ever reached. The
+  /// current value alone cannot show a floor that holds while the peak
+  /// climbs, which is exactly the shape a ratchet takes.
+  pub rss_hwm_bytes: Option<u64>,
+  /// Live vs free heap bytes from the allocator, read as one sample.
+  /// `None` off glibc-Linux. `live` growing is a real growth; `free`
+  /// growing with a flat RSS floor is the allocator holding pages — the
+  /// pair is what separates the two.
+  pub heap: Option<(u64, u64)>,
   /// JSON bridge consumers.
   pub bridge_json: usize,
   /// MessagePack bridge consumers.
@@ -331,20 +372,30 @@ pub struct StatsSnapshot {
   pub proc_depth: usize,
   /// Game-event queue depth.
   pub ws_depth: usize,
+  /// Proc-events the bounded watch queue shed since boot. Diagnostic
+  /// counterpart to `watch_depth`: depth says how deep the backlog is,
+  /// this says how much was dropped — a non-zero value means the watcher
+  /// fell behind, which depth alone can hide (the queue recovers to a
+  /// steady depth while events are silently lost).
+  pub shed_watch: usize,
 }
 
 /// Render the census line. Pure function so tests pin the shape.
 #[must_use]
 pub fn format_resource_stats(reason: &str, snapshot: &StatsSnapshot) -> String {
   format!(
-    "[rsrpc] stats ({reason}): rss={} bridge=json:{}+msgpack:{} ws={} queues=watch:{}+proc:{}+ws:{}",
+    "[rsrpc] stats ({reason}): rss={}(hwm {}) heap=live {}/free {} bridge=json:{}+msgpack:{} ws={} queues=watch:{}+proc:{}+ws:{} shed:watch:{}",
     snapshot.rss_mb(),
+    snapshot.rss_hwm_mb(),
+    snapshot.heap_live_mb(),
+    snapshot.heap_free_mb(),
     snapshot.bridge_json,
     snapshot.bridge_msgpack,
     snapshot.ws,
     snapshot.watch_depth,
     snapshot.proc_depth,
     snapshot.ws_depth,
+    snapshot.shed_watch,
   )
 }
 
@@ -354,6 +405,30 @@ impl StatsSnapshot {
     self
       .rss_bytes
       .map(|bytes| format!("{:.1}MB", bytes as f64 / 1_048_576.0))
+      .unwrap_or_else(|| "n/a".to_string())
+  }
+
+  /// Resident high-water mark as `12.3MB`, or `n/a` when unreadable.
+  fn rss_hwm_mb(&self) -> String {
+    self
+      .rss_hwm_bytes
+      .map(|bytes| format!("{:.1}MB", bytes as f64 / 1_048_576.0))
+      .unwrap_or_else(|| "n/a".to_string())
+  }
+
+  /// Live heap as `12.3MB`, or `n/a` where the allocator will not say.
+  fn heap_live_mb(&self) -> String {
+    self
+      .heap
+      .map(|(live, _)| format!("{:.1}MB", live as f64 / 1_048_576.0))
+      .unwrap_or_else(|| "n/a".to_string())
+  }
+
+  /// Free heap still held by the allocator, or `n/a`.
+  fn heap_free_mb(&self) -> String {
+    self
+      .heap
+      .map(|(_, free)| format!("{:.1}MB", free as f64 / 1_048_576.0))
       .unwrap_or_else(|| "n/a".to_string())
   }
 }

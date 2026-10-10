@@ -7,12 +7,36 @@
 //! caller-owned reuse buffers.
 
 use super::runtime::ScanGuard;
-use super::scan::{ExecScratch, MatchScratch};
-// Linux-only: the /proc reader does not exist on other targets.
+use super::scan::ScanScratch;
+// Linux-only: the /proc readers do not exist on other targets.
 #[cfg(target_os = "linux")]
-use super::scan::read_exec_into;
+use super::scan::{ExecScratch, read_exec_into};
 use super::server::ProcessServer;
 use super::types::{Exec, ProcessScanState, ScannedHit};
+
+/// Parse a `/proc` entry name into its pid: ASCII digits only, so a
+/// non-UTF-8 or non-numeric name never panics and never allocates.
+///
+/// `OsStr::as_encoded_bytes` (stable since 1.74) hands back the bytes
+/// directly; the previous `to_string_lossy().parse()` allocated a `String`
+/// and `entry.path().file_name()` allocated a `PathBuf`, both per entry.
+///
+/// Only the `/proc` sweep calls it, so it is dead weight on targets that
+/// list processes through `sysinfo`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_proc_pid(name: &[u8]) -> Option<u64> {
+  if name.is_empty() {
+    return None;
+  }
+  let mut pid: u64 = 0;
+  for &byte in name {
+    if !byte.is_ascii_digit() {
+      return None;
+    }
+    pid = pid.checked_mul(10)?.checked_add(u64::from(byte - b'0'))?;
+  }
+  Some(pid)
+}
 
 impl ProcessServer {
   /// Whether a tracked game's EXIT should wake the scan loop early.
@@ -25,12 +49,13 @@ impl ProcessServer {
   /// 0.76s effective cadence instead of 5s during NFS).
   #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
   pub fn should_wake_on_exit(&self, pid: u64) -> bool {
-    if !self
-      .detected_pids
-      .lock()
-      .unwrap_or_else(|e| e.into_inner())
-      .contains(&pid)
-    {
+    // One guard for both the membership check and the removal: the pid is
+    // consumed by an actual wake, so a follow-up EXIT of the same game
+    // must still be able to wake — and taking the lock twice re-opened a
+    // window where another EXIT could remove it in between, silently
+    // dropping that wake.
+    let mut pids = self.detected_pids.lock().unwrap_or_else(|e| e.into_inner());
+    if !pids.contains(&pid) {
       return false;
     }
     let due = self
@@ -41,11 +66,7 @@ impl ProcessServer {
       .as_secs()
       >= 1;
     if due {
-      self
-        .detected_pids
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&pid);
+      pids.remove(&pid);
     }
     due
   }
@@ -98,11 +119,13 @@ impl ProcessServer {
   ) -> rsrpc_protocol::error::Result<usize> {
     use std::fs;
 
+    // `/proc/<pid>` names are ASCII digits. Reading them as raw bytes
+    // avoids two allocations per entry (`to_string_lossy`'s String and
+    // `entry.path()`'s PathBuf) on a path that runs ~1k times per tick.
+    // Anything non-numeric is skipped, never fatal.
     let proc_list = fs::read_dir("/proc")?.filter(|e| {
       if let Ok(entry) = e {
-        // Only if we can parse this as a number (lossy: /proc names are
-        // always ASCII pids; anything else is skipped, never fatal).
-        return entry.file_name().to_string_lossy().parse::<u64>().is_ok();
+        return parse_proc_pid(entry.file_name().as_encoded_bytes()).is_some();
       }
 
       false
@@ -111,6 +134,13 @@ impl ProcessServer {
     // slot count. Slots refill in place below, so a warm tick reuses
     // every string buffer; `push` only grows past the high-water mark.
     // Tail slots past `filled` keep their buffers for the next rise.
+    //
+    // The one exception: a *sustained* drop. A build storm's spike would
+    // otherwise leave the slot list (and every tail slot's string buffers)
+    // at high-water for the rest of the session — RSS stable in content
+    // but pinned by one moment. After `SLOT_LOW_TICKS` consecutive ticks
+    // under half occupancy the surplus is released, so the next rise pays
+    // for it again. A single spike never reaches the threshold.
     let mut filled = 0usize;
 
     for entry in proc_list {
@@ -119,14 +149,7 @@ impl ProcessServer {
       let Ok(entry) = entry else {
         continue;
       };
-      let path = entry.path();
-
-      let Ok(pid) = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default()
-        .parse::<u64>()
-      else {
+      let Some(pid) = parse_proc_pid(entry.file_name().as_encoded_bytes()) else {
         continue;
       };
       // Same single-pid reader as the EXEC fast path, refilling a reused
@@ -140,14 +163,26 @@ impl ProcessServer {
         filled += 1;
       }
     }
+    // Adaptive release of surplus slots (see the note at `filled`): only
+    // after a sustained drop, never on a single tick.
+    if filled * 2 < processes.len() {
+      scratch.low_ticks = scratch.low_ticks.saturating_add(1);
+      if scratch.low_ticks >= super::scan::SLOT_LOW_TICKS {
+        processes.truncate(filled);
+        processes.shrink_to(filled);
+        scratch.low_ticks = 0;
+      }
+    } else {
+      scratch.low_ticks = 0;
+    }
     Ok(filled)
   }
 
   #[hotpath::measure]
   /// One full process sweep, classifying every process against the current
-  /// generation bundle. `processes` + `exec_scratch` are caller-owned
-  /// reuse buffers (the scan loop keeps them across ticks; one-shot
-  /// callers pass throwaways): a warm tick allocates nothing per process.
+  /// generation bundle. `processes` + `scratch` are caller-owned reuse
+  /// buffers (the scan loop keeps them across ticks; one-shot callers pass
+  /// throwaways): a warm tick allocates nothing per process.
   /// On non-Linux the list still comes from `sysinfo` (scratch unused).
   pub fn scan_for_processes(
     &self,
@@ -155,8 +190,7 @@ impl ProcessServer {
     // fresh and this param is only carried for a uniform signature.
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables, clippy::ptr_arg))]
     processes: &mut Vec<Exec>,
-    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] exec_scratch: &mut ExecScratch,
-    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] match_scratch: &mut MatchScratch,
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] scratch: &mut ScanScratch,
   ) -> rsrpc_protocol::error::Result<Vec<ScannedHit>> {
     #[cfg(not(target_os = "linux"))]
     let processes = self.process_list()?;
@@ -164,7 +198,7 @@ impl ProcessServer {
     let processes = processes.as_slice();
     #[cfg(target_os = "linux")]
     let processes = {
-      let filled = ProcessServer::process_list_into(processes, exec_scratch)?;
+      let filled = ProcessServer::process_list_into(processes, &mut scratch.exec_scratch)?;
       &processes[..filled]
     };
 
@@ -199,7 +233,7 @@ impl ProcessServer {
     // nothing per process at steady state (see path_variants_into).
     let mut variant_bufs: [String; 5] = Default::default();
 
-    let mut detected_list: Vec<ScannedHit> = processes
+    let detected_list: Vec<ScannedHit> = processes
       .iter()
       .filter_map(|process| {
         self.match_process(
@@ -208,7 +242,7 @@ impl ProcessServer {
           &mut variant_bufs,
           &mut reversed_path,
           &mut obs_open,
-          &mut *match_scratch,
+          scratch,
         )
       })
       .collect();
@@ -226,10 +260,49 @@ impl ProcessServer {
       })?(ProcessScanState { obs_open });
     }
 
-    detected_list.shrink_to_fit();
-
+    // No `shrink_to_fit` here: the list is transient (built and consumed
+    // within the tick), so forcing a realloc each scan only churns the
+    // allocator. Long-lived tables shrink in their own place (see the
+    // bundle build, which owns its tables for hours).
     tracing::debug!("[Process Scanner] Process scan complete");
 
     Ok(detected_list)
+  }
+}
+
+#[cfg(test)]
+mod proc_pid_tests {
+  use super::*;
+
+  /// Digits parse, including a long pid, without allocating a String or
+  /// a PathBuf per entry.
+  #[test]
+  fn proc_pid_parses_digits() {
+    assert_eq!(parse_proc_pid(b"1"), Some(1));
+    assert_eq!(parse_proc_pid(b"12345"), Some(12_345));
+    assert_eq!(parse_proc_pid(b"4294967294"), Some(u32::MAX as u64 - 1));
+    assert_eq!(parse_proc_pid(b""), None);
+  }
+
+  /// Non-numeric names are skipped, not fatal: `/proc` also holds
+  /// non-pid entries and this must never panic.
+  #[test]
+  fn proc_pid_rejects_non_numeric() {
+    assert_eq!(parse_proc_pid(b"self"), None);
+    assert_eq!(parse_proc_pid(b"cpuinfo"), None);
+    assert_eq!(parse_proc_pid(b"12a"), None);
+    assert_eq!(parse_proc_pid(b"a12"), None);
+    assert_eq!(parse_proc_pid(b"-1"), None);
+    assert_eq!(parse_proc_pid(b" 12"), None);
+    // Non-UTF-8 bytes are just non-digits.
+    assert_eq!(parse_proc_pid(&[0xff, 0xfe]), None);
+  }
+
+  /// An overflowing pid is rejected rather than wrapped: a wrapped value
+  /// would silently point at another process.
+  #[test]
+  fn proc_pid_rejects_overflow() {
+    assert_eq!(parse_proc_pid(b"18446744073709551616"), None);
+    assert_eq!(parse_proc_pid(b"99999999999999999999999"), None);
   }
 }

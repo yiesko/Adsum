@@ -9,6 +9,7 @@
 use std::io::{Read, Write};
 
 use rsrpc_protocol::commands;
+use rsrpc_types::AppId;
 use rsrpc_types::cmd::{ActivityCmd, ActivityCmdArgs};
 use rsrpc_types::user::RpcUser;
 use serde_json::Value;
@@ -23,20 +24,21 @@ pub trait IpcFacilitator: Send {
   /// Mark the handshake complete (cleared on close).
   fn set_handshake(&mut self, handshake: bool);
 
-  /// Client id from the handshake (routing enrichment for forwarded frames).
-  fn client_id(&self) -> String;
-  /// Remember the handshake client id.
-  fn set_client_id(&mut self, client_id: String);
+  /// Application id from the handshake (refcounted: the forward path
+  /// stamps it onto every command the connection sends).
+  fn client_id(&self) -> AppId;
+  /// Remember the handshake application id.
+  fn set_client_id(&mut self, client_id: AppId);
 
   /// Last pid seen on `SET_ACTIVITY` (clear attribution on abrupt close).
   fn pid(&self) -> u64;
   /// Remember the last pid.
   fn set_pid(&mut self, pid: u64);
 
-  /// Last nonce seen (echoed on the close-clear).
-  fn nonce(&self) -> String;
+  /// Last nonce seen (echoed on the close-clear), as the client sent it.
+  fn nonce(&self) -> Value;
   /// Remember the last nonce.
-  fn set_nonce(&mut self, nonce: String);
+  fn set_nonce(&mut self, nonce: Value);
 
   /// The `DISPATCH`/`READY` frame for new connections (reflects the
   /// current shared user, including `SET_USER` patches).
@@ -217,6 +219,33 @@ pub fn send_empty(sink: &EventSink, pid: u64) {
   sink.emit_clear(activity);
 }
 
+/// Floor for the reused read buffer.
+///
+/// Steady-state frames are a few hundred bytes; the payload cap is 1 MiB.
+/// A buffer that grew past the floor held it for an oversized frame, so
+/// the surplus is handed back rather than remembered for the connection's
+/// whole life — with one pump per connection, the cap would otherwise be
+/// paid per connection.
+const MESSAGE_BUFFER_FLOOR: usize = 64 * 1024;
+
+/// Hand back the read buffer's surplus capacity after a frame.
+///
+/// `String::clear()` keeps the capacity, which is what makes the buffer
+/// reusable across frames — and what makes one oversized frame stick for
+/// the rest of the connection. Releasing only past the floor keeps both
+/// properties: reuse for normal traffic, no permanent retention for a
+/// spike.
+///
+/// Clears first, because `shrink_to` never moves below the current
+/// length: releasing after a 1 MiB frame without clearing would be a
+/// no-op, which is what the first version of this did.
+fn release_message_capacity(message: &mut String) {
+  message.clear();
+  if message.capacity() > MESSAGE_BUFFER_FLOOR {
+    message.shrink_to(MESSAGE_BUFFER_FLOOR);
+  }
+}
+
 /// Pump one connection until close, error, or peer loss.
 ///
 /// `stream` is any synchronous duplex byte stream (socketpair, socket,
@@ -327,6 +356,11 @@ pub fn handle_stream(ipc: &mut dyn IpcFacilitator, stream: &mut (impl Read + Wri
         tracing::debug!("[ipc] Recieved pong");
       }
     }
+
+    // Reuse the buffer for the next frame, but do not remember a spike:
+    // one oversized payload would otherwise hold its capacity for the
+    // connection's whole life.
+    release_message_capacity(&mut message);
   }
 }
 
@@ -352,7 +386,7 @@ fn on_handshake(
     return true;
   }
   ipc.set_handshake(true);
-  ipc.set_client_id(data.client_id.clone());
+  ipc.set_client_id(AppId::from(data.client_id.as_str()));
   tracing::info!("[ipc] Client connected: {}", data.client_id);
   if let Err(err) = stream.write_all(&encode(PacketType::Frame, &ipc.user_payload())) {
     tracing::warn!("[ipc] Error sending connection response: {err}");
@@ -375,7 +409,7 @@ fn on_close(ipc: &mut dyn IpcFacilitator) {
       code: None,
       user_id: None,
     }),
-    nonce: Value::String(ipc.nonce()),
+    nonce: ipc.nonce(),
   };
   // Route through the clear path: a clean close must never be shed when
   // the queue is momentarily full, or the bridge keeps the card.
@@ -392,7 +426,7 @@ fn on_close(ipc: &mut dyn IpcFacilitator) {
   // Reset for a potential reuse of this facilitator; the server
   // listener itself is never rebound (see crate docs).
   ipc.set_handshake(false);
-  ipc.set_client_id(String::new());
+  ipc.set_client_id(AppId::from(""));
   ipc.set_pid(0);
 }
 
@@ -437,7 +471,7 @@ fn on_frame(ipc: &mut dyn IpcFacilitator, stream: &mut (impl Read + Write), mess
       }
     }
     "SET_ACTIVITY" => {
-      handle_set_activity(ipc, stream, message, &mut activity_cmd);
+      handle_set_activity(ipc, stream, activity_cmd);
     }
     "GET_USER" => {
       // Official response: the user object, or null when the id
@@ -505,13 +539,11 @@ fn on_frame(ipc: &mut dyn IpcFacilitator, stream: &mut (impl Read + Write), mess
   false
 }
 /// Handle a `SET_ACTIVITY` frame: forward to the event sink and echo the
-/// arRPC-shaped confirmation. `raw` is echoed back when the command has no
-/// usable body, so lock-step clients never hang.
+/// arRPC-shaped confirmation.
 fn handle_set_activity(
   ipc: &mut dyn IpcFacilitator,
   stream: &mut (impl Read + Write),
-  raw: &str,
-  activity_cmd: &mut ActivityCmd,
+  mut activity_cmd: ActivityCmd,
 ) {
   let args = match activity_cmd.args {
     Some(ref args) => args,
@@ -542,6 +574,26 @@ fn handle_set_activity(
   activity_cmd.application_id = Some(ipc.client_id());
   let pid = args.pid.unwrap_or_default();
   ipc.set_pid(pid);
+  // Read what the facilitator still needs before the command moves into
+  // the sink: the nonce is remembered for the close-clear echo and patch.
+  // Stored as the value the client sent, not its JSON *text*: re-wrapping
+  // that text double-encoded a string nonce (`"abc"` → `"\"abc\""`) and
+  // turned a null nonce into the literal `"null"`. Cloning, not taking —
+  // the command still forwards and its own nonce must survive the trip.
+  ipc.set_nonce(activity_cmd.nonce.clone());
+
+  // Fix once, up front: the reply echoes the fixed shape and the sink now
+  // receives the very same fixed command. The bridge re-runs `fix()` on
+  // its side anyway (`activity_fingerprint` and `cached_activity` both
+  // call it), so the serialized payload and the fingerprint are identical
+  // to what an unfixed forward would have produced.
+  activity_cmd.fix();
+  // `args` was validated above, so the reply always builds: the old
+  // `unwrap_or_else(|| raw.to_string())` fallback was unreachable, and with
+  // it the whole `raw` parameter the caller had to keep alive.
+  let response = commands::set_activity_response(&mut activity_cmd)
+    .expect("args was validated above, so the reply always builds");
+
   // Refused pids never reach the sink (echo below still flows, so
   // lock-step clients never hang); recording stays limited to forwarded
   // commands, keeping disconnect cleanup complete by construction.
@@ -549,18 +601,68 @@ fn handle_set_activity(
     tracing::debug!("[ipc] Past {MAX_TRACKED_PIDS} tracked pids, refusing pid {pid}");
   } else {
     ipc.note_published_pid(pid);
-    ipc.send_event(activity_cmd.clone());
+    // Moved, not cloned: nothing downstream needs the command again.
+    ipc.send_event(activity_cmd);
   }
-  ipc.set_nonce(activity_cmd.nonce.to_string());
 
   // "IPC will echo back every command you send as a response.
   //  Use this as a lock-step feature to avoid flooding messages.
   //  Can be used to validate messages such as the Presence or Subscribes."
   // Echo the activity back intact (official echo semantics): the
   // lock-step guarantee is the reply itself, not a rewritten body.
-  activity_cmd.fix();
-  let response = commands::set_activity_response(activity_cmd).unwrap_or_else(|| raw.to_string());
   if let Err(err) = stream.write_all(&encode(PacketType::Frame, &response)) {
     tracing::warn!("[ipc] Error sending connection response: {err}");
+  }
+}
+
+#[cfg(test)]
+mod read_buffer_tests {
+  use super::*;
+
+  /// N29: one oversized frame must not pin its buffer for the rest of the
+  /// connection's life.
+  ///
+  /// The read buffer is reused across frames (`clear()`, not a fresh
+  /// `String`), so it keeps whatever the largest frame needed. The payload
+  /// cap is 1 MiB, and a pump serves one connection each: a single client
+  /// that ever sent a big frame would hold that much for its whole
+  /// lifetime, and the high-water mark would never come back down.
+  #[test]
+  fn an_oversized_frame_releases_the_buffer() {
+    let mut message = String::with_capacity(MAX_IPC_PAYLOAD as usize);
+    message.push_str(&"x".repeat(MAX_IPC_PAYLOAD as usize));
+    release_message_capacity(&mut message);
+    assert!(
+      message.capacity() <= MESSAGE_BUFFER_FLOOR,
+      "an oversized frame must release its buffer, kept {} bytes",
+      message.capacity()
+    );
+  }
+
+  /// The release must be conditional: steady-state frames are a few
+  /// hundred bytes, and reallocating on every one of those would trade a
+  /// one-off retention for per-frame churn.
+  #[test]
+  fn a_steady_frame_keeps_its_buffer() {
+    let mut message = String::with_capacity(256);
+    message.push_str(&"x".repeat(256));
+    let before = message.capacity();
+    release_message_capacity(&mut message);
+    assert!(
+      message.capacity() >= before,
+      "a small buffer must not be shrunk on every frame"
+    );
+  }
+
+  /// The buffer must stay usable after a release: the next frame refills
+  /// the same `String`, and the capacity rule is re-evaluated per frame.
+  #[test]
+  fn the_buffer_is_reusable_after_a_release() {
+    let mut message = String::with_capacity(MAX_IPC_PAYLOAD as usize);
+    message.push_str(&"x".repeat(MAX_IPC_PAYLOAD as usize));
+    release_message_capacity(&mut message);
+    message.clear();
+    message.push_str("next-frame");
+    assert_eq!(message, "next-frame");
   }
 }

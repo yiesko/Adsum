@@ -99,6 +99,15 @@ jobs:
       - name: Test
         run: cargo test --manifest-path ./Cargo.toml --workspace --locked
 
+      # Benchmarks are not built by `cargo test`, so nothing above catches a
+      # fixture that stopped compiling — or, worse, one that compiles and
+      # panics. `--test` runs each benchmark once as a test: every fixture
+      # and every assert in it executes. This is what the benches were
+      # missing when a signature change turned the flood-drop benchmark
+      # into a panic that only a manual `cargo bench` would have shown.
+      - name: Bench (run once each)
+        run: cargo test --manifest-path ./Cargo.toml --benches --workspace --locked
+
   doc:
     runs-on: ubuntu-22.04
 
