@@ -51,7 +51,10 @@ jobs:
       - name: Initialize CodeQL
         uses: github/codeql-action/init@9f759ee644a3e7c15c1390abf49868036c00067b # v3
         with:
-          language: rust
+          # Singular `language` was what v3 of the action took; v4 renamed
+          # the input to `languages` (a space-separated list) and rejects
+          # the old name outright.
+          languages: rust
           build-mode: none
           # Default query suite. Widening to `security-extended` is this
           # one line, and is the first thing to try if the default set
