@@ -13,6 +13,7 @@ fn sample_command() -> ActivityCmd {
   serde_json::from_str(
     r#"{
       "cmd": "SET_ACTIVITY",
+      "application_id": "911788811076153344",
       "args": {
         "pid": 12345,
         "activity": {
