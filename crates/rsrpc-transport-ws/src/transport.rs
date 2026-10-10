@@ -116,6 +116,25 @@ impl PendingClear {
       nonce: published.nonce.clone(),
     }
   }
+
+  /// Slim metadata for a clear the sink just refused.
+  ///
+  /// The inverse of [`into_cmd`](Self::into_cmd), which is what makes a
+  /// refusal cheap to put back: the sink hands the command back untouched,
+  /// so the entry returns as the metadata it was staged as instead of as
+  /// the full command it was offered as — the difference between ~80 B and
+  /// ~1 KB retained per entry for as long as the sink stays full.
+  fn from_cmd(cmd: &ActivityCmd) -> Self {
+    Self {
+      app_id: cmd.application_id.clone(),
+      pid: cmd
+        .args
+        .as_ref()
+        .and_then(|args| args.pid)
+        .unwrap_or_default(),
+      nonce: cmd.nonce.clone(),
+    }
+  }
 }
 
 /// One staged queue entry: the payload plus its own expiry, so an older
@@ -375,13 +394,22 @@ impl Sink {
   pub(crate) fn flush_pending(&self, pending: &Mutex<PendingQueue>) {
     let mut pending = pending.lock().unwrap_or_else(|e| e.into_inner());
     while let Some(entry) = pending.pop_front() {
+      // A refused clear goes back as the metadata it was staged as, not as
+      // the command it was offered downstream: the command is ~1 KB and a
+      // wedged sink would retain one per entry for as long as the queue
+      // holds, which is the case the slim form exists for.
+      let was_clear = matches!(entry.payload, PendingPayload::Clear(_));
       match self.try_emit(entry.payload.into_cmd()) {
         TryEmit::Sent => {}
         TryEmit::Full(cmd) => {
           // Put it back exactly where it was: order is a hard invariant
           // (a clear must never overtake an older publish of the same pid).
           pending.push_front(PendingEntry {
-            payload: PendingPayload::Publish(cmd),
+            payload: if was_clear {
+              PendingPayload::Clear(PendingClear::from_cmd(&cmd))
+            } else {
+              PendingPayload::Publish(cmd)
+            },
             deadline: entry.deadline,
           });
           break;
@@ -1253,6 +1281,32 @@ mod tests {
     }
   }
 
+  /// The slim form is a faithful inverse of the command it rebuilds, in
+  /// both directions. The flush relies on it: a refused clear is put back
+  /// as metadata taken from the command the sink handed it, so a clear that
+  /// survives any number of refusals must still rebuild the same bytes.
+  #[test]
+  fn slim_clear_round_trips_through_its_command() {
+    for pid in [0u64, 7, 42, u64::MAX] {
+      let slot = slot(pid);
+      let slim = PendingClear::from_slot(&slot);
+      let cmd = slim.clone().into_cmd();
+      let back = PendingClear::from_cmd(&cmd);
+      assert_eq!(back, slim, "pid {pid}: the slim form must round-trip");
+    }
+    // A nonce that is not null, and an id that is present: the inverse
+    // reads both back out of the command rather than assuming the empty
+    // slot.
+    let slot = handlers::PublishedSlot {
+      app_id: Some(rsrpc_types::AppId::from("app-7")),
+      pid: 9,
+      nonce: Value::String("n9".to_string()),
+    };
+    let slim = PendingClear::from_slot(&slot);
+    let cmd = slim.clone().into_cmd();
+    assert_eq!(PendingClear::from_cmd(&cmd), slim);
+  }
+
   /// A staged clear is materially smaller than the command it replaces:
   /// the whole point of holding slim metadata instead of the full command.
   #[test]
@@ -1343,6 +1397,60 @@ mod tests {
     assert!(pending.lock().unwrap().is_empty());
     let last = rx.try_recv().expect("final staged entry");
     assert_eq!(last.args.as_ref().and_then(|a| a.pid), Some(9));
+    assert_eq!(sink.dropped.load(Ordering::Relaxed), 0);
+  }
+
+  /// A clear a full sink refuses keeps its slim form when it goes back.
+  ///
+  /// The flush offers each entry as a full command, so a refused clear used
+  /// to come back as a boxed publish: same bytes, same place in the queue,
+  /// but the ~1 KB command retained per entry for as long as the sink stays
+  /// full. A wedged sink is exactly the case the slim form exists for, and
+  /// it runs on every pump event while the queue is non-empty.
+  #[tokio::test]
+  async fn a_refused_clear_is_requeued_slim() {
+    // Cap-1 sink held full by a filler: the flush delivers nothing, so
+    // every staged entry takes the refused path.
+    let (tx, _rx) = mpsc::channel(1);
+    tx.send_timeout(handlers::clear_for_slot(&slot(1)), SINK_SEND_TIMEOUT)
+      .await
+      .expect("filler");
+    let sink = Sink {
+      tx,
+      dropped: Arc::new(AtomicU64::new(0)),
+    };
+    let pending = Mutex::new(PendingQueue::new());
+    for pid in [7u64, 8] {
+      sink.stage_clear(&pending, &slot(pid));
+    }
+    // Each entry carries its own retry window; the requeue must not stamp
+    // a new one, or the entry the oldest retry task is waiting on silently
+    // keeps a stranger's window.
+    let deadlines: Vec<_> = pending.lock().unwrap().iter().map(|e| e.deadline).collect();
+
+    sink.flush_pending(&pending);
+
+    let pending = pending.lock().unwrap();
+    assert_eq!(pending.len(), 2, "a full queue keeps every entry");
+    let pids: Vec<u64> = pending
+      .iter()
+      .map(|entry| match &entry.payload {
+        PendingPayload::Clear(clear) => clear.pid,
+        PendingPayload::Publish(_) => {
+          panic!("a refused clear came back as a publish, retaining the full command")
+        }
+      })
+      .collect();
+    assert_eq!(
+      pids,
+      vec![7, 8],
+      "both clears stay slim and keep their order"
+    );
+    assert_eq!(
+      deadlines,
+      pending.iter().map(|e| e.deadline).collect::<Vec<_>>(),
+      "the requeue keeps each entry's own deadline"
+    );
     assert_eq!(sink.dropped.load(Ordering::Relaxed), 0);
   }
 
