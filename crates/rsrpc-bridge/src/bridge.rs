@@ -570,6 +570,10 @@ impl Shared {
     drop(consumers);
     rsrpc_telemetry::StatsSnapshot {
       rss_bytes: rsrpc_telemetry::rss_bytes(),
+      // One read, split: `mallinfo2` is a single call, and reading it twice
+      // per census would sample two different instants.
+      heap: rsrpc_telemetry::heap_numbers(),
+      rss_hwm_bytes: rsrpc_telemetry::rss_hwm_bytes(),
       bridge_json: json_clients,
       bridge_msgpack: msgpack_clients,
       ws: self

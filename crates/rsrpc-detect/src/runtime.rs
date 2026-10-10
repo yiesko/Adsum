@@ -17,7 +17,7 @@ use super::scan::{ScanScratch, apply_ignore_list, first_sightings};
 // Linux-only: the /proc reader does not exist on other targets.
 #[cfg(target_os = "linux")]
 use super::scan::read_exec_into;
-use super::server::{ProcessServer, allocator_numbers, release_parse_arenas};
+use super::server::{ProcessServer, release_parse_arenas};
 use super::types::{Exec, ProcessDetectedEvent, ScannedHit, epoch_ms};
 use rsrpc_telemetry::SendChecked;
 
@@ -731,7 +731,7 @@ impl ProcessServer {
                     break;
                   }
                   release_parse_arenas();
-                  match allocator_numbers() {
+                  match rsrpc_telemetry::heap_numbers() {
                     Some((live, free)) => tracing::info!(
                       "[Process Scanner] post-retrim rss={:.1}MB (alloc live={:.1}MB free={:.1}MB)",
                       rsrpc_telemetry::rss_bytes().unwrap_or(0) as f64 / 1_048_576.0,

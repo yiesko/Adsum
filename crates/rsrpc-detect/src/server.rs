@@ -143,26 +143,6 @@ pub(crate) fn release_parse_arenas() {
   release_platform_arenas();
 }
 
-/// Live vs free heap bytes from the allocator (glibc `mallinfo2`):
-/// distinguishes live objects from retained arenas (`live` growing vs
-/// `free` growing with a flat RSS floor).
-/// `None` off glibc-Linux (musl, macOS, Windows), where the post-retrim
-/// line simply carries no suffix. Permanent telemetry, not DIAG: one
-/// line per installed rebuild, zero retained state.
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-pub(crate) fn allocator_numbers() -> Option<(u64, u64)> {
-  // SAFETY: `mallinfo2` only reads allocator statistics; it neither
-  // allocates nor mutates anything.
-  let info = unsafe { libc::mallinfo2() };
-  #[allow(clippy::cast_possible_truncation)]
-  Some((info.uordblks as u64, info.fordblks as u64))
-}
-
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-pub(crate) fn allocator_numbers() -> Option<(u64, u64)> {
-  None
-}
-
 /// Linux (glibc/musl).
 #[cfg(target_os = "linux")]
 fn release_platform_arenas() {

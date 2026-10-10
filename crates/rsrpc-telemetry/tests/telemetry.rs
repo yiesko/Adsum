@@ -159,6 +159,8 @@ fn format_resource_stats_mentions_reason_and_fields() {
     proc_depth: 4,
     ws_depth: 5,
     shed_watch: 0,
+    rss_hwm_bytes: Some(69_206_476),
+    heap: Some((47_718_656, 49_078_272)),
   };
   let line = format_resource_stats("hourly", &snapshot);
   assert!(line.contains("hourly"), "reason missing: {line}");
@@ -172,6 +174,85 @@ fn format_resource_stats_mentions_reason_and_fields() {
   assert!(line.contains("watch:3"), "watch depth missing: {line}");
   assert!(line.contains("proc:4"), "proc depth missing: {line}");
   assert!(line.contains("ws:5"), "ws depth missing: {line}");
+}
+
+/// E9: the census carries the high-water mark and the heap split beside
+/// the current RSS.
+///
+/// The project's own rule is that no memory change counts as verified
+/// without live heap **and** RSS/HWM: RSS alone cannot tell live objects
+/// from retained arenas, and the current value cannot tell a growth from
+/// a peak that never came back down. Both used to exist only in ad-hoc
+/// places — `VmHWM` nowhere, and `allocator_numbers` private to the
+/// scanner's post-retrim line — so the census could not report them.
+#[test]
+fn the_census_line_reports_hwm_and_heap_split() {
+  let snapshot = StatsSnapshot {
+    rss_bytes: Some(41_943_040),
+    bridge_json: 0,
+    bridge_msgpack: 0,
+    ws: 0,
+    watch_depth: 0,
+    proc_depth: 0,
+    ws_depth: 0,
+    shed_watch: 0,
+    rss_hwm_bytes: Some(69_206_476),
+    heap: Some((47_718_656, 49_078_272)),
+  };
+  let line = format_resource_stats("hourly", &snapshot);
+  assert!(line.contains("66.0MB"), "hwm missing: {line}");
+  assert!(line.contains("45.5MB"), "live heap missing: {line}");
+  assert!(line.contains("46.8MB"), "free heap missing: {line}");
+}
+
+/// Absent metrics render as `n/a` instead of `0`, so an unreadable or
+/// non-glibc target cannot pass for "nothing retained".
+#[test]
+fn absent_hwm_and_heap_render_as_unavailable() {
+  let snapshot = StatsSnapshot {
+    rss_bytes: None,
+    bridge_json: 0,
+    bridge_msgpack: 0,
+    ws: 0,
+    watch_depth: 0,
+    proc_depth: 0,
+    ws_depth: 0,
+    shed_watch: 0,
+    rss_hwm_bytes: None,
+    heap: None,
+  };
+  let line = format_resource_stats("hourly", &snapshot);
+  assert!(
+    line.contains("n/a"),
+    "unavailable values must say so: {line}"
+  );
+}
+
+/// E9: the readers agree with the kernel on the unit and the shape.
+///
+/// `/proc/self/status` reports `VmHWM:\t  2544 kB`, where procfs's "kB" is
+/// really KiB — verified against `/proc/self/statm`, where resident pages
+/// × page size equals the `VmRSS:` figure × 1024 exactly. Multiplying by
+/// 1024 is the whole contract, and a reader that assumed decimal kB would
+/// under-report by 2.4%.
+///
+/// Also pins the invariant the pair exists for: the high-water mark is the
+/// peak, so it is never below the current RSS.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_rss_readers_agree_with_the_kernel_unit() {
+  let rss = rsrpc_telemetry::rss_bytes().expect("statm is readable on Linux");
+  let hwm = rsrpc_telemetry::rss_hwm_bytes().expect("VmHWM is readable on Linux");
+
+  assert!(
+    hwm >= rss,
+    "the peak cannot be below the current value: {hwm} < {rss}"
+  );
+  // A page-sized granularity: both figures are whole pages, so neither
+  // can sit inside one.
+  let page = rsrpc_telemetry::page_size_bytes().expect("page size");
+  assert_eq!(rss % page, 0, "resident bytes must be whole pages");
+  assert_eq!(hwm % page, 0, "the high-water mark must be whole pages");
 }
 
 /// N23: the census reports how many proc-events the bounded watch queue
@@ -190,6 +271,8 @@ fn census_reports_shed_proc_events() {
     proc_depth: 4,
     ws_depth: 5,
     shed_watch: 7,
+    rss_hwm_bytes: None,
+    heap: None,
   };
   let line = format_resource_stats("hourly", &snapshot);
   assert!(
