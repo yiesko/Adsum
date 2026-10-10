@@ -14,5 +14,8 @@ fuzz_target!(|data: &[u8]| {
     };
     cmd.fix();
     // No fingerprint: exercises the always-changed path, like a first publish.
-    let _ = rsrpc_protocol::commands::cached_activity(&mut cmd, None);
+    // `cached_activity` consumes the command — the activity moves into the
+    // payload instead of being cloned for it — so the fuzz input runs the
+    // whole of what the bridge does with a command before the fan-out.
+    let _ = rsrpc_protocol::commands::cached_activity(cmd, None);
 });

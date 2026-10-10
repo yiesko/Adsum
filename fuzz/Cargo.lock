@@ -940,6 +940,7 @@ dependencies = [
  "bytes",
  "rmp-serde",
  "rsrpc-types",
+ "rustc-hash",
  "serde",
  "serde_json",
  "serde_with",
