@@ -1,53 +1,44 @@
 version: 2
 updates:
-  # Root workspace: 12 members sharing one lock file.
-  - package-ecosystem: cargo
-    directory: "/"
+  # One entry, three workspaces, on purpose.
+  #
+  # `fuzz/` and `tools/updater/` are standalone workspaces that path-depend on
+  # the root crates, so a dependency can appear in all three lock files. A
+  # per-directory entry bumps it in one of them and leaves the others stale,
+  # which is what broke twice here: the fuzz and updater gates run under
+  # `--locked` and reded every pull request with "cannot update the lock file
+  # ... because --locked was passed". A major bump of a shared crate still
+  # lands as its own pull request (it is excluded from the group below by
+  # update-types) and can still need both locks touched by hand — that one is
+  # rarer, and worth reading rather than grouping.
+  - package-ecosystem: "cargo"
+    directories:
+      - "/"
+      - "/fuzz"
+      - "/tools/updater"
     schedule:
       interval: weekly
       day: monday
-    # A workspace this size would otherwise open a PR per crate per week,
-    # and each one re-runs the whole cross-platform matrix.
     open-pull-requests-limit: 5
     labels: [dependencies, rust]
     commit-message:
       prefix: "chore(deps)"
       prefix-development: "chore(deps)"
     groups:
-      # `update-types` here is the group variant: minor/patch/major, not
-      # the `version-update:semver-*` form an `allow` rule takes. Mixing
-      # them makes Dependabot reject the file.
-      minor-and-patch:
+      # `group-by: dependency-name` is what makes one pull request carry the
+      # same dependency to the same version in every directory; without it a
+      # group only collects updates *within* a directory. Minor and patch only
+      # — majors stay individual.
+      workspace-routine:
+        patterns: ["*"]
         update-types: [minor, patch]
+        group-by: dependency-name
 
-  # The fuzz workspace is not a member of the root workspace: it has its
-  # own Cargo.lock, so it needs its own entry or Dependabot never sees it.
-  - package-ecosystem: cargo
-    directory: "/fuzz"
-    schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 2
-    labels: [dependencies, rust]
-    commit-message:
-      prefix: "chore(deps)"
-      prefix-development: "chore(deps)"
-
-  # The self-update tool: another standalone workspace, another lock.
-  - package-ecosystem: cargo
-    directory: "/tools/updater"
-    schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 2
-    labels: [dependencies, rust]
-    commit-message:
-      prefix: "chore(deps)"
-      prefix-development: "chore(deps)"
-
-  # Every action in these workflows is pinned to a full SHA with a version
-  # comment, which is what lets Dependabot bump them anyway.
-  - package-ecosystem: github-actions
+  # Same file, different ecosystem: every action here is pinned to a full SHA
+  # with a version comment, which is what lets Dependabot bump them while the
+  # pin stays a pin. Note that pulling a workflow change needs the `workflow`
+  # scope on the token doing the merge.
+  - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: weekly
@@ -57,3 +48,10 @@ updates:
     commit-message:
       prefix: "ci(deps)"
       prefix-development: "ci(deps)"
+    groups:
+      # One PR per action, not one per line: a bump that moves two steps of
+      # the same action (init and analyze, say) belongs in a single change.
+      workspace-routine:
+        patterns: ["*"]
+        update-types: [minor, patch]
+        group-by: dependency-name
