@@ -69,6 +69,10 @@ pub struct ScanScratch {
 /// Long enough that a momentary spike never triggers a realloc, short
 /// enough that a sustained drop (build finished, game exited) releases
 /// the surplus within ~40 s at the base cadence.
+///
+/// Read by the `/proc` sweep and its tests, so it is dead weight on
+/// targets that list processes through `sysinfo`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) const SLOT_LOW_TICKS: u8 = 8;
 
 // Per-pid allocation reuse for the scan tick: `read_exec` intermediates
@@ -199,8 +203,13 @@ pub(crate) fn read_steam_app_id(pid: u64, scratch: &mut ExecScratch) -> Option<S
 
 /// No environ AppIds outside Linux (Steam matching there was already
 /// limited to the exe/name paths).
+///
+/// The scratch is carried for a uniform signature with the Linux reader
+/// above: the call-site hands its buffer down on every platform instead
+/// of spelling the call out twice, and none of these targets has an
+/// environ to read into it.
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn read_steam_app_id(_pid: u64) -> Option<String> {
+pub(crate) fn read_steam_app_id(_pid: u64, _scratch: &mut ExecScratch) -> Option<String> {
   None
 }
 
@@ -1453,7 +1462,10 @@ mod first_sightings_tests {
   }
 }
 
-#[cfg(test)]
+// `/proc`-only: `process_list_into` is the Linux sweep and the slot
+// release it drives is measured through it, so the module is gated the
+// same way as `reuse_tests` above.
+#[cfg(all(test, target_os = "linux"))]
 mod slot_compaction_tests {
   use super::*;
 

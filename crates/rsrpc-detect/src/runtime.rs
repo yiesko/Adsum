@@ -183,6 +183,10 @@ pub(crate) fn deliver_snapshot(
 /// Backlog budget for the EXEC fast path's publication. Matches the
 /// snapshot lane: events are tiny, the consumer drains continuously, and
 /// a shed is repaired by the forced full emission `scan_dirty` triggers.
+///
+/// The EXEC fast path is a netlink watcher, so both this and the
+/// publisher below are dead weight off Linux.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) const EXEC_EVENT_CAP: usize = 128;
 
 /// Publish one EXEC classification, capacity-checked.
@@ -193,6 +197,7 @@ pub(crate) const EXEC_EVENT_CAP: usize = 128;
 /// carry on instead of tearing itself down over a dropped best-effort
 /// event. Only a gone receiver ends the lane — with no receiver there is
 /// nothing to drain and nothing to repair.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn publish_exec_hit(
   sender: &rsrpc_telemetry::GaugeSender<ProcessDetectedEvent>,
   hit: ScannedHit,

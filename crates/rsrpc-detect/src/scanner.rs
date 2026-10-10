@@ -7,10 +7,10 @@
 //! caller-owned reuse buffers.
 
 use super::runtime::ScanGuard;
-use super::scan::{ExecScratch, ScanScratch};
-// Linux-only: the /proc reader does not exist on other targets.
+use super::scan::ScanScratch;
+// Linux-only: the /proc readers do not exist on other targets.
 #[cfg(target_os = "linux")]
-use super::scan::read_exec_into;
+use super::scan::{ExecScratch, read_exec_into};
 use super::server::ProcessServer;
 use super::types::{Exec, ProcessScanState, ScannedHit};
 
@@ -20,6 +20,10 @@ use super::types::{Exec, ProcessScanState, ScannedHit};
 /// `OsStr::as_encoded_bytes` (stable since 1.74) hands back the bytes
 /// directly; the previous `to_string_lossy().parse()` allocated a `String`
 /// and `entry.path().file_name()` allocated a `PathBuf`, both per entry.
+///
+/// Only the `/proc` sweep calls it, so it is dead weight on targets that
+/// list processes through `sysinfo`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_proc_pid(name: &[u8]) -> Option<u64> {
   if name.is_empty() {
     return None;
