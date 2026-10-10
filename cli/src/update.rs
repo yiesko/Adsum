@@ -158,9 +158,14 @@ pub fn parse_checksums(text: &str) -> HashMap<String, String> {
 }
 
 /// SHA256 of `bytes` as lowercase hex.
+///
+/// `hex::encode` rather than the `{:x}` formatter the digest array used to
+/// accept: sha2 0.11 dropped its `LowerHex` impl, and hand-rolling the hex
+/// digits is code the ecosystem already solved. The crate was in the tree
+/// transitively, so this adds an edge rather than a package.
 #[must_use]
 pub fn sha256_hex(bytes: &[u8]) -> String {
-  format!("{:x}", Sha256::digest(bytes))
+  hex::encode(Sha256::digest(bytes))
 }
 
 /// Verify a detached minisign signature over `payload` with `pubkey_b64`
@@ -485,7 +490,7 @@ fn download_to_file(
   std::io::Write::flush(&mut file).map_err(|err| -> Box<dyn std::error::Error> {
     format!("cannot stage update: {err}").into()
   })?;
-  Ok(format!("{:x}", hasher.finalize()))
+  Ok(hex::encode(hasher.finalize()))
 }
 
 /// Download, verify (SHA256 vs the release manifest) and stage an

@@ -22,7 +22,10 @@ ureq.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 semver = "1.0"
-sha2 = "0.10"
+sha2 = "0.11"
+# Lowercase hex for update manifests and staged payloads. Present in the
+# tree transitively; declared here because the CLI calls it directly.
+hex = "0.4"
 minisign-verify = "0.3"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "std"] }
