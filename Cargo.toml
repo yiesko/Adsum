@@ -28,7 +28,7 @@ ureq = { version = "3", default-features = false, features = ["rustls", "charset
 serde_with = "3.21"
 rustc-hash = "2.1"
 rmp-serde = "1.3"
-hotpath = "0.25"
+hotpath = "0.28"
 tracing-subscriber = { version = "0.3", default-features = false }
 # tokio-util is intentionally NOT inherited: default-features differ per
 # crate (bridge/ws opt out) and inheritance cannot override them, so each
