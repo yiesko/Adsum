@@ -7,6 +7,30 @@
 use std::sync::{Arc, Mutex};
 
 use rsrpc_types::user::RpcUser;
+use serde::Serialize;
+
+/// The `SET_USER`/`RESET_USER` ACK envelope, borrowing the identity.
+///
+/// The shape used to be produced by serializing the identity into a
+/// `Value`, boxing that in a `json!` map and serializing the whole thing
+/// again: three passes over the same struct, one allocation per field each
+/// time. The ACK and the fanned-out update need the same identity, so it is
+/// serialized once from here and nowhere else.
+#[derive(Serialize)]
+struct UserAck<'a> {
+  #[serde(rename = "type")]
+  ack_type: &'static str,
+  nonce: &'a serde_json::Value,
+  data: UserAckData<'a>,
+}
+
+/// The `data` object of a user ACK: the arRPC success flag plus the
+/// identity itself, borrowed rather than copied into a `Value`.
+#[derive(Serialize)]
+struct UserAckData<'a> {
+  success: bool,
+  user: &'a RpcUser,
+}
 
 /// Handle a bridge control message (`SET_USER`/`RESET_USER`, arRPC parity).
 /// Returns the ACK text plus the new identity when it changed, `None` for
@@ -24,9 +48,12 @@ pub(crate) fn handle_bridge_control(
     .get("nonce")
     .cloned()
     .unwrap_or(serde_json::Value::Null);
-  // One critical section for the whole read-modify-read: patch/reset
-  // and both snapshots share a single guard.
-  let (before, after) = {
+  // One critical section for the whole read-modify-read: patch/reset and
+  // both snapshots share a single guard. The identity is cloned once for
+  // the caller (the fan-out update) and compared in place against the
+  // pre-patch snapshot, instead of being cloned twice and compared after
+  // the guard is gone.
+  let (ack, changed) = {
     let mut guard = user.lock().unwrap_or_else(|e| e.into_inner());
     let before = guard.clone();
     if msg_type == "SET_USER" {
@@ -38,16 +65,116 @@ pub(crate) fn handle_bridge_control(
       // Reset to the startup identity (defaults + `RSRPC_USER_*`).
       *guard = RpcUser::from_env();
     }
-    let after = guard.clone();
-    (before, after)
+    let ack_type = if msg_type == "SET_USER" {
+      "SET_USER_ACK"
+    } else {
+      "RESET_USER_ACK"
+    };
+    // Serialize while the guard is held: the ACK is a pure read of state we
+    // already own, and holding it costs nothing measurable for a message
+    // that arrives at most a few times per session.
+    let ack = serde_json::to_string(&UserAck {
+      ack_type,
+      nonce: &nonce,
+      data: UserAckData {
+        success: true,
+        user: &guard,
+      },
+    })
+    .ok()?;
+    (ack, *guard != before)
   };
-  let changed = (before != after).then_some(after.clone());
-  let user_value = serde_json::to_value(after).unwrap_or(serde_json::Value::Null);
-  let ack = serde_json::json!({
-    "type": format!("{msg_type}_ACK"),
-    "nonce": nonce,
-    "data": { "success": true, "user": user_value },
-  })
-  .to_string();
-  Some((ack, changed))
+  // Only a real change is handed back: the bridge fans out
+  // CURRENT_USER_UPDATE from it, and a repeat SET_USER with the same patch
+  // must stay quiet.
+  let identity = changed.then(|| user.lock().unwrap_or_else(|e| e.into_inner()).clone());
+  Some((ack, identity))
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// The `SET_USER` ACK carries exactly the arRPC shape, built from a
+  /// borrowing envelope.
+  ///
+  /// It used to serialize the identity into a `Value`, box that in a
+  /// `json!` map and serialize again — three passes over the same struct,
+  /// one allocation per field each time. The shape test pins what the
+  /// envelope must produce, so a DTO that drops a key or renames one fails
+  /// here rather than at a game client.
+  #[test]
+  fn a_set_user_ack_keeps_the_arrpc_shape() {
+    let user = Arc::new(Mutex::new(RpcUser::default()));
+    let (ack, changed) = handle_bridge_control(
+      &user,
+      r#"{"type":"SET_USER","nonce":"n1","patch":{"username":"web"}}"#,
+    )
+    .expect("a SET_USER control message answers");
+
+    let body: serde_json::Value = serde_json::from_str(&ack).expect("the ack is JSON");
+    assert_eq!(body["type"], "SET_USER_ACK", "the arRPC ack type is kept");
+    assert_eq!(body["nonce"], "n1", "the nonce is echoed");
+    assert_eq!(body["data"]["success"], true);
+    assert_eq!(
+      body["data"]["user"]["username"], "web",
+      "the patched identity"
+    );
+    assert_eq!(
+      body.as_object().map(|obj| obj.len()),
+      Some(3),
+      "the ack carries exactly type, nonce and data"
+    );
+
+    let changed = changed.expect("the patch changed the identity");
+    assert_eq!(changed.username, "web");
+  }
+
+  /// A control message that changes nothing still answers, and reports no
+  /// new identity — that is what keeps a repeat `SET_USER` quiet instead
+  /// of re-fanning-out an identical update.
+  #[test]
+  fn an_unchanged_set_user_reports_no_new_identity() {
+    let user = Arc::new(Mutex::new(RpcUser::default()));
+    let (ack, changed) = handle_bridge_control(
+      &user,
+      r#"{"type":"SET_USER","nonce":"n2","patch":{"username":"arRPC"}}"#,
+    )
+    .expect("a SET_USER control message answers");
+
+    let body: serde_json::Value = serde_json::from_str(&ack).expect("the ack is JSON");
+    assert_eq!(body["type"], "SET_USER_ACK");
+    assert!(
+      changed.is_none(),
+      "nothing changed, so nothing is fanned out"
+    );
+  }
+
+  /// `RESET_USER` restores the startup identity and reports it.
+  #[test]
+  fn a_reset_user_restores_the_startup_identity() {
+    let user = Arc::new(Mutex::new(RpcUser::default()));
+    let (ack, _) = handle_bridge_control(
+      &user,
+      r#"{"type":"SET_USER","nonce":"n3","patch":{"username":"web"}}"#,
+    )
+    .expect("patched");
+    let _ = ack;
+
+    let (ack, changed) = handle_bridge_control(&user, r#"{"type":"RESET_USER","nonce":"n4"}"#)
+      .expect("a RESET_USER control message answers");
+    let body: serde_json::Value = serde_json::from_str(&ack).expect("the ack is JSON");
+    assert_eq!(body["type"], "RESET_USER_ACK");
+    let changed = changed.expect("the reset changed the identity back");
+    assert_eq!(changed.username, "arRPC");
+  }
+
+  /// Anything that is not a bridge control message is left alone: the
+  /// caller echoes it to the sender untouched.
+  #[test]
+  fn a_non_control_message_is_ignored() {
+    let user = Arc::new(Mutex::new(RpcUser::default()));
+    assert!(handle_bridge_control(&user, r#"{"type":"ACTIVITY"}"#).is_none());
+    assert!(handle_bridge_control(&user, "not json").is_none());
+  }
 }
