@@ -53,7 +53,7 @@ pub(crate) fn handle_bridge_control(
   // the caller (the fan-out update) and compared in place against the
   // pre-patch snapshot, instead of being cloned twice and compared after
   // the guard is gone.
-  let (ack, changed) = {
+  let (ack, identity) = {
     let mut guard = user.lock().unwrap_or_else(|e| e.into_inner());
     let before = guard.clone();
     if msg_type == "SET_USER" {
@@ -82,17 +82,22 @@ pub(crate) fn handle_bridge_control(
       },
     })
     .ok()?;
-    (ack, *guard != before)
+    // Only a real change is handed back: the bridge fans out
+    // CURRENT_USER_UPDATE from it, and a repeat SET_USER with the same patch
+    // must stay quiet. Cloned from the guard the ACK was just serialized
+    // from, so the two cannot describe different identities: a control
+    // message on the other pump landing between here and a second lock
+    // would hand back an identity the ACK never mentioned.
+    let identity = (*guard != before).then(|| guard.clone());
+    (ack, identity)
   };
-  // Only a real change is handed back: the bridge fans out
-  // CURRENT_USER_UPDATE from it, and a repeat SET_USER with the same patch
-  // must stay quiet.
-  let identity = changed.then(|| user.lock().unwrap_or_else(|e| e.into_inner()).clone());
   Some((ack, identity))
 }
 
 #[cfg(test)]
 mod tests {
+  use std::sync::atomic::{AtomicBool, Ordering};
+
   use super::*;
 
   /// The `SET_USER` ACK carries exactly the arRPC shape, built from a
@@ -176,5 +181,66 @@ mod tests {
     let user = Arc::new(Mutex::new(RpcUser::default()));
     assert!(handle_bridge_control(&user, r#"{"type":"ACTIVITY"}"#).is_none());
     assert!(handle_bridge_control(&user, "not json").is_none());
+  }
+
+  /// The ACK answers with the same identity the handler hands back.
+  ///
+  /// The ACK is serialized under one guard and the identity used to be
+  /// cloned from a second, later lock. A control message landing in
+  /// between — the other transport's pump, which shares the same identity
+  /// — changed the user between the two reads, so the sender was told one
+  /// identity while every consumer received a different
+  /// `CURRENT_USER_UPDATE`. A single call cannot show that: both reads
+  /// agree whenever nothing runs in between.
+  ///
+  /// So the shared identity is patched from another thread while the
+  /// handler runs, and the two answers are compared on every call. What
+  /// the test asserts is the contract the fan-out relies on, not the lock
+  /// count that happens to deliver it.
+  #[test]
+  fn the_acked_identity_is_the_one_handed_back() {
+    let user = Arc::new(Mutex::new(RpcUser::default()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let patcher = {
+      let user = Arc::clone(&user);
+      let stop = Arc::clone(&stop);
+      std::thread::spawn(move || {
+        let mut flip = false;
+        while !stop.load(Ordering::Relaxed) {
+          flip = !flip;
+          let name = if flip { "patcher-a" } else { "patcher-b" };
+          // The lock may be held by the handler; skip the round rather
+          // than block it. A skipped round only widens the window the
+          // regression needs, so the test stays honest either way.
+          if let Ok(mut guard) = user.try_lock() {
+            guard.patch(&serde_json::json!({ "username": name }));
+          } else {
+            std::hint::spin_loop();
+          }
+        }
+      })
+    };
+
+    for round in 0..256u16 {
+      let (ack, changed) = handle_bridge_control(
+        &user,
+        &format!(
+          r#"{{"type":"SET_USER","nonce":"{round}","patch":{{"username":"handler-{round}"}}}}"#
+        ),
+      )
+      .expect("a SET_USER control message answers");
+      let ack: serde_json::Value = serde_json::from_str(&ack).expect("the ack is JSON");
+      let acked = ack["data"]["user"]["username"]
+        .as_str()
+        .expect("the ack carries the username");
+      let changed = changed.expect("the handler's own patch changed the identity");
+      assert_eq!(
+        changed.username, acked,
+        "round {round}: the identity handed back must be the one the ACK answered"
+      );
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    patcher.join().expect("the patcher thread joins");
   }
 }
