@@ -179,26 +179,34 @@ fn daemon_from_fetched(
   // string to `from_json_str` would parse the ~5MB body twice for zero
   // new information (double transient memory at boot). The trimmed
   // fallback goes straight from Value (no String round-trip).
-  if let Ok(parsed) = serde_json::from_str::<Vec<DetectableActivity>>(&detectable) {
-    // Seed the hourly guard with this body: the first refresh check can
-    // then skip the parse/rebuild exactly like later checks, instead of
-    // one guaranteed redundant rebuild per boot.
-    config.initial_db_content_hash = Some(content_hashes(&detectable, &parsed));
-    return Ok((Daemon::from_parsed(parsed, config), "fetched-direct"));
+  match rsrpc_detect::db::parse_database(&detectable) {
+    Ok((parsed, shape)) => {
+      // Seed the hourly guard with this body: the first refresh check can
+      // then skip the parse/rebuild exactly like later checks, instead of
+      // one guaranteed redundant rebuild per boot.
+      config.initial_db_content_hash = Some(content_hashes(&detectable, &parsed));
+      // The parser names the shape it decoded; boot reports it on the
+      // inventory line. It only ever returns these two.
+      let label = match shape {
+        "direct" => "fetched-direct",
+        _ => "fetched-trimmed",
+      };
+      Ok((Daemon::from_parsed(parsed, config), label))
+    }
+    // A fetched-but-unusable body (CDN HTML, truncation, or one that parses
+    // but breaks a structural cap) must not kill boot: same offline
+    // fallback as a failed fetch (mirrors refresh, which keeps the old DB
+    // on parse errors). The loaded DB is the bundled snapshot, not the
+    // fetched body — so drop the seeded ETag: sending it on the next
+    // refresh could answer 304 and pin the bundled database forever
+    // without ever downloading the rejected body. The reason travels with
+    // the message, since "unparseable" would not describe a cap refusal.
+    Err(err) => {
+      eprintln!("[rsrpc] Fetched DB unusable ({err}), using offline bundled snapshot");
+      config.initial_db_etag = None;
+      Ok((Daemon::from_bundled(config)?, "bundled-fallback"))
+    }
   }
-  if let Ok(parsed) = rsrpc_detect::db::trim_parse(&detectable) {
-    config.initial_db_content_hash = Some(content_hashes(&detectable, &parsed));
-    return Ok((Daemon::from_parsed(parsed, config), "fetched-trimmed"));
-  }
-  // A fetched-but-garbage body (CDN HTML, truncation) must not kill
-  // boot: same offline fallback as a failed fetch (mirrors refresh,
-  // which keeps the old DB on parse errors). The loaded DB is the
-  // bundled snapshot, not the fetched body — so drop the seeded ETag:
-  // sending it on the next refresh could answer 304 and pin the bundled
-  // database forever without ever downloading the rejected body.
-  eprintln!("[rsrpc] Fetched DB unparseable, using offline bundled snapshot");
-  config.initial_db_etag = None;
-  Ok((Daemon::from_bundled(config)?, "bundled-fallback"))
 }
 
 /// Split a comma-separated list (`--ignore-ids`,
@@ -539,5 +547,65 @@ mod tests {
     );
     let off = Args::try_parse_from(["rsrpc-cli"]).expect("defaults parse");
     assert!(off.bridge_allowed_origins.is_none());
+  }
+
+  /// One entry shaped like the real database — every field at its measured
+  /// top end (16 executables, 8 aliases, 31 SKUs, a 204-character name).
+  fn real_shaped_entry() -> String {
+    let executables: String = (0..16)
+      .map(|i| format!(r#"{{"name":"e{i}.exe","os":"linux","is_launcher":false}}"#))
+      .collect::<Vec<_>>()
+      .join(",");
+    let aliases: String = (0..8)
+      .map(|i| format!(r#""alias {i}""#))
+      .collect::<Vec<_>>()
+      .join(",");
+    let skus: String = (0..31)
+      .map(|i| format!(r#"{{"distributor":"steam","id":"{i}","sku":null}}"#))
+      .collect::<Vec<_>>()
+      .join(",");
+    format!(
+      r#"{{"id":"1045800378228281345","name":"{}","hook":false,
+           "aliases":[{aliases}],"executables":[{executables}],
+           "third_party_skus":[{skus}]}}"#,
+      "n".repeat(204)
+    )
+  }
+
+  /// A fetched body this daemon should never build — one entry past the
+  /// entry cap — must be refused at boot, the same way an unparseable body
+  /// is: the bundled snapshot comes up, not the fetched one.
+  ///
+  /// The direct decode of this body succeeds, so only the structural caps
+  /// can refuse it. A boot path that decodes straight into the daemon
+  /// hands the automaton a database no other path in the process would
+  /// accept. The entries are minimal on purpose: what breaks this cap is
+  /// the count, and 100k fat entries would only buy the test a slow build.
+  #[test]
+  fn an_over_cap_fetched_body_falls_back_to_bundled() {
+    let body = format!(
+      "[{}]",
+      vec![r#"{"id":"1","name":"n"}"#; rsrpc_detect::db::MAX_ENTRIES + 1].join(",")
+    );
+    let (_daemon, label) = daemon_from_fetched(body, RPCConfig::default())
+      .expect("boot answers even when the body is refused");
+    assert_eq!(
+      label, "bundled-fallback",
+      "an over-cap body must not be built into the daemon"
+    );
+  }
+
+  /// The same parser, fed the real shape, still builds from the fetch: the
+  /// caps are a ceiling for a pathological database, not a bar for one that
+  /// looks like the live endpoint.
+  #[test]
+  fn a_real_shaped_fetched_body_still_builds_directly() {
+    let body = format!("[{},{}]", real_shaped_entry(), real_shaped_entry());
+    let (_daemon, label) =
+      daemon_from_fetched(body, RPCConfig::default()).expect("a real-shaped body parses");
+    assert_eq!(
+      label, "fetched-direct",
+      "the caps must not refuse a database shaped like the real one"
+    );
   }
 }
