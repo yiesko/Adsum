@@ -1,0 +1,59 @@
+version: 2
+updates:
+  # Root workspace: 12 members sharing one lock file.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    # A workspace this size would otherwise open a PR per crate per week,
+    # and each one re-runs the whole cross-platform matrix.
+    open-pull-requests-limit: 5
+    labels: [dependencies, rust]
+    commit-message:
+      prefix: "chore(deps)"
+      prefix-development: "chore(deps)"
+    groups:
+      # `update-types` here is the group variant: minor/patch/major, not
+      # the `version-update:semver-*` form an `allow` rule takes. Mixing
+      # them makes Dependabot reject the file.
+      minor-and-patch:
+        update-types: [minor, patch]
+
+  # The fuzz workspace is not a member of the root workspace: it has its
+  # own Cargo.lock, so it needs its own entry or Dependabot never sees it.
+  - package-ecosystem: cargo
+    directory: "/fuzz"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+    labels: [dependencies, rust]
+    commit-message:
+      prefix: "chore(deps)"
+      prefix-development: "chore(deps)"
+
+  # The self-update tool: another standalone workspace, another lock.
+  - package-ecosystem: cargo
+    directory: "/tools/updater"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+    labels: [dependencies, rust]
+    commit-message:
+      prefix: "chore(deps)"
+      prefix-development: "chore(deps)"
+
+  # Every action in these workflows is pinned to a full SHA with a version
+  # comment, which is what lets Dependabot bump them anyway.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    labels: [dependencies, github-actions]
+    commit-message:
+      prefix: "ci(deps)"
+      prefix-development: "ci(deps)"
