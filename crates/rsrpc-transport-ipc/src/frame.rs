@@ -24,7 +24,6 @@ pub trait IpcFacilitator: Send {
   /// Mark the handshake complete (cleared on close).
   fn set_handshake(&mut self, handshake: bool);
 
-  /// Client id from the handshake (routing enrichment for forwarded frames).
   /// Application id from the handshake (refcounted: the forward path
   /// stamps it onto every command the connection sends).
   fn client_id(&self) -> AppId;
