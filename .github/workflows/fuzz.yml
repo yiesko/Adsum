@@ -24,7 +24,7 @@ jobs:
   smoke:
     # PR sanity: every target still typechecks (no engine run — that is
     # the nightly job's). Cheap enough to gate merges.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
