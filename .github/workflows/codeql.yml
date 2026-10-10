@@ -1,0 +1,63 @@
+# Rust is extracted from the source, not built: the CodeQL database for
+# C/C++, C#, Java and Rust is generated directly from the codebase, so this
+# job has no build step and nothing to fail on. It cannot be broken by a
+# compile error, an outdated lock or a missing generated snapshot.
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/codeql.yml"
+      - "crates/**"
+      - "cli/**"
+      - "Cargo.lock"
+  pull_request:
+    paths:
+      - ".github/workflows/codeql.yml"
+      - "crates/**"
+      - "cli/**"
+      - "Cargo.lock"
+  schedule:
+    # Weekly, independent of what landed: an untouched default branch still
+    # gets scanned, so queries added by a newer CodeQL bundle reach code
+    # that has not changed since the last release.
+    - cron: "30 6 * * 1"
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: ${{ github.ref }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: analyze (rust)
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      # Required: without it the analysis cannot upload its results and
+      # the job fails closed.
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [rust]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@9f759ee644a3e7c15c1390abf49868036c00067b # v3
+        with:
+          language: rust
+          build-mode: none
+          # Default query suite. Widening to `security-extended` is this
+          # one line, and is the first thing to try if the default set
+          # comes up quiet on a codebase with this much `unsafe`.
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@9f759ee644a3e7c15c1390abf49868036c00067b # v3
+        with:
+          category: "/language:rust"
