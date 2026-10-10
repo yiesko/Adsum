@@ -417,7 +417,7 @@ struct ActivityEcho<'a> {
 ///
 /// Takes `&mut` because the echo's `application_id` is the command's, not
 /// the activity's: the activity's own copy is dropped first so the field
-/// below is the only one emitted (see [`ActivityEcho`]).
+/// below is the only one emitted (see the echo envelope below).
 #[must_use]
 pub fn set_activity_response(cmd: &mut ActivityCmd) -> Option<String> {
   // The echo's `application_id` is the outer command's id, verbatim —

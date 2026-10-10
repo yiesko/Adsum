@@ -298,7 +298,7 @@ pub fn undotted_names(name_map: &SortedIndex) -> SortedIndex {
 /// Writes into caller-owned buffers and returns how many are filled, so the
 /// per-process scan allocates nothing at steady state: buffers are reused
 /// across processes and scans, and the marker strip writes into the slot
-/// it will occupy (see [`remove_marker_into`]).
+/// it will occupy (see `remove_marker_into` below).
 pub fn path_variants_into(path: &str, out: &mut [String; 5]) -> usize {
   out[0].clear();
   out[0].push_str(path);

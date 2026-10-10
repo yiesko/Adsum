@@ -81,8 +81,9 @@ impl AsRef<str> for SocketId {
   }
 }
 
-/// Same as [`AppId`](AppId::Deref): the socket id is a transparent
-/// wrapper over `Arc<str>`, so it stands in for `&str` the same way.
+/// Same as [`AppId`], whose `Deref` target is also `str`: the socket id is
+/// a transparent wrapper over `Arc<str>`, so it stands in for `&str` the
+/// same way.
 impl std::ops::Deref for SocketId {
   type Target = str;
 

@@ -437,7 +437,7 @@ const MAX_SEEN_IDS: usize = 1024;
 /// silent daemon is distinguishable from a blind one without a debug
 /// build; the bridge still owns publish/dedup logging downstream.
 ///
-/// `seen` is bounded: past [`MAX_SEEN_IDS`] it is dropped whole rather
+/// `seen` is bounded: past `MAX_SEEN_IDS` it is dropped whole rather
 /// than growing without limit, so a repeat INFO may surface after enough
 /// id churn. That is the accepted trade for constant memory — the log
 /// line is diagnostic, never state.
