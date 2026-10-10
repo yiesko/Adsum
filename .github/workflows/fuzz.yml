@@ -20,6 +20,11 @@ concurrency:
   group: ${{ github.ref }}-${{ github.workflow }}
   cancel-in-progress: true
 
+# Least privilege, workflow-wide: both jobs only read the repository and
+# run cargo.
+permissions:
+  contents: read
+
 jobs:
   smoke:
     # PR sanity: every target still typechecks (no engine run — that is

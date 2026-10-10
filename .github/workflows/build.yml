@@ -22,6 +22,12 @@ concurrency:
   group: ${{ github.ref }}-${{ github.workflow }}
   cancel-in-progress: true
 
+# Least privilege, workflow-wide: the build matrix only reads the
+# repository and uploads artifacts. The release job widens this to
+# `contents: write`, which is the only job that needs to publish.
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ${{ matrix.config.platform }}

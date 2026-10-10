@@ -30,6 +30,13 @@ concurrency:
   group: ${{ github.ref }}-${{ github.workflow }}
   cancel-in-progress: true
 
+# Least privilege, workflow-wide: every job here only reads the repository
+# (fmt, clippy, test, doc, audit, msrv, the artifact syntax checks and the
+# fuzz typecheck). Declared once so a job added later inherits the default
+# instead of silently getting whatever the repository default is.
+permissions:
+  contents: read
+
 jobs:
   shell:
     runs-on: ubuntu-22.04
