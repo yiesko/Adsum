@@ -100,6 +100,63 @@ fn set_activity(pid: u64, name: &str) -> rsrpc_types::cmd::ActivityCmd {
   .unwrap()
 }
 
+/// A `SET_ACTIVITY` flood does not ratchet the heap.
+///
+/// The publish path is the one place every transient in the bridge goes
+/// through: envelope build, fingerprint, replay-cache insert, fan-out to
+/// N consumers. Each of those used to leave something behind, and the
+/// failures were cumulative rather than dramatic — which is why this
+/// measures *live* heap rather than RSS: glibc holds freed pages, so RSS
+/// stays put while `uordblks` returns to baseline on free. A ratchet shows
+/// up in the second number long before the first.
+///
+/// The activity carries a large payload and rotates app ids, so the
+/// replay cache cannot answer from an existing entry and every publish
+/// does the full work rather than being dropped by the flood guard.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_publish_flood_does_not_ratchet_the_heap() {
+  let fx = fixture().await;
+  // A big enough activity that a leak of one would dominate the reading.
+  let long_name = "n".repeat(4_096);
+  let rounds = 4_000u32;
+
+  // Warm up once: the first publish pays for every lazily-built table, and
+  // a baseline taken before that would make the test measure warm-up.
+  fx.ipc_tx.send(set_activity(0, &long_name)).await.unwrap();
+  drain_inputs().await;
+  let baseline = rsrpc_telemetry::heap_numbers().map(|(live, _)| live);
+
+  for round in 0..rounds {
+    // A fresh app id per round: the flood guard must not collapse these,
+    // and the replay cache must not answer from an earlier entry.
+    let mut cmd = set_activity(u64::from(round) + 1, &long_name);
+    cmd.application_id = Some(rsrpc_types::AppId::from(format!("flood-{round}")));
+    fx.ipc_tx.send(cmd).await.unwrap();
+  }
+  drain_inputs().await;
+
+  let Some(baseline) = baseline else {
+    // Off glibc-Linux there is no heap split to read; nothing to assert.
+    return;
+  };
+  let (live, _) = rsrpc_telemetry::heap_numbers().expect("still readable");
+  let slack = 8 * 1024 * 1024;
+  assert!(
+    live < baseline + slack,
+    "live heap grew by more than {slack} bytes across {rounds} publishes: \
+     {baseline} -> {live}"
+  );
+}
+
+/// Let every spawned task observe the published commands before the heap
+/// is read: the fan-out and the dirty-gated persist both run on tasks.
+async fn drain_inputs() {
+  for _ in 0..8 {
+    tokio::task::yield_now().await;
+  }
+  tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 /// Publishes fan out to JSON + MessagePack and replay to late joiners.
 async fn publish_reaches_both_protocols_with_replay() {

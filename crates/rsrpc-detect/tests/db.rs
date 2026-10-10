@@ -2,6 +2,141 @@ use rsrpc_detect::db::{
   BUNDLED_DETECTABLE, content_hashes, parse_exclusions, trim_detectable, trim_detectable_value,
 };
 
+/// The fallback parse builds no second DOM.
+///
+/// The trimmed path used to walk a `Vec<Value>` and then a second
+/// `Vec<Value>`, so a body that failed the direct decode paid for three
+/// structures at once — which on a 64 MiB body is a peak several times the
+/// database itself, at exactly the moment the daemon is already busy
+/// recovering from a malformed upstream. It now builds one small object per
+/// entry and drops it before the next is read.
+///
+/// Counted in allocations rather than measured in bytes: absolute heap and
+/// RSS readings drift with whatever else runs in the test binary, which is
+/// what made the measured version of this test fail for reasons that had
+/// nothing to do with the parse. Counting is a delta around one call, and
+/// the comparison is a ratio against the direct decode, so only a
+/// structural change moves it.
+#[test]
+fn the_fallback_parse_builds_no_second_dom() {
+  // Each entry carries a long name so the JSON bytes dominate over per-entry
+  // overhead, and the entry count is large enough that an extra DOM is a
+  // whole extra set of allocations per entry rather than a rounding error.
+  let entries = 20_000usize;
+  let body: String = (0..entries)
+    .map(|i| {
+      format!(
+        r#"{{"id":"{i}","name":"{}","hook":false,"executables":[{{"name":"e{i}.exe","os":"linux","is_launcher":false}}]}}"#,
+        "n".repeat(200)
+      )
+    })
+    .collect::<Vec<_>>()
+    .join(",");
+  let body = format!("[{body}]");
+
+  let counter = allocations::counter();
+  let (direct_len, direct) = counter.during(|| {
+    serde_json::from_str::<Vec<rsrpc_detect::db::DetectableActivity>>(&body)
+      .expect("direct decode")
+      .len()
+  });
+  let (fallback_len, fallback) = counter.during(|| {
+    rsrpc_detect::db::trim_parse(&body)
+      .expect("trim parse")
+      .len()
+  });
+
+  assert_eq!(direct_len, entries, "every entry must decode directly");
+  assert_eq!(fallback_len, entries, "every entry must survive the trim");
+  // The trimmed path reads the body twice over — once as raw JSON, once
+  // through the projection — so it is allowed more work, but not another
+  // whole DOM. Measured: the clean fallback peaks within 22 allocations of
+  // the direct decode, and a body re-parsed into a `Vec<Value>` peaks at
+  // 4.5x it. The budget sits in that gap.
+  let budget = direct.saturating_mul(2);
+  assert!(
+    fallback <= budget,
+    "the fallback peaked at {fallback} allocations where the direct decode peaked \
+     at {direct}: a second structure is riding along"
+  );
+}
+
+/// Allocation counting for the memory-shape tests in this binary.
+///
+/// A delta around one call is what the tests assert on, so concurrent
+/// tests in the same binary cancel out: only this call's own allocations
+/// land between the two readings.
+mod allocations {
+  use std::alloc::{GlobalAlloc, Layout, System};
+  use std::cell::Cell;
+
+  thread_local! {
+    /// Live allocations on this thread, and the peak it reached. Thread-local
+    /// so a test running concurrently in this binary — which the harness does
+    /// by default — cannot inflate the reading: its allocations are on its own
+    /// thread.
+    static LIVE: Cell<usize> = const { Cell::new(0) };
+    static PEAK: Cell<usize> = const { Cell::new(0) };
+  }
+
+  struct Counting;
+
+  // SAFETY: forwards every operation to the system allocator and only
+  // moves counters alongside it. No pointer is retained.
+  unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+      LIVE.with(|live| {
+        let now = live.get() + 1;
+        live.set(now);
+        PEAK.with(|peak| peak.set(peak.get().max(now)));
+      });
+      // SAFETY: the layout comes from the caller, unchanged.
+      unsafe { System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+      LIVE.with(|live| live.set(live.get().saturating_sub(1)));
+      // SAFETY: the pointer and layout come from the caller, unchanged.
+      unsafe { System.dealloc(ptr, layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+      LIVE.with(|live| {
+        let now = live.get() + 1;
+        live.set(now);
+        PEAK.with(|peak| peak.set(peak.get().max(now)));
+      });
+      // SAFETY: pointer, layout and new size come from the caller.
+      unsafe { System.realloc(ptr, layout, new_size) }
+    }
+  }
+
+  #[global_allocator]
+  static COUNTING: Counting = Counting;
+
+  /// The per-thread allocation counter.
+  pub fn counter() -> Counter {
+    Counter
+  }
+
+  pub struct Counter;
+
+  impl Counter {
+    /// The value `body` returned, plus how many allocations were in flight
+    /// at the busiest moment inside it — on this thread only.
+    ///
+    /// Peak rather than end-state, because the thing under test is a
+    /// transient: a second DOM is built and freed inside the call, so the
+    /// live count at the end is identical either way. The peak is what the
+    /// daemon actually has to survive.
+    pub fn during<T>(&self, body: impl FnOnce() -> T) -> (T, usize) {
+      let peak_before = PEAK.with(Cell::get);
+      let value = body();
+      let peak_after = PEAK.with(Cell::get);
+      assert!(peak_after >= peak_before, "the peak went backwards");
+      (value, peak_after.saturating_sub(peak_before))
+    }
+  }
+}
+
 /// Bundled snapshot parses and survives the trim round-trip intact.
 #[test]
 fn bundled_snapshot_parses_and_hashes() {
