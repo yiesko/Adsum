@@ -514,6 +514,75 @@ fn portal_win32_entry_server() -> ProcessServer {
   )
 }
 
+/// [`portal_entry_server`] plus a user override that has nothing to do
+/// with it, which is what puts the probe into its two-pass shape: main
+/// automaton, then custom. The override has to exist for the second pass
+/// to happen at all — with none configured the loop runs once and the
+/// erased refusal cannot occur.
+fn portal_entry_with_custom_override_server() -> ProcessServer {
+  let (tx, _rx) = rsrpc_telemetry::QueueGauge::pair();
+  let entry: DetectableActivity = serde_json::from_value(serde_json::json!({
+    "id": "1",
+    "name": "Portal 2",
+    "hook": false,
+    "executables": [{"name": "portal2.exe", "is_launcher": false, "os": ""}],
+    "aliases": []
+  }))
+  .expect("fixture parses");
+  let custom: DetectableActivity = serde_json::from_value(serde_json::json!({
+    "id": "999",
+    "name": "Unrelated Override",
+    "hook": false,
+    "executables": [{"name": "somethingelse.exe", "is_launcher": false, "os": ""}],
+    "aliases": []
+  }))
+  .expect("fixture parses");
+  ProcessServer::new_with_custom(
+    vec![Arc::new(entry)],
+    vec![custom],
+    tx,
+    ProcessEventListeners::default(),
+    RefreshConfig::default(),
+    vec![],
+  )
+}
+
+/// A refusal has to survive the rest of the walk, not just be the last
+/// thing one variant happened to produce.
+///
+/// `probe_variants` assigns its outcome per probe, so a refusal from the
+/// main automaton was overwritten by the *no-match* that the custom
+/// automaton returned for the same string — and a no-match is exactly what
+/// lets the folder heuristic answer. With an unrelated user override
+/// configured (the common case: anyone who has ever added one), a refusal
+/// could therefore be erased by the very next probe, and
+/// `.../Portal 2/portal2.exe.txt` came back as Portal 2 from its folder
+/// again. A stripped 64-bit variant misses the same way.
+///
+/// The comment in the loop promised the opposite of what the code did.
+#[test]
+fn a_refusal_survives_a_later_probe_that_simply_misses() {
+  let server = portal_entry_with_custom_override_server();
+  let bundle = server.bundle();
+  let mut scratch = ScanScratch::default();
+  let mut variants: [String; 5] = Default::default();
+  let mut reversed = String::new();
+  let mut obs_open = false;
+
+  let hit = server.match_process(
+    &process("/opt/Portal 2/portal2.exe.txt", ""),
+    &bundle,
+    &mut variants,
+    &mut reversed,
+    &mut obs_open,
+    &mut scratch,
+  );
+  assert!(
+    hit.is_none(),
+    "a later no-match must not erase the refusal that came before it"
+  );
+}
+
 /// The Proton probe runs *after* the first refusal check, so a refusal of
 /// its own needs settling before the tier that follows it. Linux-only:
 /// that is the only platform where a `win32` pattern is Proton-only, and

@@ -1100,7 +1100,12 @@ impl ProcessServer {
     } else {
       2
     };
-    let mut outcome = MatchOutcome::NoMatch;
+    // A refusal is a property of the *walk*, not of the probe that
+    // happened to run last. Remembering it per probe let the next miss
+    // erase it — the custom automaton returning nothing for a string the
+    // main automaton had just refused — and a miss is precisely what lets
+    // the folder tier answer.
+    let mut refused = false;
     for pass in 0..passes {
       for variant in &variant_bufs[..variant_count] {
         reversed_path.clear();
@@ -1109,23 +1114,27 @@ impl ProcessServer {
         // one names the string that was probed. Generic in the probe so
         // the three automatons — which yield different iterator types —
         // share the corroboration below instead of repeating it.
-        outcome = if proton {
+        let outcome = if proton {
           first_hit_naming_path(self.proton_probe(reversed_path, bundle), variant)
         } else if pass == 0 {
           first_hit_naming_path(self.main_probe(reversed_path, bundle), variant)
         } else {
           first_hit_naming_path(self.custom_probe(reversed_path, bundle), variant)
         };
-        // A corroborated hit ends the walk; a refusal is remembered so
-        // the looser tiers below can stand down, but the remaining
-        // variants and the other automaton still get their turn.
-        let hit = outcome.take_hit();
-        if let Some((obj, exe_index)) = hit {
+        refused |= outcome.refused();
+        // A corroborated hit ends the walk. A refusal is remembered so the
+        // looser tiers below can stand down, but the remaining variants
+        // and the other automaton still get their turn.
+        if let Some((obj, exe_index)) = outcome.take_hit() {
           return MatchOutcome::Corroborated(obj, exe_index);
         }
       }
     }
-    outcome
+    if refused {
+      MatchOutcome::Refused
+    } else {
+      MatchOutcome::NoMatch
+    }
   }
 
   /// Classify one enumerated process, cheapest source first:
