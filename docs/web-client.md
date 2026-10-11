@@ -14,9 +14,11 @@ instead.
 | 1338 | MessagePack | `ws://127.0.0.1:1338?format=msgpack` |
 
 The server auto-detects the protocol of each connection, so either port
-works regardless of the `format` query parameter. Ports move when they are
-taken: the JSON bridge scans 1337–1347 like arRPC, and the MessagePack port
-steps forward on collision. Configure them with `--bridge-port`,
+works regardless of the `format` query parameter; `format` accepts `json`,
+`msgpack`, or `messagepack`, and an absent or unrecognized value falls back
+to the port's own protocol. Ports move when they are taken: the JSON bridge
+scans 1337–1347 like arRPC, and the MessagePack port steps forward on
+collision. Configure them with `--bridge-port`,
 `--bridge-port-end`, and `--msgpack-port` (see
 [cli-options.md](cli-options.md)).
 
@@ -66,18 +68,42 @@ client.disconnect();
 
 ## Message format
 
-Each message is an object with three fields:
+**The first message on every connection is not an activity.** Once the origin
+check passes, the bridge sends a `READY` payload with the user identity
+before anything else, and only then replays whatever cards are cached. The
+bundled `RsRpcClient` hands *every* frame to `onActivity`, so a consumer
+written from this page alone receives that identity object first and has to
+tolerate it:
+
+```json
+{ "evt": "READY", "data": { "id": "…", "username": "…", "discriminator": "0",
+                            "global_name": "…", "avatar": null, "bot": false,
+                            "flags": 0, "premium_type": 0, "nonce": null } }
+```
+
+A `READY` frame has no `activity` field. Check for it (`if (!data.activity)
+return;`) rather than assuming the first callback carries a game.
+
+After that, each activity message is an object with three fields:
 
 ```json
 { "activity": { "name": "My Game", "details": "In a match" }, "pid": 1234, "socketId": "1234" }
 ```
 
 - `activity` — the Rich Presence activity, or `null` for a clear.
-- `pid` — the process that published it (absent on some frames).
+- `pid` — the process that published it. Always present as a key; `null`
+  when the publisher did not send one.
 - `socketId` — who published it: the pid for game-SDK frames, the app id
   for process-detected cards.
 
-MessagePack frames carry the same field names.
+MessagePack frames carry the same field names. A clear is `activity: null`
+on an otherwise normal frame — it is not a separate message type, and the
+`pid`/`socketId` still tell you what was cleared.
+
+Frames you send back are echoed to you and not forwarded, and bridge
+clients do not publish presence: only `SET_USER`/`RESET_USER` are treated as
+control, and anything else returns as an echo. Binary frames echo like text
+ones.
 
 ## Vencord plugin and userscript
 
@@ -112,20 +138,26 @@ These arrive on the JSON port as plain text frames:
 
 Both replies look like
 `{"type":"SET_USER_ACK","nonce":...,"data":{"success":true,"user":{...}}}`
-— the `nonce` you sent is echoed back. Identity changes are broadcast to
-all bridge clients as the official `CURRENT_USER_UPDATE` DISPATCH; game
-clients see the new identity on their next handshake.
+— the `nonce` you sent is echoed back. The patch itself is read from
+`patch` (arRPC's spelling) or, equivalently, `data`. Identity changes are
+broadcast to all bridge clients as the official `CURRENT_USER_UPDATE`
+DISPATCH; game clients see the new identity on their next handshake.
 
-Other text frames are echoed back to the sender.
+Other frames — text and binary alike — are echoed back to the sender.
 
 ## Delivery behavior
 
-- **Echo** — a publisher still receives its own presence frames.
+- **Ready first** — every connection opens with the identity `READY` frame
+  described above, before any replay.
 - **Replay** — clients that connect late immediately receive the cached
   activities (arRPC parity, up to 50 entries).
 - **Refresh** — cached activities are rebroadcast every 30 seconds.
-- **Ghost reaping** — caches owned by dead pids are dropped (by PID
-  liveness checks).
+- **Flood guard** — an identical republish of the same `(application_id,
+  pid)` within 5 seconds is dropped, and never reaches the broadcast at all.
+  A client that watches for every frame will see fewer than it published.
+- **Ghost reaping** — caches owned by dead pids are dropped when the scanner
+  reports an empty table, so a reaped card implies the process list went
+  empty rather than one process exiting.
 
 ## See also
 
