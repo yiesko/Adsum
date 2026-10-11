@@ -385,10 +385,19 @@ fn a_launcher_process_carrying_the_games_app_id_is_not_the_game() {
       )
       .unwrap_or_else(|| panic!("{argv0} should read as the game"));
     assert_eq!(hit.entry.name, "Baldur's Gate III".into());
+    // Which tier answers first is the platform's, not this test's: the
+    // executables are `win32`, so on Windows they are native patterns and
+    // the automaton runs ahead of the id tier. The point of the assertion
+    // is that *a* corroborating tier answers — not the loose name and
+    // folder fallbacks, which is what the launcher half above rules out.
+    let corroborating = if cfg!(target_os = "windows") {
+      DetectSource::Automaton
+    } else {
+      DetectSource::SteamAppId
+    };
     assert_eq!(
-      hit.source,
-      DetectSource::SteamAppId,
-      "{argv0} must be corroborated by the store-id tier, no launch flags involved"
+      hit.source, corroborating,
+      "{argv0} must be corroborated, not answered by a loose fallback"
     );
   }
 }
@@ -481,6 +490,10 @@ fn a_refused_exe_match_is_not_overruled_by_the_folder_heuristic() {
 /// A fixture like [`portal_entry_server`], but the executable is `win32`:
 /// on Linux its pattern lives in the *Proton* automaton only, which runs
 /// after the store-id tier — and therefore after the first refusal check.
+///
+/// Gated with its single caller: off Linux the fixture has no user, and
+/// `-D warnings` reads that as dead code.
+#[cfg(target_os = "linux")]
 fn portal_win32_entry_server() -> ProcessServer {
   let (tx, _rx) = rsrpc_telemetry::QueueGauge::pair();
   let entry: DetectableActivity = serde_json::from_value(serde_json::json!({
@@ -537,6 +550,10 @@ fn a_proton_refusal_is_settled_before_the_tier_after_it() {
 /// carries the directory a bare launch would be missing: Proton launches
 /// often hand the scanner a bare `argv[0]`, and the install path the
 /// database knows lives behind the process cwd.
+///
+/// Gated with its single caller: off Linux the fixture has no user, and
+/// `-D warnings` reads that as dead code.
+#[cfg(target_os = "linux")]
 fn bare_exe_win32_server(declared: &str) -> ProcessServer {
   let (tx, _rx) = rsrpc_telemetry::QueueGauge::pair();
   let entry: DetectableActivity = serde_json::from_value(serde_json::json!({
