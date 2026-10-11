@@ -28,8 +28,9 @@ use rsrpc_types::AppId;
 /// out of every tier, including the ones the id corroboration cannot
 /// judge — the library-prefix and folder tiers have no store id to check a
 /// path against — and it costs one hash lookup. The set is deliberately
-/// small, because a name it misses is caught by
-/// [`argv_names_an_executable`] instead.
+/// small, because a name it misses is caught by the corroboration inside
+/// [`match_steam_id`], which is the rule that does not depend on a name
+/// being known.
 ///
 /// Evidence, not a guess: the launcher and helper basenames are the
 /// binaries a Steam install actually ships — `Proton <ver>/proton` and
@@ -663,9 +664,14 @@ pub struct SteamIdLookup<'a> {
 /// carrying only a steam distributor id matches here, since the map
 /// only indexes the main list. Canonical map hits always win.
 ///
-/// A hit is corroborated by the process path unless the entry declares no
-/// executables, because the id says which game was launched, not which
-/// process is running (see [`argv_names_an_executable`]).
+/// A hit is corroborated by the process path: the entry has to declare the
+/// executable the process is running, matched on a component boundary. The
+/// id says which game was launched, and Steam launches things on a game's
+/// behalf with that game's id — its update script phase, the Proton prefix
+/// setup, the shader pre-cache — so an id alone is evidence of work on the
+/// game rather than of play. An entry declaring no executables is the case
+/// this tier exists for and wins on the id alone: there is nothing to
+/// corroborate against.
 pub fn match_steam_id(
   pid: u64,
   stat: &mut String,
