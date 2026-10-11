@@ -687,28 +687,84 @@ fn exe_names_path(path: &str, name: &str) -> bool {
   }
   let path = path.as_bytes();
   let name = name.as_bytes();
-  let Some(at) = path.len().checked_sub(name.len()) else {
-    // Shorter than the name: it cannot be this name's tail.
-    return false;
-  };
-  let tail = &path[at..];
-  if !tail.iter().zip(name).all(|(path_byte, name_byte)| {
-    // A declared Windows separator is the `/` the path carries.
-    let name_byte = if *name_byte == b'\\' {
-      b'/'
-    } else {
-      *name_byte
-    };
-    path_byte.eq_ignore_ascii_case(&name_byte)
-  }) {
+  if let Some(at) = path.len().checked_sub(name.len()) {
+    let tail = &path[at..];
+    if tail.iter().zip(name).all(|(path_byte, name_byte)| {
+      // A declared Windows separator is the `/` the path carries.
+      let name_byte = if *name_byte == b'\\' {
+        b'/'
+      } else {
+        *name_byte
+      };
+      path_byte.eq_ignore_ascii_case(&name_byte)
+    }) {
+      // What precedes the name has to be a separator — unless the name
+      // carries its own leading one, which is the boundary itself (a
+      // normalized pattern does). Bytes, not chars: the tail was matched
+      // byte-for-byte above, so the split is already known to be aligned.
+      let rest = &path[..at];
+      if rest.is_empty() || rest.last() == Some(&b'/') || matches!(name.first(), Some(b'/' | b'\\'))
+      {
+        return true;
+      }
+    }
+  }
+  names_a_bundle(path, name)
+}
+
+/// The macOS bundle interior, which every bundle Apple has ever shipped
+/// carries: `.../<Something>.app/Contents/MacOS/<binary>`.
+const BUNDLE_INTERIOR: &[u8] = b"/contents/";
+
+/// Whether `name` is a `.app` bundle standing at a component boundary with
+/// that interior behind it.
+///
+/// A macOS entry names the bundle rather than the binary inside it:
+/// Factorio declares `factorio.app` beside its Linux `factorio` and its
+/// `factorio.exe`, but the process macOS runs is
+/// `.../Factorio.app/Contents/MacOS/factorio` — the declared name is a
+/// component in the middle of the path and never its tail, so the rule
+/// above refuses the running game.
+///
+/// Requiring the interior is what keeps this from reopening the substring
+/// hole the function exists to close: a name in the middle of a path names
+/// nothing unless a bundle's own contents follow it, and
+/// `.../factorio.app/something/factorio` still names nothing. 61 declared
+/// executables across 56 entries in the bundled database are spelled this
+/// way, every one of them `os: "darwin"`.
+fn names_a_bundle(path: &[u8], name: &[u8]) -> bool {
+  // Cheap enough to sit in front of the search: 56 of 24.299 entries
+  // carry a `.app` name, and the four-byte compare is what keeps the
+  // other ~24.000 off the walk below. This runs per declared executable
+  // per probe, so it cannot afford to be unconditional.
+  if name.len() < 4 || !name[name.len() - 4..].eq_ignore_ascii_case(b".app") {
     return false;
   }
-  // What precedes the name has to be a separator — unless the name
-  // carries its own leading one, which is the boundary itself (a
-  // normalized pattern does). Bytes, not chars: the tail was matched
-  // byte-for-byte above, so the split is already known to be aligned.
-  let rest = &path[..at];
-  rest.is_empty() || rest.last() == Some(&b'/') || matches!(name.first(), Some(b'/' | b'\\'))
+  path.windows(name.len()).enumerate().any(|(at, window)| {
+    let whole = window.iter().zip(name).all(|(path_byte, name_byte)| {
+      let name_byte = if *name_byte == b'\\' {
+        b'/'
+      } else {
+        *name_byte
+      };
+      path_byte.eq_ignore_ascii_case(&name_byte)
+    });
+    if !whole {
+      return false;
+    }
+    // Same boundary rule as the tail case: a `/` before, or a name that
+    // carries its own leading one.
+    let fronted = at == 0 || path[at - 1] == b'/' || matches!(name.first(), Some(b'/' | b'\\'));
+    fronted && starts_with_bundle_interior(&path[at + name.len()..])
+  })
+}
+
+/// Whether `rest` opens with [`BUNDLE_INTERIOR`], folded case — the
+/// default filesystem holds `Contents` with that spelling and plenty of
+/// bundles arrive lowercased from a Windows-authored download.
+fn starts_with_bundle_interior(rest: &[u8]) -> bool {
+  rest.len() >= BUNDLE_INTERIOR.len()
+    && rest[..BUNDLE_INTERIOR.len()].eq_ignore_ascii_case(BUNDLE_INTERIOR)
 }
 
 /// What one automaton's walk over a variant concluded about the process.
@@ -1892,6 +1948,83 @@ mod tick2_tests {
       assert!(
         !exe_names_path(path, name),
         "{name:?} must not name the tail of {path:?}"
+      );
+    }
+  }
+
+  /// A macOS entry names the *bundle*, not the binary it runs.
+  ///
+  /// 61 executables across 56 entries in the bundled database are spelled
+  /// `something.app` and all carry `os: "darwin"` — Factorio declares
+  /// `factorio.app` beside its Linux `factorio` and its `factorio.exe`.
+  /// But the process macOS actually runs is the binary inside the bundle,
+  /// `.../Factorio.app/Contents/MacOS/factorio`, so the declared name is a
+  /// component in the middle of the path and never its tail. Requiring the
+  /// tail is what refuses them.
+  ///
+  /// The bundle is the unit the database names, and the interior is
+  /// Apple's, fixed for every bundle ever shipped: `Contents/MacOS/`. So a
+  /// declared `.app` name sitting at a component boundary with that
+  /// interior behind it does name the process — and nothing else does.
+  #[test]
+  fn a_declared_app_bundle_names_the_binary_it_runs() {
+    for (name, path) in [
+      // The real Factorio layout.
+      (
+        "factorio.app",
+        "/Applications/Factorio.app/Contents/MacOS/factorio",
+      ),
+      // The bundle mounted from a Steam library rather than /Applications.
+      (
+        "factorio.app",
+        "/Users/x/Library/Application Support/Steam/SteamApps/common/Factorio.app/Contents/MacOS/factorio",
+      ),
+      // Lowercase, and the interior spelled as the filesystem holds it.
+      (
+        "factorio.app",
+        "/games/factorio.app/contents/macos/factorio",
+      ),
+      // A bundle whose executable does not repeat its own name.
+      (
+        "the binding of isaac rebirth.app",
+        "/Applications/The Binding of Isaac Rebirth.app/Contents/MacOS/isaac",
+      ),
+    ] {
+      assert!(
+        exe_names_path(path, name),
+        "{name:?} names the bundle this binary runs inside"
+      );
+    }
+
+    for (name, path) in [
+      // The interior is what makes it a bundle. Without it, a name in the
+      // middle of a path is the substring the whole rule exists to refuse
+      // — this is `hl2.exe.txt` wearing a different extension.
+      ("factorio.app", "/games/factorio.app/something/factorio"),
+      // A different bundle entirely.
+      (
+        "factorio.app",
+        "/Applications/Subnautica.app/Contents/MacOS/subnautica",
+      ),
+      // The boundary still has to be a `/`.
+      (
+        "factorio.app",
+        "/Applications/xfactorio.app/Contents/MacOS/factorio",
+      ),
+      // And the name still has to match whole: `factorio.app` is not a
+      // prefix of `factorio.app2`.
+      (
+        "factorio.app",
+        "/Applications/factorio.app2/Contents/MacOS/factorio",
+      ),
+      // A non-`.app` name is untouched by any of this: it sits in the
+      // middle of the path, it is not the tail, and there is no bundle
+      // rule to catch it.
+      ("hl2.exe", "/Applications/x/hl2.exe/Contents/MacOS/launcher"),
+    ] {
+      assert!(
+        !exe_names_path(path, name),
+        "{name:?} must not name {path:?} — no bundle of that name runs it"
       );
     }
   }
