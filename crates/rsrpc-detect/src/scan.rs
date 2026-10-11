@@ -610,10 +610,13 @@ pub(crate) fn is_shortcut_id(app_id: &str) -> bool {
 /// the relative names the database declares (`hl2.exe`, `garrysmod/hl2.exe`,
 /// `win64/gmod.exe`).
 ///
-/// The fold is idempotent by construction: the scan tick hands over its
-/// already-lowered copy, and folding that again costs one byte scan and no
-/// allocation, while a path that still carries uppercase is folded once
-/// here. The rule therefore does not depend on the caller remembering.
+/// The comparison is the same one the automaton tier corroborates its hits
+/// with ([`exe_names_path`]), deliberately: one question — does this name
+/// name this process? — has one rule, including the launcher marker and the
+/// Windows separators `normalize_exe_pattern` folds before a pattern is
+/// built. Comparing the raw spelling instead would reject an entry that
+/// declared only `>hl2.exe` or `bin\gmad.exe`. It also compares in place,
+/// so the per-name lowercased copy this loop used to build is gone.
 fn argv_names_an_executable(process_path: &str, obj: &ScannedEntry) -> bool {
   // Nothing declared: the store id is the only evidence there is, so it
   // stands on its own. This is the case the id tier exists for.
@@ -629,19 +632,10 @@ fn argv_names_an_executable(process_path: &str, obj: &ScannedEntry) -> bool {
   if obj.executables.is_empty() {
     return true;
   }
-  let folded;
-  let process_path = if process_path.bytes().any(|b| b.is_ascii_uppercase()) {
-    folded = process_path.to_ascii_lowercase();
-    &folded
-  } else {
-    process_path
-  };
-  obj.executables.iter().any(|exe| {
-    let name = exe.name.to_ascii_lowercase();
-    process_path
-      .strip_suffix(name.as_str())
-      .is_some_and(|rest| rest.is_empty() || rest.ends_with('/'))
-  })
+  obj
+    .executables
+    .iter()
+    .any(|exe| exe_names_path(process_path, &exe.name))
 }
 
 /// Whether the declared executable `name` names the tail of `path` on a
@@ -1758,6 +1752,53 @@ mod tick2_tests {
       assert!(
         !exe_names_path(path, name),
         "{name:?} must not name the tail of {path:?}"
+      );
+    }
+  }
+
+  /// The two spellings `normalize_exe_pattern` folds before a pattern is
+  /// built — the launcher marker (arrpc's "the arguments carry the
+  /// launcher", kept raw on the entry for `finish_direct_hit`) and Windows
+  /// separators — have to name the process in the store-id tier too.
+  ///
+  /// Comparing the raw spelling rejects both: `strip_suffix(">hl2.exe")`
+  /// and `strip_suffix("bin\gmad.exe")` can never match a `/`-separated
+  /// path. No entry in the bundled database is affected today — every one
+  /// that declares such a name also declares a plain one, and none uses a
+  /// backslash at all — so this is a latent divergence and not a live
+  /// false negative. Pinned anyway: it is the same rule the automaton
+  /// tier corroborates with, and two rules for one question is how the
+  /// other divergence on this branch survived a review.
+  #[test]
+  fn argv_names_an_executable_matches_what_the_automaton_normalizes() {
+    use crate::types::OsName;
+    use crate::types::ScannedExe;
+
+    for (name, path) in [
+      (">hl2.exe", "/C:/Steam/steamapps/common/GarrysMod/hl2.exe"),
+      (
+        "bin\\gmad.exe",
+        "/C:/Steam/steamapps/common/GarrysMod/bin/gmad.exe",
+      ),
+    ] {
+      // One executable, spelled the way the database spells it: the entry
+      // has no plain name to fall back on, so the spelling under test is
+      // the only evidence.
+      let entry = ScannedEntry {
+        id: "1".into(),
+        name: "Garry's Mod".into(),
+        executables: Box::new([ScannedExe {
+          name: name.into(),
+          os: OsName::Win32,
+          is_launcher: false,
+          arguments: None,
+        }]),
+        steam_ids: Box::new(["4000".into()]),
+        aliases: Box::new([]),
+      };
+      assert!(
+        argv_names_an_executable(path, &entry),
+        "{name:?} should name {path} exactly as the automaton's pattern does"
       );
     }
   }
