@@ -135,11 +135,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of parking blocking threads without bound, leaving room in the
   32-thread blocking pool for unrelated work.
 - Split the two biggest modules internally, same crates and same
-  behavior: `rsrpc-detect/src/server.rs` is now foundation plus
+  behavior: `crates/rsrpc-detect/src/server.rs` is now foundation plus
   `runtime` (threads, shutdown, join), `database` (bundle ownership and
   swaps), `scanner` (enumeration and classification), `steam`
   (library roots) alongside the existing `bundle`/`db`/`refresh`/`scan`
-  modules; `rsrpc-bridge/src/bridge.rs` is now construction plus pumps
+  modules; `crates/rsrpc-bridge/src/bridge.rs` is now construction plus pumps
   alongside `consumer` (fan-out and pruning), `router` (activity
   decisions), `replay` (cache and ghost-reap pid resolution), `snapshot`
   (persistence) and `control` (`SET_USER`/`RESET_USER`). `Shared` fields
@@ -318,10 +318,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - WebSocket game-client handlers (`handle_browser_command`,
   `handle_deep_link`, `handle_connections_callback`, `handle_set_activity`)
   now report whether their reply was delivered and the pump
-  (`Event::Disconnect` in `crates/rsrpc-transport-ws/src/transport.rs:324`)
+  (`Event::Disconnect` in `crates/rsrpc-transport-ws/src/transport.rs:801`)
   removes the client and clears every published pid when delivery fails,
   freeing the per-client slots the same way a clean `Disconnect` does
-  (`crates/rsrpc-transport-ws/src/handlers.rs:33`). Verified with real
+  (`crates/rsrpc-transport-ws/src/handlers.rs:291`). Verified with real
   `Responder` tests (RFC6455 handshake + killed-connection simulation with
   condition-wait for `send==false` and `Disconnect`).
 - Hourly bundle-swap RSS floor ratchet: the swap ran `malloc_trim` while
@@ -348,7 +348,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   plus a `StatsSnapshot` census (`rss` via `/proc/self/statm` on Linux,
   `n/a` elsewhere) with bridge `json`/`msgpack` and `ws` client counts and
   all three queue depths
-  (`crates/rsrpc-telemetry/src/lib.rs:206`). Helpers, rendering and the
+  (`crates/rsrpc-telemetry/src/lib.rs:20`). Helpers, rendering and the
   daemon wiring are covered by `crates/rsrpc-telemetry/tests/telemetry.rs`
   (gauge sharing, `rss_bytes`, snapshot shape) and the bridge census
   suite (live counts, session-boundary lines): the bridge logs the
