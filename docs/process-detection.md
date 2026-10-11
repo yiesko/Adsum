@@ -7,32 +7,89 @@ matching works and how it coexists with games that report themselves.
 
 ## How a process is matched
 
-**Executable names.** The scanner builds one Aho-Corasick automaton over
-the database's executable names and probes each process path against it.
-Both sides are reversed and normalized to `/` separators (arRPC parity),
-and matching is ASCII case-insensitive. Each process path is also tried
-with its 64-bit markers (`64`, `.x64`, `x64`, `_64`) removed, so a game
-installed as `wow64.exe` still matches a database entry for `wow.exe`.
-This is the same approach arRPC and pog5's rsrpc use.
+**Executable names.** The scanner builds Aho-Corasick automatons over the
+database's executable names and probes each process path against them. There
+are three: the main database, the custom overrides, and — on Linux — a
+Proton-only one holding the `win32` entries. Both sides are reversed and
+normalized to `/` separators (arRPC parity), and matching is ASCII
+case-insensitive. Each process path is also tried with its 64-bit markers
+(`64`, `.x64`, `x64`, `_64`) removed, so a game installed as `wow64.exe`
+still matches a database entry for `wow.exe`. This is the same approach arRPC
+and pog5's rsrpc use.
 
-**Proton and Wine.** On Linux, entries marked `win32` are matched by a second
-fallback automaton, because a Windows game running under Proton has a Windows
-executable path. Without it, those games would never match.
+**An automaton hit is not a match.** The automatons match substrings, so a
+hit only says a declared name appears somewhere in the path — which by
+itself is not evidence of anything. The executable that fired has to **name
+the end of the probed string**, on a path-component boundary. Without this,
+any process whose path merely *contains* a declared name reads as the game:
+`.../hl2.exe.txt` and `.../hl2.exe.evil` would both be Half-Life 2.
+
+A rejection costs that one match, not the whole probe. The probes walk their
+automaton's overlapping matches and keep going, because a shorter name from a
+different entry can end *inside* the path and hide the match that does name
+the process — Minecraft declares a bare `java`, Illarion declares
+`illarion/jre/bin/java.exe`, and on that path the short one ends first.
+
+**Executables flagged `is_launcher` never become patterns.** Clicking Play on
+Baldur's Gate III makes Steam run `larilauncher.exe` before the game starts,
+and that process carries the game's store id. The database flags these names,
+so the automaton skips them at build time.
+
+**macOS bundles.** A declared name ending in `.app` names the bundle, not the
+binary: macOS runs `.../Factorio.app/Contents/MacOS/factorio`, so the declared
+name is a component in the middle of the path and never its tail. A `.app`
+name at a component boundary matches when Apple's bundle interior (`Contents/`)
+follows it. Without this, every macOS entry naming a bundle would be
+undetectable.
+
+**Proton and Wine.** On Linux, entries marked `win32` are matched by a third
+automaton, because a Windows game running under Proton has a Windows
+executable path. Without it, those games would never match. It runs **after**
+the store-id tier, and a refusal from the native automaton does not stop it:
+Hearts of Iron IV declares `hoi4` for Linux and `hoi4.exe` for Windows, and
+the short Linux name must not hide the Wine game the Proton automaton can
+name.
 
 **Steam application ids.** When no executable matches, the scanner falls
 back to Steam AppId. The id is read from the process environment
 (`/proc/<pid>/environ`, `SteamAppId=`), then from `AppId=` on the command
 line (for sandboxed Proton runtimes that hide the environment), and
 finally from the install folder via Steam's own `libraryfolders.vdf` and
-`appmanifest_*.acf` files. This is how entries that ship no executables at
-all are found. Ids in Steam's shortcut range (assigned by Steam itself to
-non-Steam shortcuts) match by name before location.
+`appmanifest_*.acf` files. Ids in Steam's shortcut range (assigned by Steam
+itself to non-Steam shortcuts) match by name before location.
 
-**Names.** If an entry has no executables at all, the scanner falls back to
-the executable stem or install-folder name — but only for multi-word names,
-so a generic folder like `Games` never triggers a false positive
-(`how to fish.exe` → `How to Fish`; `fish` alone never matches).
-Alternative titles (`aliases`) are indexed too and join the same fallback.
+**The id has to be corroborated too.** An id says which game was *launched*;
+it does not say which binary is *running*. Steam hands its own helpers the
+game's environment, and those helpers run during an update. So when the entry
+declares executables, the process must be running one of them — the same
+component-boundary rule as above. An entry with **no** declared executables
+is the exception and stands on the id alone, which is what that tier is for.
+
+**Names.** When no automaton and no id resolve, the scanner falls back to the
+executable stem or install-folder name. This runs for **any** entry, not only
+those lacking executables, and it is the loosest tier by design — the
+database declares normalized *names*, which is all an install folder has to
+offer. It is gated to names that both contain a space and are at least six
+characters, so a generic folder like `Games` never triggers a false positive
+(`how to fish.exe` → `How to Fish`; `fish` alone never matches). Alternative
+titles (`aliases`) are indexed too and join the same fallback, as do
+punctuation-stripped variants of both (`R.E.P.O.`, `Q.U.B.E.`).
+
+**A refusal stands these tiers down.** When an automaton saw a declared name
+that did not name the path, that is specific evidence the process is *not*
+the game — `.../Portal 2/portal2.exe.txt` holds `portal2.exe` without ending
+with it. The name and folder heuristics are guesses built out of the install
+location, and they do not run after one. A genuine no-match is different and
+still reaches them: `.../Portal 2/launcher.exe` carries no declared name at
+all, and reads as the game from its folder.
+
+**Declared arguments.** Five entries require a string on the command line
+alongside the executable — the Source games share one `hl2.exe` binary, and
+what distinguishes Garry's Mod from Team Fortress 2 is `-game garrysmod` vs
+`-game tf`, and Minecraft is `net.minecraft.client.main.Main`. When an entry
+declares one and the process's command line does not carry it, the hit is
+refused. This applies to the automaton tiers; the store-id tier does not
+check it.
 
 **Discord's exclusion list.** Installer and crash-reporter names and patterns
 from Discord's exclusion endpoint never match. With `--enable-db-update`
@@ -60,8 +117,8 @@ watcher receives `EXEC` and `EXIT` events from the kernel, so a game appears
 the moment it starts and clears the moment it exits.
 
 The kernel delivery is officially lossy, so the watcher is best-effort: it
-can rarely go silent for stretches. It resubscribes on its own every five
-minutes, and polling backstops everything either way. Use
+can rarely go silent for stretches. When its self-test fails it resubscribes
+instead of dying, and polling backstops everything either way. Use
 `--no-proc-events` / `RSRPC_NO_PROC_EVENTS=1` to disable the watcher and
 run polling only, or `-n` / `--no-process-scan` to disable detection
 entirely.
@@ -91,6 +148,13 @@ companions. The flag remains for slots you want silent no matter what.
   really is talking to rsRPC is never silenced by this list.
 - Anything on Discord's exclusion list.
 - Anything that fails the OS filter (main database only; overrides bypass it).
+- Steam's own helpers, by basename — a first cheap line, not the rule. The
+  rule is the corroboration above: `reaper` is a plain word a game could
+  ship as its own binary, so the list only trims what is already cheap to
+  reject and cannot be the reason a helper is rejected.
+- Executables the database flags `is_launcher`, in the store-id tier.
+- A path that contains a declared name without ending with it, in the
+  automaton tiers.
 
 ## Custom overrides
 
@@ -118,7 +182,15 @@ bundled database:
   file.
 - Overrides are staged before anything else, so `--list-detected` shows
   exactly what the daemon would publish.
-- They bypass the OS filter and always win over the main database.
+- They bypass the OS filter, which is how a win32-only entry gets detected
+  under Proton/Wine.
+- **They do not outrank the main database.** Precedence is per automaton, not
+  per override: every path variant is probed against the main automaton
+  first, and only then against the overrides, so a main pattern wins even
+  when only a stripped 64-bit variant collides (main `wow.exe` against
+  override `wow64.exe`). The store-id tier is the same: the main database is
+  canonical and overrides are a linear fallback. To give an override
+  priority, remove or rename the database entry it collides with.
 
 The library exposes the same capability through
 `append_detectables` / `remove_detectable_by_name` and
