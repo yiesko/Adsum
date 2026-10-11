@@ -7,7 +7,8 @@ officially-shaped replies. Two transports are served:
 - **IPC** — local sockets named `discord-ipc-0` … `discord-ipc-9`, found in
   `XDG_RUNTIME_DIR`, then `TMPDIR`, `TMP`, `TEMP`, and finally `/tmp`
   (with symlinks into the other candidate directories so clients find the
-  socket wherever they look).
+  socket wherever they look). On Windows the same names are **named pipes**
+  (`\\.\pipe\discord-ipc-0` … `-9`), with no directory involved at all.
 - **WebSocket** — loopback only, on the first free port in
   `6463`–`6472` (`--ws-port-start` / `--ws-port-end`).
 
@@ -21,7 +22,7 @@ to the bridge instead — see [web-client.md](web-client.md).
 | Game IPC sockets | `discord-ipc-0` … `discord-ipc-9` | — |
 | Game websocket | 6463–6472 (first free) | `--ws-port-start` / `--ws-port-end` |
 | Bridge (JSON) | 1337–1347 (first free) | `--bridge-port` / `--bridge-port-end` |
-| Bridge (MessagePack) | 1338 (steps forward if taken) | `--msgpack-port` |
+| Bridge (MessagePack) | 1338 (scans 1338–1348, first free) | `--msgpack-port` |
 
 ## IPC handshake
 
@@ -72,8 +73,10 @@ The `user` object is rsRPC's identity — see
 
 ## Commands
 
-Both transports share one command table (see
-`crates/rsrpc-protocol/src/commands.rs`):
+Both transports share one reply vocabulary (see
+`crates/rsrpc-protocol/src/commands.rs`), but they do **not** route
+identically. Where a row below differs, the difference is called out — the
+most important ones are `DEEP_LINK` and a malformed `SET_ACTIVITY`.
 
 | Command | What happens |
 |---|---|
@@ -81,11 +84,25 @@ Both transports share one command table (see
 | `SUBSCRIBE`, `UNSUBSCRIBE` | Acknowledged locally — there is no voice/guild backend to subscribe to. |
 | `GET_USER` | Returns the current identity, or `null` when the id names somebody else (a missing id resolves to self). |
 | `INVITE_BROWSER`, `GUILD_TEMPLATE_BROWSER`, `GIFT_CODE_BROWSER` | Forwarded to bridge clients, then ACKed. The websocket transport validates the code first (`4011` invalid invite, `4017` invalid guild template, `4016` invalid gift code). |
-| `DEEP_LINK` | Forwarded, then ACKed. |
+| `DEEP_LINK` | **IPC forwards it, then ACKs. The websocket transport only ACKs** — it builds the acknowledgement and returns, never forwarding. A deep link over the websocket reaches bridge clients as nothing. |
 | `CONNECTIONS_CALLBACK` | Refused with an error (code `1000`, "CONNECTIONS_CALLBACK is not supported"). |
 
 A `SET_ACTIVITY` with no `args` at all is treated as malformed input, not a
-clear: it gets error `4005` ("Missing activity args") and changes nothing.
+clear. Over **IPC** it gets error `4005` ("Missing activity args") and
+changes nothing. Over the **websocket** there is no error at all: no reply
+is built, the connection is reported as alive, and the bridge drops the
+command in silence.
+
+### Limits that change what a client observes
+
+- **16 tracked pids per connection.** Beyond the cap, new pids are refused
+  before being forwarded — they are never published, so they never ghost
+  either. The cap bounds memory against pathological publishers; a client
+  multiplexing more than 16 distinct pids over one connection will see the
+  extras silently dropped.
+- **Flood guard.** An identical republish of the same `(application_id,
+  pid)` within 5 seconds is dropped before it reaches the broadcast. A
+  client that counts frames will count fewer than it published.
 
 ### Commands rsRPC cannot back
 
