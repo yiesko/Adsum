@@ -21,7 +21,7 @@ use rsrpc_detect::db::DetectableActivity;
 use rsrpc_detect::refresh::RefreshConfig;
 use rsrpc_detect::scan::ScanScratch;
 use rsrpc_detect::server::ProcessServer;
-use rsrpc_detect::types::{Exec, ProcessEventListeners};
+use rsrpc_detect::types::{DetectSource, Exec, ProcessEventListeners};
 
 /// Steam AppId of the game being updated (Garry's Mod).
 const APP_ID: &str = "4000";
@@ -211,4 +211,127 @@ fn an_entry_with_no_executables_stands_on_the_id_alone() {
     )
     .expect("an entry with no executables still wins on the id alone");
   assert_eq!(hit.entry.name, "No Exes".into());
+}
+
+/// A server whose one entry is reachable **only** by the executables it
+/// declares: no store id at all, so the id tier has nothing to look up
+/// and the automaton is the only tier that can answer. (The fixture
+/// above carries the real Steam id, which lets that tier answer instead
+/// — a different rule, already pinned there.)
+///
+/// The executables carry an empty `os` on purpose: a pattern for an
+/// executable with no OS lands in the native automaton on every
+/// platform, where a `win32` one is reachable only through the Proton
+/// automaton and only on Linux. The tier under test is the same either
+/// way — both probes run the one shared variant loop — but the CI tests
+/// on Windows and macOS too, and there the Proton automaton is never
+/// built at all. The names are still the real ones
+/// `applications/detectable` declares for this game.
+fn exe_only_server() -> ProcessServer {
+  let (tx, _rx) = rsrpc_telemetry::QueueGauge::pair();
+  let entry: DetectableActivity = serde_json::from_value(serde_json::json!({
+    "id": "356879032584896512",
+    "name": "Garry's Mod",
+    "hook": false,
+    "executables": [
+      {"name": "hl2.exe", "is_launcher": false, "os": ""},
+      {"name": "garrysmod/hl2.exe", "is_launcher": false, "os": ""},
+      {"name": "bin/gmad.exe", "is_launcher": false, "os": ""},
+      {"name": "win64/gmod.exe", "is_launcher": false, "os": ""},
+    ],
+    "aliases": []
+  }))
+  .expect("fixture parses");
+  ProcessServer::new_with_custom(
+    vec![Arc::new(entry)],
+    vec![],
+    tx,
+    ProcessEventListeners::default(),
+    RefreshConfig::default(),
+    vec![],
+  )
+}
+
+/// The automaton matches a substring, not a path component: any process
+/// whose path merely *contains* a declared executable name reads as the
+/// game. `.../xhl2.exe` holds `hl2.exe`; so does `.../hl2.exe.txt`; so
+/// does `.../hl2.exe.evil`. Nothing about any of them says the game is
+/// running.
+///
+/// No store id is in play here, so the id-tier corroboration that fixed
+/// the inherited-AppId false positive cannot answer for this one: the
+/// automaton is the tier that has to know the difference.
+#[test]
+fn a_path_that_merely_contains_a_declared_exe_name_is_not_the_game() {
+  let server = exe_only_server();
+  let bundle = server.bundle();
+  let mut scratch = ScanScratch::default();
+  let mut variants: [String; 5] = Default::default();
+  let mut reversed = String::new();
+  let mut obs_open = false;
+
+  for argv0 in [
+    "/C:/Program Files (x86)/Steam/steamapps/common/GarrysMod/xhl2.exe",
+    "/C:/Program Files (x86)/Steam/steamapps/common/GarrysMod/hl2.exe.txt",
+    "/C:/Program Files (x86)/Steam/steamapps/common/GarrysMod/hl2.exe.evil",
+  ] {
+    let hit = server.match_process(
+      &process(argv0, ""),
+      &bundle,
+      &mut variants,
+      &mut reversed,
+      &mut obs_open,
+      &mut scratch,
+    );
+    assert!(
+      hit.is_none(),
+      "{argv0} only contains a declared name — it does not end with one, \
+       so it names no executable the entry declares"
+    );
+  }
+}
+
+/// The other half of the rule, with no store id in play: the game's own
+/// process keeps its detection through the automaton itself. A boundary
+/// rule that is too tight is a silent false negative — a legitimate game
+/// that simply stops being announced — so this half is pinned as hard as
+/// the rejection above.
+///
+/// The last case is why the check reads the string that was actually
+/// probed: `hl2_64.exe` reaches the automaton as its 64-bit-stripped
+/// variant `hl2.exe`, and the boundary has to hold for the variant.
+#[test]
+fn the_automaton_still_names_the_games_own_process() {
+  let server = exe_only_server();
+  let bundle = server.bundle();
+  let mut scratch = ScanScratch::default();
+  let mut variants: [String; 5] = Default::default();
+  let mut reversed = String::new();
+  let mut obs_open = false;
+
+  for argv0 in [
+    "/C:/Program Files (x86)/Steam/steamapps/common/GarrysMod/hl2.exe",
+    "/C:/Program Files (x86)/Steam/steamapps/common/GarrysMod/garrysmod/hl2.exe",
+    "/C:/Program Files (x86)/Steam/steamapps/common/GarrysMod/win64/gmod.exe",
+    "/C:/Program Files (x86)/Steam/steamapps/common/GarrysMod/bin/gmad.exe",
+    // Probed as its stripped variant `.../hl2.exe`.
+    "/C:/Program Files (x86)/Steam/steamapps/common/GarrysMod/hl2_64.exe",
+  ] {
+    let hit = server
+      .match_process(
+        &process(argv0, ""),
+        &bundle,
+        &mut variants,
+        &mut reversed,
+        &mut obs_open,
+        &mut scratch,
+      )
+      .unwrap_or_else(|| panic!("{argv0} should read as the game"));
+    assert_eq!(hit.entry.name, "Garry's Mod".into());
+    assert_eq!(
+      hit.source,
+      DetectSource::Automaton,
+      "{argv0} must be the automaton answering, not a heuristic falling back"
+    );
+  }
 }

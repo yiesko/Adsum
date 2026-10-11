@@ -635,6 +635,62 @@ fn argv_names_an_executable(process_path: &str, obj: &ScannedEntry) -> bool {
   })
 }
 
+/// Whether the declared executable `name` names the tail of `path` on a
+/// path-component boundary.
+///
+/// The boundary half of the corroboration rule the store-id tier applies
+/// ([`argv_names_an_executable`]), compared against the **normalized**
+/// name instead of the raw one: the automaton's pattern is the name after
+/// `normalize_exe_pattern` — Windows separators folded, the launcher
+/// marker turned into the leading `/` — so comparing the raw name here
+/// would reject every launcher entry the automaton just accepted.
+///
+/// The automaton matches a substring, so a hit on its own is not
+/// evidence: a process whose path merely *contains* a declared name
+/// (`.../hl2.exe.txt` holds `hl2.exe`) would otherwise read as the game,
+/// with no store id involved to catch it. The name has to END the
+/// string, and what precedes it has to be a separator.
+///
+/// Walks bytes from the end and folds case in place, so confirming a hit
+/// costs no allocation: the automaton fires once per detected process,
+/// but the scan tick classifies every process on the box.
+fn exe_names_path(path: &str, name: &str) -> bool {
+  // The launcher marker is arrpc's "the arguments carry the launcher"
+  // flag, kept raw on the entry for the argument check in
+  // `finish_direct_hit`; it is not part of the file name.
+  let name = name.strip_prefix('>').unwrap_or(name);
+  // A name that normalizes to a bare `/` is dropped at bundle build time
+  // (it would match every path), so no hit can point at one — but a name
+  // that names nothing must never name anything.
+  if name.is_empty() {
+    return false;
+  }
+  let path = path.as_bytes();
+  let name = name.as_bytes();
+  let Some(at) = path.len().checked_sub(name.len()) else {
+    // Shorter than the name: it cannot be this name's tail.
+    return false;
+  };
+  let tail = &path[at..];
+  if !tail.iter().zip(name).all(|(path_byte, name_byte)| {
+    // A declared Windows separator is the `/` the path carries.
+    let name_byte = if *name_byte == b'\\' {
+      b'/'
+    } else {
+      *name_byte
+    };
+    path_byte.eq_ignore_ascii_case(&name_byte)
+  }) {
+    return false;
+  }
+  // What precedes the name has to be a separator — unless the name
+  // carries its own leading one, which is the boundary itself (a
+  // normalized pattern does). Bytes, not chars: the tail was matched
+  // byte-for-byte above, so the split is already known to be aligned.
+  let rest = &path[..at];
+  rest.is_empty() || rest.last() == Some(&b'/') || matches!(name.first(), Some(b'/' | b'\\'))
+}
+
 /// One store-id lookup: what is being asked, and the tables that answer it.
 ///
 /// Positional arguments ran out at eight, and the parts split naturally
@@ -873,6 +929,14 @@ impl ProcessServer {
   /// custom — so a main pattern always beats a custom one even when
   /// only a stripped variant collides (e.g. main `wow.exe` vs custom
   /// `wow64.exe`).
+  ///
+  /// A hit is only returned once it is corroborated: the automaton
+  /// matches substrings, so the executable that fired has to name the end
+  /// of the probed string on a component boundary
+  /// ([`exe_names_path`](exe_names_path)). This is the one place that
+  /// knows both halves at once — the string that was actually probed
+  /// (the variant the 64-bit strip rewrote, or the cwd-joined candidate
+  /// the caller built) and which executable matched it.
   fn probe_variants(
     &self,
     path: &str,
@@ -901,8 +965,28 @@ impl ProcessServer {
         } else {
           self.custom_probe(reversed_path, bundle)
         };
-        if found.is_some() {
-          return found;
+        // The automaton matches a substring, so a hit on its own is not
+        // evidence: a process whose path merely *contains* a declared
+        // name would read as the game, with no store id in play to
+        // corroborate it. The executable that fired has to name the END
+        // of the string that was probed — the variant, which the 64-bit
+        // strip may have rewritten, and which the cwd-joined caller
+        // built — on a component boundary. A hit that fails keeps
+        // looking: another variant, or the other automaton, may still
+        // name the process properly.
+        if let Some((obj, exe_index)) = found {
+          if obj
+            .executables
+            .get(exe_index)
+            .is_some_and(|exe| exe_names_path(variant, &exe.name))
+          {
+            return Some((obj, exe_index));
+          }
+          tracing::debug!(
+            "[Process Scanner] {} does not name a declared executable of {}, skipping",
+            variant,
+            obj.name
+          );
         }
       }
     }
@@ -1481,6 +1565,99 @@ mod tick2_tests {
       assert!(
         argv_names_an_executable(path, &entry),
         "{path} should pass when nothing is declared"
+      );
+    }
+  }
+
+  /// The automaton tier's boundary rule: a declared executable name has
+  /// to END the probed string on a path-component boundary. The
+  /// automaton matches a substring, so without this any process whose
+  /// path merely *contains* a name reads as the game.
+  ///
+  /// Compared against the *normalized* name — Windows separators folded
+  /// and the launcher marker (`>`) turned into the leading `/`, exactly
+  /// what `normalize_exe_pattern` does before the pattern is built.
+  /// Comparing the raw name instead would reject every launcher entry
+  /// the automaton just accepted.
+  #[test]
+  fn exe_names_path_demands_a_component_boundary() {
+    for (name, path) in [
+      // The relative names the database spells, as a Proton `argv[0]`
+      // carries them: the name sits at the end.
+      ("hl2.exe", "/C:/Steam/steamapps/common/GarrysMod/hl2.exe"),
+      ("hl2.exe", "/C:/Steam/steamapps/common/garrysmod/HL2.EXE"),
+      (
+        "garrysmod/hl2.exe",
+        "/C:/Steam/steamapps/common/GarrysMod/garrysmod/hl2.exe",
+      ),
+      (
+        "win64/gmod.exe",
+        "/C:/Steam/steamapps/common/GarrysMod/win64/gmod.exe",
+      ),
+      // A declared `bin\gmad.exe` is the `bin/gmad.exe` the path carries.
+      (
+        "bin\\gmad.exe",
+        "/C:/Steam/steamapps/common/GarrysMod/bin/gmad.exe",
+      ),
+      // The launcher marker is not part of the file name: it is kept raw
+      // on the entry for the argument check in `finish_direct_hit`.
+      (">hl2.exe", "/C:/Steam/steamapps/common/GarrysMod/hl2.exe"),
+      // A name that carries its own leading separator owns its boundary.
+      ("/hl2.exe", "/C:/Steam/steamapps/common/GarrysMod/hl2.exe"),
+      // The bare name alone, as the database spells it.
+      ("hl2.exe", "hl2.exe"),
+      // Multi-byte components on the way in do not disturb the tail.
+      ("a.exe", "/games/ä/a.exe"),
+    ] {
+      assert!(
+        exe_names_path(path, name),
+        "{name:?} should name the tail of {path:?}"
+      );
+    }
+
+    for (name, path) in [
+      // A near miss is not a match: the boundary is a `/`, not any byte.
+      ("hl2.exe", "/C:/Steam/steamapps/common/GarrysMod/xhl2.exe"),
+      (
+        "hl2.exe",
+        "/C:/Steam/steamapps/common/GarrysMod/hl2.exe.txt",
+      ),
+      (
+        "hl2.exe",
+        "/C:/Steam/steamapps/common/GarrysMod/hl2.exe.evil",
+      ),
+      // A multi-component name has to match whole, boundary included.
+      (
+        "garrysmod/hl2.exe",
+        "/C:/Steam/steamapps/common/GarrysMod/xgarrysmod/hl2.exe",
+      ),
+      (
+        "bin/gmad.exe",
+        "/C:/Steam/steamapps/common/GarrysMod/hl2.exe/gmad.exe",
+      ),
+      // A folder that ends the path is not the executable.
+      ("hl2.exe", "/C:/Steam/steamapps/common/GarrysMod/hl2.exe/"),
+      // The un-stripped original: the scan probes the stripped variant,
+      // and the check reads the string that was probed.
+      ("hl2.exe", "/C:/Steam/steamapps/common/GarrysMod/hl2_64.exe"),
+      (
+        ">hl2.exe",
+        "/C:/Steam/steamapps/common/GarrysMod/hl2_64.exe",
+      ),
+      // A different game entirely.
+      (
+        "hl2.exe",
+        "/C:/Steam/steamapps/common/deadlock/game/bin/win64/deadlock.exe",
+      ),
+      // Shorter than the name.
+      ("hl2.exe", "hl2.ex"),
+      // A name that normalizes to a bare `/` is dropped at bundle build
+      // time, because it would match every path: it names nothing.
+      (">", "/anything"),
+    ] {
+      assert!(
+        !exe_names_path(path, name),
+        "{name:?} must not name the tail of {path:?}"
       );
     }
   }
