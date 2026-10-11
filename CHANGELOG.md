@@ -77,10 +77,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   index pairs, and the automaton is built in a single pass with exact
   reservations.
 - Structural caps on the fetched database, measured rather than guessed:
-  the live `applications/detectable` body and the bundled snapshot agree
-  at 24,628 entries, 16 executables, 8 aliases, 31 Steam SKUs and
-  204-character names, and every cap sits an order of magnitude above
-  that. A body decoding past one is rejected as `DatabaseTooLarge`,
+  the bundled snapshot is 24,299 entries, and the maxima within an entry are
+  16 executables, 8 aliases, 30 Steam SKUs and 204-character names. Every
+  cap sits an order of magnitude above that. A body decoding past one is
+  rejected as `DatabaseTooLarge`,
   distinct from a parse failure, and the caller keeps the database it
   already holds. The 64 MiB body limit bounded the bytes; it never
   bounded what they decode into — one entry with tens of thousands of
@@ -112,7 +112,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flood-guard table stays within its cap.
 - Shared package metadata and dependency pins now live in the workspace
   root (`[workspace.package]` + `[workspace.dependencies]`): edition,
-  MSRV, license, repository, authors and 14 dependency versions change
+  MSRV, license, repository, authors and 15 dependency versions change
   once instead of per crate. `Cargo.lock` is byte-identical, and per-crate
   versions are untouched. `authors` names the historical author and the
   current maintainer (`spikehd`, `yieskoW`). `tokio-util` stays pinned
@@ -334,8 +334,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cfg-gated) (`crates/rsrpc-detect/src/db.rs`, `server.rs`). The
   canonical content hash is factored per entry (byte-identical stream,
   pinned by a fold test).
-- First-sighting `INFO` logs report every new id again: the
-  `MAX_SEEN_IDS` cap is dropped, restoring main-branch log parity.
+- First-sighting `INFO` logs report every new id again, restoring main-branch
+  log parity. The remembered-id set stays bounded at
+  `MAX_SEEN_IDS = 1024`: past it the set is dropped whole rather than grown
+  without limit, so a repeat `INFO` may surface after enough id churn. That
+  is the accepted trade for constant memory — the log line is diagnostic,
+  never state.
 
 ### Added
 - Read-only resource census for long-session memory diagnosis (no behavior

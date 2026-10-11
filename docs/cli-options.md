@@ -117,7 +117,7 @@ When nothing matches, `--list-detected` prints
 
 | Flag | Environment variable | What it does |
 |---|---|---|
-| `--check-update` | `RSRPC_CHECK_UPDATE` | Check for a newer release and exit. Exit code `2` means one is available, `0` means you are up to date. |
+| `--check-update` | `RSRPC_CHECK_UPDATE` | Check for a newer release and exit. Exit code `2` means one is available, `0` means there is nothing to do — which is either "you are up to date" or "no build exists for your platform". The printed line says which; do not treat `0` alone as up-to-date on a non-Linux host. |
 | `--update` | `RSRPC_UPDATE` | Download and stage the newest release. It applies on the next start. |
 | `--yes` | *(none)* | Answer "yes" to the staging prompt, for scripts. |
 | `--rollback` | `RSRPC_ROLLBACK` | Restore the binary that the last update replaced, then exit. |
@@ -133,6 +133,7 @@ These have no command-line flag:
 |---|---|
 | `RSRPC_USER_ID`, `RSRPC_USER_USERNAME`, `RSRPC_USER_GLOBAL_NAME`, `RSRPC_USER_DISCRIMINATOR`, `RSRPC_USER_AVATAR` | Change the identity rsRPC reports to clients. Blank values are ignored. |
 | `RSRPC_OTA_DIR` | Where updates are staged (default `~/.cache/rsrpc/ota/`). |
+| `RSRPC_OTA_APPLIED` | **Internal.** Set by rsRPC on the re-executed process so a staged update applies at most once per boot chain. Setting it yourself makes the next start skip the pending update and turns `--rollback` into a no-op — leave it alone. |
 | `RSRPC_STEAM_ROOT` | Point at a specific Steam install directory. |
 | `RSRPC_STEAM_LIBRARIES` | Point at specific Steam library folders (`:`-separated). |
 | `RUST_LOG` | Full `tracing` filter; overrides the `--debug`/`RSRPC_DEBUG` choice (see below). |

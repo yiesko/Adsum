@@ -84,13 +84,28 @@ when it finds:
 
 ## Supported targets
 
-Published update binaries are Linux x86_64 and Linux ARM64
-(`rsrpc-cli-x86_64-unknown-linux-gnu`, `rsrpc-cli-aarch64-unknown-linux-gnu`).
-Anything else reports `no published builds for <triple>` and keeps the
-version it has. Releases also ship `SHA256SUMS.txt` (plus its minisign
+**Background update staging only works on Linux x86_64 and Linux ARM64.**
+Those are the only two raw binaries published as
+`rsrpc-cli-x86_64-unknown-linux-gnu` and
+`rsrpc-cli-aarch64-unknown-linux-gnu`. Anything else reports `no published
+builds for <triple>` and keeps the version it has.
+
+Every release carries **seven zipped builds**, one per CI target:
+
+| Archive | Platform |
+|---|---|
+| `rsrpc-x86_64-unknown-linux-gnu.zip` | Linux x86_64 |
+| `rsrpc-aarch64-unknown-linux-gnu.zip` | Linux ARM64 |
+| `rsrpc-armv7-unknown-linux-gnueabihf.zip` | Linux ARMv7 |
+| `rsrpc-x86_64-apple-darwin.zip` | macOS Intel |
+| `rsrpc-aarch64-apple-darwin.zip` | macOS Apple Silicon |
+| `rsrpc-x86_64-pc-windows-msvc.zip` | Windows x86_64 |
+| `rsrpc-aarch64-pc-windows-msvc.zip` | Windows ARM64 |
+
+Alongside them, each release ships `SHA256SUMS.txt` (plus its minisign
 signature), the `systemd/rsrpc.service` unit file (covered by the same
-manifest), and zipped builds for Linux armv7, macOS (x86_64 and ARM64) and
-Windows (x86_64 and ARM64) on the
+manifest), and — on the two Linux targets above — the raw binary that
+`--update` fetches. All of it is on the
 [releases page](https://github.com/yiesko/discord-rich-presence/releases).
 
 ## See also
