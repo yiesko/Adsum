@@ -6,7 +6,14 @@
 //! from a service context, so the id reaches the scanner by way of the
 //! command line: "AppId 4000 for pid … from command line (environ
 //! unreadable)", one second after Steam committed 3005 updated files, while
-//! the user was only downloading. That is the shape this file pins.
+//! the user was only downloading.
+//!
+//! The process that did it was named once the fix was deployed and the
+//! download repeated: Steam's own `reaper`, under its `ubuntu12_32` runtime
+//! directory, launched at the end of the update with the app's AppId. It is
+//! the regression this file now pins by name, and the reason the rule is the
+//! executable rather than a list: `reaper` is a plain word a game could ship
+//! as its own binary.
 
 use std::sync::Arc;
 
@@ -21,11 +28,16 @@ const APP_ID: &str = "4000";
 
 /// The basenames in [`STEAM_SIDECAR_BASENAMES`] cover the known Steam
 /// launchers. These do not — and are the ones only the executable rule can
-/// catch: a script interpreter, a runtime, the client itself. The short
-/// unknown process that announced Garry's Mod while 3005 files were being
-/// committed was almost certainly one of these, which is exactly why the
-/// rule does not depend on the list being complete.
+/// catch: a script interpreter, a runtime, the client itself, and the one
+/// that actually did it. The short unknown process that announced Garry's
+/// Mod while 3005 files were being committed was Steam's own `reaper`, from
+/// its `ubuntu12_32` runtime, launched at the end of the update with the
+/// app's AppId — which is why the rule does not depend on the list being
+/// complete, and why `reaper` is deliberately *not* on it: a plain word can
+/// be a game's binary, while the executable check cannot be fooled by a name
+/// at all.
 const UNLISTED_HELPERS: &[&str] = &[
+  "reaper",
   "sh",
   "dash",
   "bash",
