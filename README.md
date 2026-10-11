@@ -191,7 +191,7 @@ Add the dependency (git tag; `rsrpc-core` is not on crates.io):
 
 ```toml
 [dependencies]
-rsrpc-core = { git = "https://github.com/yiesko/discord-rich-presence", tag = "v0.36.0" }
+rsrpc-core = { git = "https://github.com/yiesko/discord-rich-presence", tag = "v0.38.0" }
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal"] }
 ```
 
