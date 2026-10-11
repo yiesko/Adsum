@@ -691,6 +691,41 @@ fn exe_names_path(path: &str, name: &str) -> bool {
   rest.is_empty() || rest.last() == Some(&b'/') || matches!(name.first(), Some(b'/' | b'\\'))
 }
 
+/// First of `probe`'s matches that names the end of `variant` on a
+/// component boundary, if any.
+///
+/// The automaton reports the earliest-*ending* match, which is not
+/// necessarily the one that names the process: a shorter declared name
+/// from another entry can end *before* it, inside the same path — `java`
+/// inside `illarion/jre/bin/java.exe`. Refusing that match is correct, but
+/// refusing the *variant* with it would lose the game the path does name,
+/// so the walk continues through the variant's remaining matches in the
+/// same order a single `find` used to return them. Each refusal is logged,
+/// because a boundary rule that is too tight is a silent false negative.
+///
+/// Generic in the probe so the three automatons, whose iterators are
+/// different types, share this one corroboration.
+fn first_hit_naming_path(
+  probe: impl Iterator<Item = (Arc<ScannedEntry>, usize)>,
+  variant: &str,
+) -> Option<(Arc<ScannedEntry>, usize)> {
+  for (obj, exe_index) in probe {
+    if obj
+      .executables
+      .get(exe_index)
+      .is_some_and(|exe| exe_names_path(variant, &exe.name))
+    {
+      return Some((obj, exe_index));
+    }
+    tracing::debug!(
+      "[Process Scanner] {} does not name a declared executable of {}, skipping",
+      variant,
+      obj.name
+    );
+  }
+  None
+}
+
 /// One store-id lookup: what is being asked, and the tables that answer it.
 ///
 /// Positional arguments ran out at eight, and the parts split naturally
@@ -885,41 +920,71 @@ impl ProcessServer {
   /// Main-DB half of [`ProcessServer::ac_probe`]: every path variant is
   /// probed here before any variant reaches custom overrides, so a main
   /// pattern always beats a custom one regardless of 64-bit stripping.
-  fn main_probe(
+  ///
+  /// Yields the matches in scan order (earliest-ending first — the same
+  /// one `find` returned), *overlapping* included: a shorter declared
+  /// name can sit inside the path (`java` inside
+  /// `illarion/jre/bin/java.exe`) and end before the match that actually
+  /// names the process, so the caller has to be able to refuse that one
+  /// and keep looking at the rest of the variant instead of giving up on
+  /// the variant as a whole. Overlapping iteration is what makes those
+  /// two visible to the same walk.
+  fn main_probe<'a>(
     &self,
-    reversed_path: &str,
-    bundle: &DetectablesBundle,
-  ) -> Option<(Arc<ScannedEntry>, usize)> {
-    let mat = bundle.ac.find(reversed_path)?;
-    let pair = bundle.indexes[mat.pattern().as_usize()].resolve();
-    Some((bundle.list[pair.0].clone(), pair.1))
+    reversed_path: &'a str,
+    bundle: &'a DetectablesBundle,
+  ) -> impl Iterator<Item = (Arc<ScannedEntry>, usize)> + 'a {
+    bundle
+      .ac
+      .find_overlapping_iter(reversed_path)
+      .filter_map(move |mat| {
+        let pair = bundle.indexes.get(mat.pattern().as_usize())?.resolve();
+        Some((bundle.list.get(pair.0)?.clone(), pair.1))
+      })
   }
 
-  /// Custom-overrides half of [`ProcessServer::ac_probe`].
-  fn custom_probe(
+  /// Custom-overrides half of [`ProcessServer::ac_probe`]. Same scan-order
+  /// overlapping walk as [`main_probe`](ProcessServer::main_probe).
+  fn custom_probe<'a>(
     &self,
-    reversed_path: &str,
-    bundle: &DetectablesBundle,
-  ) -> Option<(Arc<ScannedEntry>, usize)> {
-    let custom_ac = bundle.custom_ac.as_ref()?;
-    let mat = custom_ac.find(reversed_path)?;
-    let pair = bundle.custom_indexes[mat.pattern().as_usize()].resolve();
-    Some((bundle.custom[pair.0].clone(), pair.1))
+    reversed_path: &'a str,
+    bundle: &'a DetectablesBundle,
+  ) -> impl Iterator<Item = (Arc<ScannedEntry>, usize)> + 'a {
+    bundle.custom_ac.iter().flat_map(move |ac| {
+      ac.find_overlapping_iter(reversed_path)
+        .filter_map(move |mat| {
+          let pair = bundle
+            .custom_indexes
+            .get(mat.pattern().as_usize())?
+            .resolve();
+          Some((bundle.custom.get(pair.0)?.clone(), pair.1))
+        })
+    })
   }
 
-  /// Proton fallback probe (main DB `win32` entries on Linux): same shape
-  /// as [`ProcessServer::ac_probe`], consulted only after the native
-  /// patterns, user overrides and the authoritative Steam AppId all miss.
-  /// Empty automaton off-Linux, so this is a cheap `None` there.
-  pub fn proton_probe(
+  /// Proton fallback probe (main DB `win32` entries on Linux): consulted
+  /// only after the native patterns, user overrides and the authoritative
+  /// Steam AppId all miss. Empty automaton off-Linux, so this is a cheap
+  /// empty iterator there rather than a `None`.
+  ///
+  /// Same scan-order overlapping walk as the main-DB half: the callers
+  /// refuse a match that does not name the probed string, and a refusal
+  /// must cost that match, not the whole variant.
+  pub fn proton_probe<'a>(
     &self,
-    reversed_path: &str,
-    bundle: &DetectablesBundle,
-  ) -> Option<(Arc<ScannedEntry>, usize)> {
-    let automaton = bundle.proton_ac.as_ref()?;
-    let mat = automaton.find(reversed_path)?;
-    let pair = bundle.proton_indexes[mat.pattern().as_usize()].resolve();
-    Some((bundle.list[pair.0].clone(), pair.1))
+    reversed_path: &'a str,
+    bundle: &'a DetectablesBundle,
+  ) -> impl Iterator<Item = (Arc<ScannedEntry>, usize)> + 'a {
+    bundle.proton_ac.iter().flat_map(move |ac| {
+      ac.find_overlapping_iter(reversed_path)
+        .filter_map(move |mat| {
+          let pair = bundle
+            .proton_indexes
+            .get(mat.pattern().as_usize())?
+            .resolve();
+          Some((bundle.list.get(pair.0)?.clone(), pair.1))
+        })
+    })
   }
 
   /// Shared variant loop: try `path` plus its 64-bit-stripped variants
@@ -958,35 +1023,19 @@ impl ProcessServer {
       for variant in &variant_bufs[..variant_count] {
         reversed_path.clear();
         reversed_path.extend(variant.chars().rev());
-        let found = if proton {
-          self.proton_probe(reversed_path, bundle)
+        // One automaton's matches for this variant, in scan order, until
+        // one names the string that was probed. Generic in the probe so
+        // the three automatons — which yield different iterator types —
+        // share the corroboration below instead of repeating it.
+        let hit = if proton {
+          first_hit_naming_path(self.proton_probe(reversed_path, bundle), variant)
         } else if pass == 0 {
-          self.main_probe(reversed_path, bundle)
+          first_hit_naming_path(self.main_probe(reversed_path, bundle), variant)
         } else {
-          self.custom_probe(reversed_path, bundle)
+          first_hit_naming_path(self.custom_probe(reversed_path, bundle), variant)
         };
-        // The automaton matches a substring, so a hit on its own is not
-        // evidence: a process whose path merely *contains* a declared
-        // name would read as the game, with no store id in play to
-        // corroborate it. The executable that fired has to name the END
-        // of the string that was probed — the variant, which the 64-bit
-        // strip may have rewritten, and which the cwd-joined caller
-        // built — on a component boundary. A hit that fails keeps
-        // looking: another variant, or the other automaton, may still
-        // name the process properly.
-        if let Some((obj, exe_index)) = found {
-          if obj
-            .executables
-            .get(exe_index)
-            .is_some_and(|exe| exe_names_path(variant, &exe.name))
-          {
-            return Some((obj, exe_index));
-          }
-          tracing::debug!(
-            "[Process Scanner] {} does not name a declared executable of {}, skipping",
-            variant,
-            obj.name
-          );
+        if let Some(hit) = hit {
+          return Some(hit);
         }
       }
     }
@@ -1240,9 +1289,12 @@ impl ProcessServer {
   ) -> Option<(Arc<ScannedEntry>, usize)> {
     // Same-bundle automaton + indexes: the ids this find() returns can
     // only index the table they were built with. No locks, no tearing.
+    // First match per automaton, main before custom: this seam is the raw
+    // probe — the boundary corroboration lives in `probe_variants`.
     self
       .main_probe(reversed_path, bundle)
-      .or_else(|| self.custom_probe(reversed_path, bundle))
+      .next()
+      .or_else(|| self.custom_probe(reversed_path, bundle).next())
   }
 }
 

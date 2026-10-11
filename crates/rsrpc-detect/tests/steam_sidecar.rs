@@ -171,6 +171,120 @@ fn the_games_own_process_still_reads_as_the_game() {
   }
 }
 
+/// Two entries that collide by construction, exactly as
+/// `applications/detectable` declares them: Minecraft declares the bare
+/// `>java` (the real entry also declares `>javaw.exe`, left out because
+/// the collision under test is the one it takes part in), and Illarion
+/// declares `illarion/jre/bin/java.exe`, whose automaton pattern
+/// *contains* Minecraft's. No store ids, so only the automaton can
+/// answer — the same exclusion the other fixture relies on.
+fn colliding_exe_server() -> ProcessServer {
+  let (tx, _rx) = rsrpc_telemetry::QueueGauge::pair();
+  let entries: Vec<DetectableActivity> = serde_json::from_value(serde_json::json!([
+    {
+      "id": "1",
+      "name": "Minecraft",
+      "hook": false,
+      "executables": [{"name": ">java", "is_launcher": false, "os": ""}],
+      "aliases": []
+    },
+    {
+      "id": "2",
+      "name": "Illarion",
+      "hook": false,
+      "executables": [{"name": "illarion/jre/bin/java.exe", "is_launcher": false, "os": ""}],
+      "aliases": []
+    }
+  ]))
+  .expect("fixture parses");
+  ProcessServer::new_with_custom(
+    entries.into_iter().map(Arc::new).collect(),
+    vec![],
+    tx,
+    ProcessEventListeners::default(),
+    RefreshConfig::default(),
+    vec![],
+  )
+}
+
+/// A hit rejected on the boundary must not hide the match that does name
+/// the path.
+///
+/// The automaton reports the earliest-*ending* match, and a different
+/// entry's shorter declared name can sit inside the path: Minecraft's
+/// `java` pattern is the interior of `illarion/jre/bin/java.exe`, and it
+/// ends earlier than Illarion's, so it is the one returned. Rejecting it
+/// is right — the path does not end with `java` — but falling through to
+/// the next variant with it throws away the match that *does* name the
+/// process. That is what the boundary check did right after it landed:
+/// the loop moved on instead of asking the automaton for the rest of the
+/// variant's matches, and this process stopped being detected at all
+/// (worse: before the boundary check it was announced as Minecraft).
+///
+/// Same entry order as the database, so the pattern order is realistic.
+#[test]
+fn a_rejected_match_does_not_hide_the_one_that_names_the_path() {
+  let server = colliding_exe_server();
+  let bundle = server.bundle();
+  let mut scratch = ScanScratch::default();
+  let mut variants: [String; 5] = Default::default();
+  let mut reversed = String::new();
+  let mut obs_open = false;
+
+  let hit = server
+    .match_process(
+      &process("/opt/illarion/jre/bin/java.exe", ""),
+      &bundle,
+      &mut variants,
+      &mut reversed,
+      &mut obs_open,
+      &mut scratch,
+    )
+    .expect(".../illarion/jre/bin/java.exe should read as Illarion, not be lost");
+  assert_eq!(
+    hit.entry.name,
+    "Illarion".into(),
+    "the interior `java` match that was rejected belongs to Minecraft"
+  );
+  assert_eq!(
+    hit.source,
+    DetectSource::Automaton,
+    "no store id is in play, so only the automaton can answer"
+  );
+}
+
+/// The other half of the rule above: a path that ends with the *short*
+/// declared name still matches it, and the entry that declares it is the
+/// one announced — `java` declares the executable *named* `java`, so the
+/// path has to end with exactly that, not with `java.exe`.
+///
+/// The two tests together pin that the boundary rule filters matches
+/// without starving the variant they came from: the long name that
+/// contains the short one, and the short name on its own.
+#[test]
+fn the_short_declared_name_still_matches_a_path_ending_with_it() {
+  let server = colliding_exe_server();
+  let bundle = server.bundle();
+  let mut scratch = ScanScratch::default();
+  let mut variants: [String; 5] = Default::default();
+  let mut reversed = String::new();
+  let mut obs_open = false;
+
+  for argv0 in ["/opt/minecraft/java", "/opt/minecraft/jre/bin/java"] {
+    let hit = server
+      .match_process(
+        &process(argv0, ""),
+        &bundle,
+        &mut variants,
+        &mut reversed,
+        &mut obs_open,
+        &mut scratch,
+      )
+      .unwrap_or_else(|| panic!("{argv0} should read as Minecraft"));
+    assert_eq!(hit.entry.name, "Minecraft".into(), "{argv0}");
+  }
+}
+
 /// An entry with no declared executables is the case the id tier exists
 /// for, and it keeps working: there is nothing to corroborate against, so
 /// the store id stands on its own.
