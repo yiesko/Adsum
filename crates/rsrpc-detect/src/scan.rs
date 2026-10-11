@@ -618,8 +618,9 @@ pub(crate) fn is_shortcut_id(app_id: &str) -> bool {
 /// declared only `>hl2.exe` or `bin\gmad.exe`. It also compares in place,
 /// so the per-name lowercased copy this loop used to build is gone.
 fn argv_names_an_executable(process_path: &str, obj: &ScannedEntry) -> bool {
-  // Nothing declared: the store id is the only evidence there is, so it
-  // stands on its own. This is the case the id tier exists for.
+  // Nothing declared that can name the game: the store id is the only
+  // evidence there is, so it stands on its own. This is the case the id
+  // tier exists for.
   //
   // It is also the tier's largest hole, and knowingly so: 35% of the
   // database declares no executables, so a helper that inherits such an
@@ -632,9 +633,25 @@ fn argv_names_an_executable(process_path: &str, obj: &ScannedEntry) -> bool {
   if obj.executables.is_empty() {
     return true;
   }
+  // A launcher is not the game, and the database flags them as such
+  // (`is_launcher`). Steam launches the launcher with the game's store
+  // id, so a process can carry Baldur's Gate III's id while running only
+  // `larilauncher.exe` — the same inherited-id shape as the `reaper`. The
+  // automaton never had a pattern for one of these (`collect_split_patterns`
+  // skips them), so without this filter the two tiers disagree about
+  // exactly the process the flag exists to describe. The `>` marker on a
+  // name is a different thing: it is the arrpc "arguments carry the
+  // launcher" spelling, and those entries are *not* flagged here.
+  //
+  // Every entry in the bundled database that declares a launcher also
+  // declares the game's own executables, so the filter costs no detection
+  // on current data. An entry that declared *only* launchers would lose
+  // the id tier — none does, and it would have nothing that names the
+  // game to be corroborated by.
   obj
     .executables
     .iter()
+    .filter(|exe| !exe.is_launcher)
     .any(|exe| exe_names_path(process_path, &exe.name))
 }
 
@@ -694,6 +711,43 @@ fn exe_names_path(path: &str, name: &str) -> bool {
   rest.is_empty() || rest.last() == Some(&b'/') || matches!(name.first(), Some(b'/' | b'\\'))
 }
 
+/// What one automaton's walk over a variant concluded about the process.
+///
+/// The middle case is the one that matters: the probed string *carries*
+/// declared executable names, but none of them names it — `.../Portal 2/
+/// portal2.exe.txt` holds `portal2.exe` without ending with it. That is
+/// specific evidence the process is not the game, and it is stronger than
+/// anything the stem and folder tiers can say, so it is carried forward
+/// instead of being flattened into an ordinary miss.
+#[derive(Debug)]
+enum MatchOutcome {
+  /// A match that names the probed string on a component boundary.
+  Corroborated(Arc<ScannedEntry>, usize),
+  /// Declared names were seen in this string, and every one of them was
+  /// refused: the process is running something that is *not* a declared
+  /// executable of any entry.
+  Refused,
+  /// No declared name was found in this string at all.
+  NoMatch,
+}
+
+impl MatchOutcome {
+  /// The hit, when the walk corroborated one.
+  fn take_hit(&self) -> Option<(Arc<ScannedEntry>, usize)> {
+    match self {
+      Self::Corroborated(obj, exe_index) => Some((obj.clone(), *exe_index)),
+      Self::Refused | Self::NoMatch => None,
+    }
+  }
+
+  /// Whether this outcome saw a declared name that did not name the
+  /// process: evidence strong enough that the looser stem and folder
+  /// tiers must not answer afterwards.
+  fn refused(&self) -> bool {
+    matches!(self, Self::Refused)
+  }
+}
+
 /// First of `probe`'s matches that names the end of `variant` on a
 /// component boundary, if any.
 ///
@@ -711,22 +765,28 @@ fn exe_names_path(path: &str, name: &str) -> bool {
 fn first_hit_naming_path(
   probe: impl Iterator<Item = (Arc<ScannedEntry>, usize)>,
   variant: &str,
-) -> Option<(Arc<ScannedEntry>, usize)> {
+) -> MatchOutcome {
+  let mut any_match = false;
   for (obj, exe_index) in probe {
     if obj
       .executables
       .get(exe_index)
       .is_some_and(|exe| exe_names_path(variant, &exe.name))
     {
-      return Some((obj, exe_index));
+      return MatchOutcome::Corroborated(obj, exe_index);
     }
+    any_match = true;
     tracing::debug!(
       "[Process Scanner] {} does not name a declared executable of {}, skipping",
       variant,
       obj.name
     );
   }
-  None
+  if any_match {
+    MatchOutcome::Refused
+  } else {
+    MatchOutcome::NoMatch
+  }
 }
 
 /// One store-id lookup: what is being asked, and the tables that answer it.
@@ -766,6 +826,15 @@ pub struct SteamIdLookup<'a> {
 /// game rather than of play. An entry declaring no executables is the case
 /// this tier exists for and wins on the id alone: there is nothing to
 /// corroborate against.
+///
+/// # Breaking change
+///
+/// Takes a [`SteamIdLookup`] instead of eight positional arguments. The
+/// old signature had no field for the process path — which is exactly
+/// what the corroboration is made of — so a compatible wrapper would
+/// have to guess at the evidence or silently skip the check. The parts
+/// are grouped because two callers now read as one sentence, and because
+/// the next field will not spill into a ninth positional.
 pub fn match_steam_id(
   pid: u64,
   stat: &mut String,
@@ -973,6 +1042,15 @@ impl ProcessServer {
   /// Same scan-order overlapping walk as the main-DB half: the callers
   /// refuse a match that does not name the probed string, and a refusal
   /// must cost that match, not the whole variant.
+  ///
+  /// # Breaking change
+  ///
+  /// Yields the matches instead of returning the first one. A caller that
+  /// wants the old behaviour — the first match, corroborated by nobody —
+  /// takes `.next()`, which is what the raw probe seam does. The scan loop
+  /// needs every match, because the first one can be a different entry's
+  /// shorter name that does not name the process, and stopping there
+  /// loses the game that does.
   pub fn proton_probe<'a>(
     &self,
     reversed_path: &'a str,
@@ -1012,7 +1090,7 @@ impl ProcessServer {
     reversed_path: &mut String,
     bundle: &DetectablesBundle,
     proton: bool,
-  ) -> Option<(Arc<ScannedEntry>, usize)> {
+  ) -> MatchOutcome {
     let variant_count = path_variants_into(path, variant_bufs);
     // Automaton passes outer, variants inner (strict precedence). Without
     // user overrides there is no custom automaton: run a single pass
@@ -1022,6 +1100,7 @@ impl ProcessServer {
     } else {
       2
     };
+    let mut outcome = MatchOutcome::NoMatch;
     for pass in 0..passes {
       for variant in &variant_bufs[..variant_count] {
         reversed_path.clear();
@@ -1030,19 +1109,23 @@ impl ProcessServer {
         // one names the string that was probed. Generic in the probe so
         // the three automatons — which yield different iterator types —
         // share the corroboration below instead of repeating it.
-        let hit = if proton {
+        outcome = if proton {
           first_hit_naming_path(self.proton_probe(reversed_path, bundle), variant)
         } else if pass == 0 {
           first_hit_naming_path(self.main_probe(reversed_path, bundle), variant)
         } else {
           first_hit_naming_path(self.custom_probe(reversed_path, bundle), variant)
         };
-        if let Some(hit) = hit {
-          return Some(hit);
+        // A corroborated hit ends the walk; a refusal is remembered so
+        // the looser tiers below can stand down, but the remaining
+        // variants and the other automaton still get their turn.
+        let hit = outcome.take_hit();
+        if let Some((obj, exe_index)) = hit {
+          return MatchOutcome::Corroborated(obj, exe_index);
         }
       }
     }
-    None
+    outcome
   }
 
   /// Classify one enumerated process, cheapest source first:
@@ -1128,15 +1211,28 @@ impl ProcessServer {
     // variants (so `wow64.exe` also matches a `wow.exe` pattern, like
     // arrpc/pog5-rsrpc). First hit in variant order wins.
     let mut found = self.probe_variants(&process_path, variant_bufs, reversed_path, bundle, false);
+    // Whether any automaton saw a declared name in this path that did not
+    // name it. That is specific evidence the process is *not* the game,
+    // carried down to the stem and folder tiers so they cannot hand a hit
+    // back over it (see `MatchOutcome::Refused`).
+    let mut refused = found.refused();
     // Which probe won (native path vs cwd-joined): tracked alongside
     // `found` because both funnel into one tail call below.
     let mut found_source = DetectSource::Automaton;
+
+    // The reconstructed path, when the bare-exe probe built one: the
+    // Proton probe below used to see only the bare `argv[0]` again, which
+    // loses a `win32` entry whose declared name carries the directory the
+    // cwd supplies (`bin/game.exe` for a bare `game.exe`). The store-id
+    // tier keeps the raw path — a cwd-joined string is a guess, and the
+    // authoritative tier should not corroborate on one.
+    let mut joined: Option<String> = None;
 
     // Proton bare-exe probe (DOOM Eternal case): argv[0] without
     // directories plus the process cwd often reconstructs the install
     // path the DB knows. Only for bare exes (paths with directories
     // already had their full match above); one readlink per miss.
-    if found.is_none()
+    if found.take_hit().is_none()
       && let Some(exe) = bare_exe(&process_path)
       && let Some(cwd) = read_cwd(process.pid)
     {
@@ -1146,13 +1242,16 @@ impl ProcessServer {
         process.pid
       );
       found = self.probe_variants(&candidate, variant_bufs, reversed_path, bundle, false);
-      if found.is_some() {
+      refused |= found.refused();
+      if found.take_hit().is_some() {
         found_source = DetectSource::CwdJoined;
         tracing::debug!("[Process Scanner] Cwd match for pid {}", process.pid);
+      } else {
+        joined = Some(candidate);
       }
     }
 
-    let (obj, exe_index) = match found {
+    let (obj, exe_index) = match found.take_hit() {
       Some(found) => found,
       None => {
         // Lowercase copy for the case-sensitive tail below (store-id
@@ -1209,6 +1308,18 @@ impl ProcessServer {
         // small unknown id is a real game missing from the DB, where
         // location (Steam's ground truth) still beats name guessing.
         let non_steam = app_id.as_deref().is_some_and(is_shortcut_id);
+        // A refusal already happened: an automaton saw a declared name in
+        // this path that did not name it. The tiers below are deliberately
+        // looser, and answering after one would hand the hit back over the
+        // specific evidence — `/opt/Portal 2/portal2.exe.txt` must not come
+        // back as Portal 2 from its folder.
+        if refused {
+          tracing::debug!(
+            "[Process Scanner] {} refused a declared executable match, not guessing further",
+            lowered
+          );
+          return None;
+        }
         if non_steam
           && let Some(hit) = match_name_or_folder(
             lowered,
@@ -1224,10 +1335,14 @@ impl ProcessServer {
         }
         // Proton fallback: `win32` executables from the main DB. Catches
         // Wine/Proton games whose store id is unreadable and whose exe is
-        // too generic for the stem/folder heuristics.
-        if let Some((obj, exe_index)) =
-          self.probe_variants(&process_path, variant_bufs, reversed_path, bundle, true)
-        {
+        // too generic for the stem/folder heuristics. The bare-exe probe
+        // above may have reconstructed a fuller path from the process
+        // cwd; that reconstruction is exactly what this probe needs, so
+        // it is preferred over the bare `argv[0]` when it exists.
+        let proton_path = joined.as_deref().unwrap_or(&process_path);
+        let proton = self.probe_variants(proton_path, variant_bufs, reversed_path, bundle, true);
+        refused |= proton.refused();
+        if let Some((obj, exe_index)) = proton.take_hit() {
           return finish_direct_hit(
             &obj,
             exe_index,
@@ -1235,6 +1350,16 @@ impl ProcessServer {
             DetectSource::ProtonAutomaton,
             &mut scratch.match_scratch.stat,
           );
+        }
+        // The Proton probe runs after the check above, so a refusal of its
+        // own is only settled here — and there are still two looser tiers
+        // below it.
+        if refused {
+          tracing::debug!(
+            "[Process Scanner] {} refused a declared executable match, not guessing further",
+            lowered
+          );
+          return None;
         }
         // Steam's own word: the process runs under a known install dir,
         // so it inherits that entry's AppId. Beats name guessing below,
