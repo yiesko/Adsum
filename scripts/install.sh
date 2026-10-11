@@ -131,6 +131,15 @@ if [ -f "$WORK/SHA256SUMS.txt" ]; then
     else
       die "minisign not installed: refusing to install unverified (install minisign and retry)"
     fi
+  else
+    # Fail closed, not just today. The download above already aborts when
+    # the signature is missing, so this branch is unreachable on the normal
+    # path -- which is exactly why it has to exist. If that `|| die` is ever
+    # relaxed to tolerate older releases, a missing signature would
+    # otherwise fall through to a SHA256-only install with no message,
+    # which is the opposite of what this script promises. An unsigned
+    # manifest is refused explicitly.
+    die "no signature manifest: refusing to install without authentication"
   fi
 elif [ -n "$BINARY" ]; then
   log "local binary: skipping download verification (explicit --binary)"
