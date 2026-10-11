@@ -11,7 +11,7 @@ Lifecycle lines (detection, publish, takeover, clear, resume) are
 (`RUST_LOG=debug`). Logs go to stderr — the journal under systemd:
 
 ```bash
-journalctl --user -u rsrpc.service --since "10 minutes ago" | grep -E "Detected|Published|Yielding|Clearing|cleared|took over|Reaping|went away without CLEAR"
+journalctl --user -u rsrpc.service --since "10 minutes ago" | grep -E "Detected|Published|Yielding|Clearing|cleared|took over|now owns|Reaping|went away without CLEAR"
 ```
 
 ## Detection: source and latency
@@ -20,43 +20,90 @@ First sighting of a game logs how it was classified and how long the
 process had already been alive (`process age`):
 
 ```
-[Process Scanner] Detected: Hades II (331224... , pid 4242) via steam-app-id, process age 32118ms
+[Process Scanner] Detected: Hades II (1261791958597741569, pid 4242) via steam-app-id, process age 32118ms
 ```
 
-Sources (`via`):
-
-| Source | Meaning |
-|---|---|
-| `automaton` | Database-declared path matched the process path |
-| `cwd-joined` | Bare exe joined with the process working directory |
-| `proton-automaton` | `win32` (Proton/Wine) database entries |
-| `steam-app-id` | Authoritative store id (Steam environ, cmdline fallback, custom SKU) |
-| `steam-library` | Process runs under a known Steam install dir |
-| `exe-stem` | Executable stem equals a multi-word game name |
-| `folder` | Install folder carries the title |
+The id is printed in full. A shortened form (`331224...`) in a hand-written
+example tends to be copied into a grep that then matches nothing.
 
 `process age` is omitted when the start time is unreadable (sandboxed
 runtimes, exotic platforms). The start time is read once per newly
 detected game — never per process per tick — so tracing costs nothing
 on the scan hot path.
 
+Sources (`via`), and what each one actually had to satisfy:
+
+| Source | Meaning |
+|---|---|
+| `automaton` | A declared executable named the end of the process path |
+| `cwd-joined` | Bare exe joined with the process working directory |
+| `proton-automaton` | `win32` (Proton/Wine) database entries |
+| `steam-app-id` | Store id (Steam environ, cmdline fallback, custom SKU), and the process runs a declared executable — or the entry declares none |
+| `steam-library` | Process runs under a known Steam install dir |
+| `exe-stem` | Executable stem equals a game name of at least two words |
+| `folder` | Install folder carries the title |
+
+## Why a game did not appear: the refusal lines
+
+A `Detected:` line tells you a game matched. The absence of one is the harder
+question, and its answer is at `DEBUG`, not `INFO`. Turn it on scoped to the
+scanner — it is the noisy component:
+
+```bash
+systemctl --user edit rsrpc.service   # [Service]
+# Environment=RUST_LOG=rsrpc_detect=debug
+systemctl --user daemon-reload && systemctl --user restart rsrpc
+```
+
+Then watch for the reason a candidate was dropped:
+
+| Line | Meaning |
+|---|---|
+| `{path} does not name a declared executable of {entry}, skipping` | The automaton matched a declared name inside the path, but that name does not **end** it — `.../hl2.exe.txt` holding `hl2.exe`. Specific evidence the process is not that game |
+| `AppId {appid} does not belong to {argv0} ({entry}), skipping` | Steam handed this process the game's id, but it is not running one of the entry's declared executables. This is the update-time `reaper` |
+| `Argument mismatch for pid {pid}, skipping` | The entry declares a required command-line string the process did not carry |
+| `Steam helper process, skipping: {basename}` | Caught by the helper basename list — a cheap first line, not the corroboration rule |
+| `{path} refused a declared executable match, not answering from its name` | After a refusal, the name and folder heuristics were stood down rather than answering from the install location |
+| `{path} refused a declared executable match, not guessing further` | Same, standing down the tiers after the Proton probe |
+
+Read the last two together with [process-detection.md](process-detection.md):
+a refusal stops the *guessing* tiers, not the other automaton, so a native
+refusal does not prevent the Proton automaton from naming the game. If you
+see the first line and then no `Detected:`, the Proton probe also came up
+empty — which is a genuinely undetected process, not a silenced one.
+
+Turning the level back off:
+
+```bash
+systemctl --user revert rsrpc.service && systemctl --user restart rsrpc
+```
+
+Unreadable command lines are a different matter entirely: a process whose
+`/proc/<pid>/cmdline` cannot be read is skipped before any matcher runs and
+logs nothing here at all.
+
 ## Bridge: publish, takeover, clear
 
 - `Published: {name} (app {app}, pid {pid})` — SDK card went out.
 - `Published clear for {app} (pid {pid}): {reason}` — card cleared.
 - `SDK presence for {app} (pid {pid}) took over slot from generic {name}`
-  (or `now owns its slot` when no generic was showing) — a game-specific
-  client (e.g. wwRPC-style companions) took the slot from generic
-  detection. Logged once per takeover; steady republishes stay quiet.
+  — a game-specific client (e.g. wwRPC-style companions) took the slot from
+  generic detection. Logged once per takeover; steady republishes stay quiet.
+  Two variants replace the tail: `now owns its slot` when no generic card was
+  showing, and `took over slot from pid {old}` when a slot was already owned
+  by something else.
 - `Yielding generic {name} ({id}) to live IPC presence (pid {owner}): yielded`
   — generic card withdrawn for the live owner.
 - `Source cleared for {app} (pid {pid}), resuming {n} slot(s)` — the SDK
   source sent CLEAR; generic detection re-asserts the still-running game.
 - `Owner pid {pid} went away without CLEAR, resuming {n} slot(s)` —
   abrupt close; dead owners release their slots.
-- `Clearing removed game slot for {app} (pid {pid}): process-vanished` —
-  the scanner reports the process gone (per-slot remove, or every slot
-  when the table empties).
+- `Clearing removed game slot for {app} (pid {pid}): {reason}` — the scanner
+  reports that one process is gone.
+- `Clearing {app} (pid {pid}): {reason}` — the scanner's table emptied, so
+  every slot went at once. Note the absence of `removed game slot for`: the
+  two forms are distinct lines and tell you whether one game or all of them
+  went.
 - `Reaping ghost card for dead pid {pid}: abrupt-close` — a card whose
   pid is provably dead but never got a clear.
 
