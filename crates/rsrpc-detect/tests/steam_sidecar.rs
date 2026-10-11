@@ -643,6 +643,90 @@ fn bare_exe_win32_server(declared: &str) -> ProcessServer {
   )
 }
 
+/// The real Hearts of Iron IV row, which has the shape that costs a
+/// Proton game its detection: the same name twice, once bare and once
+/// with the Windows extension. `hoi4` is the Linux pattern and lands in
+/// the native automaton; `hoi4.exe` is `win32` and lands in the Proton
+/// one, which only runs later.
+///
+/// Gated with its single caller: off Linux the fixture has no user, and
+/// `-D warnings` reads that as dead code.
+#[cfg(target_os = "linux")]
+fn hoi4_server() -> ProcessServer {
+  let (tx, _rx) = rsrpc_telemetry::QueueGauge::pair();
+  let entry: DetectableActivity = serde_json::from_value(serde_json::json!({
+    "id": "1",
+    "name": "Hearts of Iron IV",
+    "hook": false,
+    "executables": [
+      {"name": "hoi4.exe", "is_launcher": false, "os": "win32"},
+      {"name": "hoi4", "is_launcher": false, "os": "linux"},
+      {"name": "hearts of iron iv/hoi4.exe", "is_launcher": false, "os": "win32"}
+    ],
+    "aliases": []
+  }))
+  .expect("fixture parses");
+  ProcessServer::new_with_custom(
+    vec![Arc::new(entry)],
+    vec![],
+    tx,
+    ProcessEventListeners::default(),
+    RefreshConfig::default(),
+    vec![],
+  )
+}
+
+/// A refusal must not take the *other* automaton down with it.
+///
+/// Hearts of Iron IV declares `hoi4` for Linux and `hoi4.exe` for Windows,
+/// so on a Wine launch of `.../hoi4.exe` the native automaton matches the
+/// bare `hoi4` sitting inside the path, refuses it — correctly, the path
+/// does not end in `hoi4` — and that refusal used to end the whole
+/// classification. The Proton automaton holds the pattern that does name
+/// the path, but it runs *after* the refusal was allowed to stop the walk,
+/// so the game went undetected.
+///
+/// The refusal is evidence about the loose name and folder rules, which
+/// are guesses built out of the install location. It is not evidence
+/// against a second automaton that has not run yet, and one entry's short
+/// name is a standing reason for it to be right: measured against the
+/// bundled database, `hoi4`, `factorio`, `fieldsofmistria` and `>java` are
+/// each the interior of a `win32` name of their own entry.
+///
+/// Linux-only: this is the platform where a `win32` pattern is Proton-only
+/// and the two automatons are disjoint. On Windows both names are native
+/// and the walk is over before the question arises.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_native_refusal_does_not_stop_the_proton_probe() {
+  let server = hoi4_server();
+  let bundle = server.bundle();
+  let mut scratch = ScanScratch::default();
+  let mut variants: [String; 5] = Default::default();
+  let mut reversed = String::new();
+  let mut obs_open = false;
+
+  // The folder is named like the game on purpose: without the hit from
+  // the Proton automaton, the folder tier is standing right there, and a
+  // test that passes for want of a fallback proves nothing.
+  let hit = server
+    .match_process(
+      &process("/games/Hearts of Iron IV/hoi4.exe", ""),
+      &bundle,
+      &mut variants,
+      &mut reversed,
+      &mut obs_open,
+      &mut scratch,
+    )
+    .expect("hoi4.exe names the path and the Proton automaton holds it");
+  assert_eq!(hit.entry.name, "Hearts of Iron IV".into());
+  assert_eq!(
+    hit.source,
+    DetectSource::ProtonAutomaton,
+    "the name that ends the path is the win32 one, which only Proton holds"
+  );
+}
+
 /// The reconstructed path has to reach the tier that needs it.
 ///
 /// A Proton process launched with a bare `argv[0]` (`game.exe`) leaves the

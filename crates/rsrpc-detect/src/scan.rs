@@ -1318,18 +1318,24 @@ impl ProcessServer {
         // location (Steam's ground truth) still beats name guessing.
         let non_steam = app_id.as_deref().is_some_and(is_shortcut_id);
         // A refusal already happened: an automaton saw a declared name in
-        // this path that did not name it. The tiers below are deliberately
+        // this path that did not name it. The name rules are deliberately
         // looser, and answering after one would hand the hit back over the
         // specific evidence — `/opt/Portal 2/portal2.exe.txt` must not come
         // back as Portal 2 from its folder.
+        //
+        // It does not carry as far as the Proton probe. That automaton has
+        // not run yet and holds the `win32` names, and one entry's short
+        // native name is a standing reason for it to hold the right one:
+        // `hoi4` is the interior of Hearts of Iron IV's own `hoi4.exe`, and
+        // `factorio` and `>java` are the interiors of theirs. Returning
+        // here would let a Linux name hide a Wine game the very next probe
+        // was about to name.
         if refused {
           tracing::debug!(
-            "[Process Scanner] {} refused a declared executable match, not guessing further",
+            "[Process Scanner] {} refused a declared executable match, not answering from its name",
             lowered
           );
-          return None;
-        }
-        if non_steam
+        } else if non_steam
           && let Some(hit) = match_name_or_folder(
             lowered,
             process.pid,
