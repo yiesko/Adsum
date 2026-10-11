@@ -617,6 +617,15 @@ pub(crate) fn is_shortcut_id(app_id: &str) -> bool {
 fn argv_names_an_executable(process_path: &str, obj: &ScannedEntry) -> bool {
   // Nothing declared: the store id is the only evidence there is, so it
   // stands on its own. This is the case the id tier exists for.
+  //
+  // It is also the tier's largest hole, and knowingly so: 35% of the
+  // database declares no executables, so a helper that inherits such an
+  // entry's id still reads as the game. The sidecar list trims the known
+  // Valve helpers and the boundary rule covers the entries that *do*
+  // declare executables, but nothing here can reject an unknown helper
+  // for an entry that declares nothing. Dropping the fallback would
+  // trade that for a silent false negative on every such game, which is
+  // why the limit is stated instead of closed.
   if obj.executables.is_empty() {
     return true;
   }
@@ -1098,8 +1107,18 @@ impl ProcessServer {
     }
     // Steam's own helpers, which inherit the game's `SteamAppId`. Before
     // any matching, like the exclusions above: a store id carried by a
-    // launcher, a shader pre-cache or a prefix upgrade is evidence Steam is
-    // working on the game, not that it is being played.
+    // launcher, a shader pre-cache or a prefix upgrade is evidence Steam
+    // is working on the game, not that it is being played.
+    //
+    // A cheap first line, not a rule — the list never closes, and a new
+    // Valve helper is a name nobody listed. It matches *process
+    // basenames* and only those: `steamapprun_pipeline_cache`, which
+    // Valve's own logs name while a game pre-caches shaders, is the
+    // Fossilize serialization **path** (`.../fozpipelinesv6/
+    // steamapprun_pipeline_cache.<hash>`), not a process — the process is
+    // `fossilize`, which the family match already covers. Matching paths
+    // would be a different rule than this one, and it is the boundary
+    // check in the tiers below that actually rejects a helper.
     if is_steam_sidecar(&basename) {
       tracing::debug!("[Process Scanner] Steam helper process, skipping: {basename}");
       return None;
