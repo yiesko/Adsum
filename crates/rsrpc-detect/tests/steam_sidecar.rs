@@ -168,6 +168,16 @@ fn the_games_own_process_still_reads_as_the_game() {
       )
       .unwrap_or_else(|| panic!("{argv0} should read as the game"));
     assert_eq!(hit.entry.name, "Garry's Mod".into());
+    // The tier under test, not just the outcome: the entry is `win32`
+    // only, so the Proton automaton is a second route to the same hit,
+    // and a test that stops at the name passes either way. Asserting the
+    // provenance is what makes a rejection in the id tier visible here
+    // instead of being silently papered over by a fallback.
+    assert_eq!(
+      hit.source,
+      DetectSource::SteamAppId,
+      "{argv0} must be the AppId tier answering, not a fallback"
+    );
   }
 }
 
