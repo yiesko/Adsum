@@ -7,7 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.37.0] - 2026-09-25
+## [0.38.0] - 2026-10-11
+
+> **Note on 0.37.0.** A `0.37.0` was prepared on 2026-09-25 and documented,
+> but never tagged, published or installed anywhere — `gh release view
+> v0.37.0` returns *release not found*, and the last published release is
+> `v0.36.1`. Its content was therefore not lost, just never shipped: it is
+> part of this release, under the version it actually left the machine as.
+> There is no `0.37.0` in the wild to be compatible with.
 
 ### Added
 - Detection traceability: every first sighting logs which matcher won
@@ -48,6 +55,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   daemons sharing a slot still write apart. Slot selection stays
   best-effort — concurrent daemons share slots, last writer wins —
   and stale crash temps are swept under the same staleness rule.
+
+### Performance
+- The per-tick, per-publish and per-connection allocations left behind by
+  the earlier memory fix (#2) are gone, under one rule: **one owned
+  materialization at the boundary, zero deep copies after it** (61 commits,
+  59 files, +6394/-1349). Same games detected, same order, same log lines.
+- Ids (`AppId`, `SocketId`) are `Arc<str>` newtypes with `Deref<str>`, so
+  cloning one is a refcount bump: every path that copied a client id,
+  socket id or app id now shares it.
+- Payloads that reach more than one consumer cross as
+  `Bytes`/`Utf8Bytes`/`Arc<T>` and are encoded once; the MessagePack
+  derivation is lazy and shared instead of rebuilt per consumer.
+- Scratch buffers (`ExecScratch`, `MatchScratch`, the `/proc` stat and
+  environ paths) are owned by the loop and reused across ticks, which is
+  where roughly 400 allocations every 5 s per process came from. The scan
+  tick classifies every process on the machine, so this is the path that
+  decides the resident set, not a hot path in the usual sense.
+- Collections that outlive their build are `Box<[T]>` and shrunk;
+  transient ones deliberately are not. Entries carry packed `[u32;2]`
+  index pairs, and the automaton is built in a single pass with exact
+  reservations.
+- Structural caps on the fetched database, measured rather than guessed:
+  the live `applications/detectable` body and the bundled snapshot agree
+  at 24,628 entries, 16 executables, 8 aliases, 31 Steam SKUs and
+  204-character names, and every cap sits an order of magnitude above
+  that. A body decoding past one is rejected as `DatabaseTooLarge`,
+  distinct from a parse failure, and the caller keeps the database it
+  already holds. The 64 MiB body limit bounded the bytes; it never
+  bounded what they decode into — one entry with tens of thousands of
+  executables is a megabyte of JSON becoming one automaton pattern and
+  one index pair each.
+- The census now reports the resident high-water mark beside the current
+  RSS and the live/free heap split from the allocator, so a growth can be
+  told from a floor that held while the peak climbed. Both were verified
+  against the kernel before being written: the `kB` unit in
+  `/proc/self/status` is really KiB, confirmed by comparing resident pages
+  against `VmRSS`.
+- **Two deliberate deviations.** The `SET_ACTIVITY` echo emits `data`
+  keys in declaration order instead of the `BTreeMap`'s alphabetical
+  order (the echo contract already allows key-order variance and every
+  test compares parsed values), and the IPC close-clear nonce now carries
+  the value the client sent instead of its JSON *text* — that one is a
+  fix, see below.
 
 ### Changed
 - Folded `rsrpc-state` into `rsrpc-bridge` (12 crates down to 11): the
@@ -97,6 +147,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   breaking change for library callers: `rsrpc_proc_events::watch` now
   takes a shutdown flag (`watch(events, stop)`), so the watcher thread
   joins on directed shutdown instead of blocking on netlink.
+- CodeQL now scans the workspace as one job with the v4 action inputs, and
+  re-scans whenever any workflow changes rather than only its own.
+- Dependabot maintains the three cargo workspaces and the pinned actions;
+  CI declares the least permissions each workflow needs, and the runners
+  are pinned by image label instead of floating on `ubuntu-latest`.
+- The three workspaces share one grouped `cargo` entry in CI instead of
+  three near-duplicates.
 
 ### Fixed
 - Hostile timestamps saturate instead of overflowing: `normalize_timestamp`
@@ -149,6 +206,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The crash-temp sweep only removes snapshot temps: it now requires the
   snapshot filename prefix too, so other programs' `*.tmp-*` files in
   the shared temp dir are never touched.
+- **Downloading or updating a game on Steam opened a presence for a game
+  nobody was playing.** Steam ends an update by running the app's script
+  phase and setting up the Proton prefix, and hands both the game's
+  environment — `SteamAppId` included. Under Proton the environ is hidden
+  from a service context, so the id reached the scanner by way of the
+  command line, about a second after Steam committed thousands of updated
+  files. A `SteamAppId` now only corroborates when the process runs an
+  executable the database entry declares, matched on a path-component
+  boundary; an entry with no declared executables keeps the id on its own,
+  which is the case the tier exists for. Verified in the field with the
+  deployed binary: the log names Steam's own `reaper` and no presence
+  appears.
+- **A declared name that merely appears in the path no longer reads as
+  the game.** The automaton matches substrings, so `.../hl2.exe.txt` and
+  `.../hl2.exe.evil` were detected as Half-Life 2 with no store id
+  involved. The executable that fired now has to name the *end* of the
+  probed string on a boundary.
+- The two tiers disagreed about spelling: the store-id tier compared the
+  raw declared name while the automaton compared the normalized one, so
+  an entry declaring only `>hl2.exe` or `bin\gmad.exe` was rejected by the
+  id tier and accepted by the automaton. Both now corroborate through the
+  same allocation-free predicate.
+- **A launcher is not the game.** The database flags these with
+  `is_launcher`, and Steam runs them first: clicking Play on Baldur's Gate
+  III launches `larilauncher.exe`, which carries the game's AppId before
+  the game has started — the same shape as the update above, one tier over.
+  Twenty executables across thirteen entries were in that position. The
+  `>` marker is a different mechanism ("the arguments carry the launcher")
+  and is unaffected.
+- **A macOS `.app` bundle names the binary inside it.** Sixty-one
+  executables across fifty-six entries are declared as the bundle
+  (`factorio.app`), but the process macOS runs is the binary within
+  `.../Factorio.app/Contents/MacOS/factorio`. Those games were detected
+  before the boundary rule and stopped being detected after it; a declared
+  `.app` at a component boundary now matches when Apple's bundle interior
+  follows it.
+- **A refusal is remembered for the whole automaton walk.** A declared name
+  seen in a path without naming it is specific evidence that the process
+  is not the game, and the stem and folder heuristics must not answer over
+  it — but the evidence belongs to the path, not to the automaton that read
+  it, so a second pass or a stripped 64-bit variant no longer erases it.
+  It also no longer stands between the two automata: Hearts of Iron IV
+  declares `hoi4` for Linux and `hoi4.exe` for Windows, and the Linux name
+  was hiding the Wine game the Proton probe was about to name.
+- A rejected automaton match no longer hides the match that *does* name
+  the process: the probes walk their automaton's overlapping matches and a
+  refusal costs that match, not the variant. Without this, Minecraft's
+  short `java` pattern ended inside Illarion's longer
+  `illarion/jre/bin/java.exe` and the correct hit was never tried.
+- The IPC close-clear nonce now carries the value the client sent instead
+  of its JSON text: `"abc"` used to be echoed back as `"\"abc\""`, and a
+  null nonce as the literal string `"null"`.
 
 ## [0.36.1] - 2026-09-24
 
@@ -717,8 +826,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Stuck presence after game close.
 
-[Unreleased]: https://github.com/yiesko/discord-rich-presence/compare/v0.37.0...HEAD
-[0.37.0]: https://github.com/yiesko/discord-rich-presence/releases/tag/v0.37.0
+[Unreleased]: https://github.com/yiesko/discord-rich-presence/compare/v0.38.0...HEAD
+[0.38.0]: https://github.com/yiesko/discord-rich-presence/releases/tag/v0.38.0
 [0.36.1]: https://github.com/yiesko/discord-rich-presence/releases/tag/v0.36.1
 [0.36.0]: https://github.com/yiesko/discord-rich-presence/releases/tag/v0.36.0
 [0.35.0]: https://github.com/yiesko/discord-rich-presence/releases/tag/v0.35.0

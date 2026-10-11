@@ -15,7 +15,7 @@ disk; the swap happens the next time the binary starts.
 
 ```bash
 ./rsrpc-cli --check-update
-# [rsrpc] update available: v0.37.0 (release v0.37.0); run with --update to stage it
+# [rsrpc] update available: v0.38.0 (release v0.38.0); run with --update to stage it
 # (exit code 2; exit code 0 means you are current)
 
 ./rsrpc-cli --update --yes     # stage now, apply on next start
