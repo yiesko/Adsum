@@ -12,6 +12,74 @@ use crate::server::ProcessServer;
 use crate::types::{DetectSource, Exec, ScannedEntry, ScannedHit};
 use rsrpc_types::AppId;
 
+/// Basenames Steam launches on a game's behalf, none of which is the game
+/// itself.
+///
+/// Steam ends an update by pre-compiling shaders (`steamapprun` driving
+/// `fossilize`/`fossilize-replay`) and by creating or upgrading the
+/// Proton prefix (`wineserver`, `wineboot`), and it runs the game inside
+/// the Steam Linux Runtime sandbox (`pressure-vessel` below `bwrap`,
+/// `run-in-soldier`). It hands every one of those the game's
+/// environment, `SteamAppId` included — so the store id that reaches the
+/// scanner says Steam is working *on* the game, not that it is being
+/// played. That is how updating a game opened a presence for it.
+///
+/// This is the cheap first line, not the whole rule. It keeps these names
+/// out of every tier, including the ones the id corroboration cannot
+/// judge — the library-prefix and folder tiers have no store id to check a
+/// path against — and it costs one hash lookup. The set is deliberately
+/// small, because a name it misses is caught by
+/// [`argv_names_an_executable`] instead.
+///
+/// Evidence, not a guess: the launcher and helper basenames are the
+/// binaries a Steam install actually ships — `Proton <ver>/proton` and
+/// `Proton <ver>/files/bin/{wine,wineserver}`,
+/// `SteamLinuxRuntime_*/{pressure-vessel,run,run-in-soldier}` — and the
+/// pre-cache pair is named by Valve's own logs (`Fossilize`,
+/// `steamapprun_pipeline_cache`, `fossilize_replay`). `bwrap` is the
+/// primitive below pressure-vessel, and `steamwebhelper` is Steam's own
+/// browser process; a game runs as a child of them, never as them.
+pub const STEAM_SIDECAR_BASENAMES: [&str; 13] = [
+  "steamapprun",
+  "fossilize",
+  "wineserver",
+  "wineboot",
+  "proton",
+  "protonfixes",
+  "pressure-vessel",
+  "pressure-vessel-arm64",
+  "bwrap",
+  "steamwebhelper",
+  "steam-runtime",
+  "pv-wrap",
+  "run-in-soldier",
+];
+
+/// Whether a process basename is a Steam sidecar: one that runs on a
+/// game's behalf and therefore inherits its `SteamAppId`.
+///
+/// Lowercase basename in, matching the case the exclusions are consulted
+/// with. Families are matched with a separator rather than as a bare
+/// prefix: `fossilized` or `steam-runtimex` is a game's name, not one of
+/// these.
+#[inline]
+pub fn is_steam_sidecar(basename: &str) -> bool {
+  STEAM_SIDECAR_BASENAMES.contains(&basename)
+    || matches_sidecar_family(basename, "fossilize")
+    || matches_sidecar_family(basename, "steam-runtime")
+    || matches_sidecar_family(basename, "pv-wrap")
+}
+
+/// Whether `basename` is a versioned member of a sidecar family: the base
+/// name itself, or `base-suffix` / `base_suffix`, which is how Valve
+/// versions its tools (`fossilize-replay`, `steam-runtime-soldier`).
+#[inline]
+fn matches_sidecar_family(basename: &str, base: &str) -> bool {
+  basename
+    .strip_prefix(base)
+    .is_some_and(|rest| rest.starts_with('-') || rest.starts_with('_'))
+}
+
 /// Read one process's cmdline into an `Exec` (Linux). `None` for kernel
 /// threads, zombies, vanished or unreadable pids — the caller just skips
 /// them; the periodic scan is the backstop.
@@ -526,46 +594,127 @@ pub(crate) fn is_shortcut_id(app_id: &str) -> bool {
   app_id.parse::<u32>().is_ok_and(|id| id & 0x8000_0000 != 0)
 }
 
+/// Whether `process_path` names an executable the entry declares.
+///
+/// A store id says which game was *launched*, not which process is running:
+/// Steam ends an update by running the app's script phase and setting up the
+/// Proton prefix, and under Proton those run with the environ hidden from a
+/// service context — so the id reaches the scanner by way of the command
+/// line, exactly as it did while Garry's Mod was committing 3005 files. What
+/// tells a helper from the game is the executable: a game process carries the
+/// game's own binary as `argv[0]`, and a launcher never does.
+///
+/// Lowercased `/`-separated path in, matched as a path suffix, so a Windows
+/// `argv[0]` under Proton (`/C:/…/steamapps/common/garrysmod/hl2.exe`) matches
+/// the relative names the database declares (`hl2.exe`, `garrysmod/hl2.exe`,
+/// `win64/gmod.exe`).
+///
+/// The fold is idempotent by construction: the scan tick hands over its
+/// already-lowered copy, and folding that again costs one byte scan and no
+/// allocation, while a path that still carries uppercase is folded once
+/// here. The rule therefore does not depend on the caller remembering.
+fn argv_names_an_executable(process_path: &str, obj: &ScannedEntry) -> bool {
+  // Nothing declared: the store id is the only evidence there is, so it
+  // stands on its own. This is the case the id tier exists for.
+  if obj.executables.is_empty() {
+    return true;
+  }
+  let folded;
+  let process_path = if process_path.bytes().any(|b| b.is_ascii_uppercase()) {
+    folded = process_path.to_ascii_lowercase();
+    &folded
+  } else {
+    process_path
+  };
+  obj.executables.iter().any(|exe| {
+    let name = exe.name.to_ascii_lowercase();
+    process_path
+      .strip_suffix(name.as_str())
+      .is_some_and(|rest| rest.is_empty() || rest.ends_with('/'))
+  })
+}
+
+/// One store-id lookup: what is being asked, and the tables that answer it.
+///
+/// Positional arguments ran out at eight, and the parts split naturally
+/// anyway — the id being resolved, the evidence it has to be corroborated
+/// with, and the database side that resolves it. Grouping them also keeps
+/// the two callers honest: they read as "look this id up, against these
+/// tables, for this process".
+pub struct SteamIdLookup<'a> {
+  /// The id to resolve, when one was found at all.
+  pub app_id: Option<&'a str>,
+  /// `argv[0]` of the process being classified, `/`-separated.
+  pub process_path: &'a str,
+  /// Which matcher is asking, so the hit reports where it came from.
+  pub source: DetectSource,
+  /// Store id to entry index.
+  pub steam_map: &'a SortedIndex,
+  /// The entries the index points into.
+  pub entries: &'a [Arc<ScannedEntry>],
+  /// User overrides, searched linearly (user-sized, not DB-sized).
+  pub custom: &'a [Arc<ScannedEntry>],
+}
+
 /// Authoritative aux lookup: `SteamAppId` (store games with empty
 /// `executables`, legit Steam). Runs before every fuzzy heuristic — a
 /// store id beats path guessing. Custom overrides participate as a
 /// linear fallback (they are user-sized, not DB-sized): a custom entry
 /// carrying only a steam distributor id matches here, since the map
 /// only indexes the main list. Canonical map hits always win.
+///
+/// A hit is corroborated by the process path unless the entry declares no
+/// executables, because the id says which game was launched, not which
+/// process is running (see [`argv_names_an_executable`]).
 pub fn match_steam_id(
-  steam_app_id: Option<&str>,
   pid: u64,
-  steam_map: &SortedIndex,
-  detectable_list: &[Arc<ScannedEntry>],
-  custom: &[Arc<ScannedEntry>],
-  source: DetectSource,
   stat: &mut String,
+  lookup: &SteamIdLookup<'_>,
 ) -> Option<ScannedHit> {
-  let appid = steam_app_id?;
-  if let Some(&idx) = steam_map.get(appid) {
-    let obj = detectable_list.get(idx)?;
+  let appid = lookup.app_id?;
+  if let Some(&idx) = lookup.steam_map.get(appid) {
+    let obj = lookup.entries.get(idx)?;
+    if !argv_names_an_executable(lookup.process_path, obj) {
+      // The id is the game's, but this process is not the game: Steam's
+      // own script/prefix/pre-cache work carries it. Named in the log,
+      // because a rejected hit is otherwise indistinguishable from a miss.
+      tracing::debug!(
+        "[Process Scanner] AppId {appid} does not belong to {argv0} ({name}), skipping",
+        argv0 = lookup.process_path,
+        name = obj.name,
+      );
+      return None;
+    }
     tracing::debug!(
       "[Process Scanner] Steam match: {} (appid {})",
       obj.name,
       appid
     );
-    return live_or_none(obj, pid, source, stat);
+    return live_or_none(obj, pid, lookup.source, stat);
   }
   // Custom override with a bare steam SKU (no executables to index):
   // the provenance travels through — a library-inherited app id matched
   // here still reports the library path that supplied it.
-  for obj in custom {
+  for obj in lookup.custom {
     let sku_match = obj.steam_ids.iter().any(|id| {
       let sid: &str = id;
       sid == appid
     });
     if sku_match {
+      if !argv_names_an_executable(lookup.process_path, obj) {
+        tracing::debug!(
+          "[Process Scanner] AppId {appid} does not belong to {argv0} ({name}, custom), skipping",
+          argv0 = lookup.process_path,
+          name = obj.name,
+        );
+        continue;
+      }
       tracing::debug!(
         "[Process Scanner] Steam match (custom): {} (appid {})",
         obj.name,
         appid
       );
-      return live_or_none(obj, pid, source, stat);
+      return live_or_none(obj, pid, lookup.source, stat);
     }
   }
   None
@@ -808,6 +957,14 @@ impl ProcessServer {
       tracing::debug!("[Process Scanner] Excluded process, skipping: {basename}");
       return None;
     }
+    // Steam's own helpers, which inherit the game's `SteamAppId`. Before
+    // any matching, like the exclusions above: a store id carried by a
+    // launcher, a shader pre-cache or a prefix upgrade is evidence Steam is
+    // working on the game, not that it is being played.
+    if is_steam_sidecar(&basename) {
+      tracing::debug!("[Process Scanner] Steam helper process, skipping: {basename}");
+      return None;
+    }
 
     // OBS binaries ship lowercase; the flag only feeds an unconsumed
     // observer callback, so original-case matching is exact enough.
@@ -879,13 +1036,16 @@ impl ProcessServer {
         // Authoritative Steam AppId first: a store id beats every fuzzy
         // path heuristic below.
         if let Some(hit) = match_steam_id(
-          app_id.as_deref(),
           process.pid,
-          &bundle.steam_map,
-          &bundle.list,
-          &bundle.custom,
-          DetectSource::SteamAppId,
           &mut scratch.match_scratch.stat,
+          &SteamIdLookup {
+            app_id: app_id.as_deref(),
+            process_path: lowered,
+            source: DetectSource::SteamAppId,
+            steam_map: &bundle.steam_map,
+            entries: &bundle.list,
+            custom: &bundle.custom,
+          },
         ) {
           return Some(hit);
         }
@@ -930,13 +1090,16 @@ impl ProcessServer {
         if let Some(library_appid) =
           self.steam_prefix_app_id_into(lowered, &mut scratch.match_scratch.steam_path)
           && let Some(hit) = match_steam_id(
-            Some(&library_appid),
             process.pid,
-            &bundle.steam_map,
-            &bundle.list,
-            &bundle.custom,
-            DetectSource::SteamLibrary,
             &mut scratch.match_scratch.stat,
+            &SteamIdLookup {
+              app_id: Some(&library_appid),
+              process_path: lowered,
+              source: DetectSource::SteamLibrary,
+              steam_map: &bundle.steam_map,
+              entries: &bundle.list,
+              custom: &bundle.custom,
+            },
           )
         {
           tracing::debug!(
@@ -1235,6 +1398,87 @@ mod tick2_tests {
     }
   }
 
+  /// Whether the process path names an executable the entry declares.
+  ///
+  /// A path suffix on a component boundary: the database's names are
+  /// relative (`hl2.exe`, `garrysmod/hl2.exe`, `win64/gmod.exe`) and a
+  /// Proton `argv[0]` is a full Windows path with them at the end.
+  #[test]
+  fn argv_names_an_executable_matches_on_a_component_boundary() {
+    use crate::types::{OsName, ScannedExe};
+
+    let entry = ScannedEntry {
+      id: "1".into(),
+      name: "Garry's Mod".into(),
+      executables: Box::new([
+        ScannedExe {
+          name: "hl2.exe".into(),
+          os: OsName::Win32,
+          is_launcher: false,
+          arguments: None,
+        },
+        ScannedExe {
+          name: "garrysmod/hl2.exe".into(),
+          os: OsName::Win32,
+          is_launcher: false,
+          arguments: None,
+        },
+      ]),
+      steam_ids: Box::new(["4000".into()]),
+      aliases: Box::new([]),
+    };
+
+    for path in [
+      // Full Proton path: the declared name sits at the end.
+      "/C:/Steam/steamapps/common/GarrysMod/garrysmod/hl2.exe",
+      "/C:/Steam/steamapps/common/GarrysMod/hl2.exe",
+      // The bare relative name, as the database spells it.
+      "hl2.exe",
+      "garrysmod/hl2.exe",
+      // Case does not matter: `argv[0]` arrives lowercased.
+      "/C:/Steam/steamapps/common/garrysmod/HL2.EXE",
+    ] {
+      assert!(
+        argv_names_an_executable(path, &entry),
+        "{path} should name a declared executable"
+      );
+    }
+
+    for path in [
+      // A near miss is not a match: the boundary is a `/`, not any byte.
+      "/C:/Steam/steamapps/common/GarrysMod/xhl2.exe",
+      "/C:/Steam/steamapps/common/GarrysMod/hl2.exe.txt",
+      "/C:/Steam/steamapps/common/GarrysMod/sub/gmad.exe",
+      "/C:/Steam/steamapps/common/GarrysMod/hl2.exe.evil",
+      // A different game entirely.
+      "/C:/Steam/steamapps/common/deadlock/game/bin/win64/deadlock.exe",
+    ] {
+      assert!(
+        !argv_names_an_executable(path, &entry),
+        "{path} must not pass for a declared executable"
+      );
+    }
+  }
+
+  /// An entry that declares no executables cannot be corroborated, so the
+  /// store id has to stand on its own: this is the case the tier exists for.
+  #[test]
+  fn argv_names_an_executable_passes_an_entry_with_no_executables() {
+    let entry = ScannedEntry {
+      id: "1".into(),
+      name: "No Exes".into(),
+      executables: Box::new([]),
+      steam_ids: Box::new(["777".into()]),
+      aliases: Box::new([]),
+    };
+    for path in ["/opt/whatever", "/usr/bin/steamwebhelper", "hl2.exe"] {
+      assert!(
+        argv_names_an_executable(path, &entry),
+        "{path} should pass when nothing is declared"
+      );
+    }
+  }
+
   /// Authoritative AppId matches report their provenance on the hit.
   /// (Inline: the fixture needs `SortedIndex::build`, which is
   /// crate-private by design.)
@@ -1252,13 +1496,17 @@ mod tick2_tests {
     });
     let steam_map = SortedIndex::build(vec![("12345".into(), 0)]);
     let hit = match_steam_id(
-      Some("12345"),
       u64::from(std::process::id()),
-      &steam_map,
-      &[entry],
-      &[],
-      DetectSource::SteamAppId,
       &mut String::new(),
+      &SteamIdLookup {
+        app_id: Some("12345"),
+        // No executables declared, so the id stands on its own: any path does.
+        process_path: "/opt/whatever",
+        source: DetectSource::SteamAppId,
+        steam_map: &steam_map,
+        entries: &[entry],
+        custom: &[],
+      },
     )
     .expect("appid hits");
     assert_eq!(hit.source, DetectSource::SteamAppId);
@@ -1326,13 +1574,17 @@ mod tick2_tests {
     });
     let empty_map = SortedIndex::build(Vec::new());
     let hit = match_steam_id(
-      Some("999"),
       u64::from(std::process::id()),
-      &empty_map,
-      &[],
-      &[entry],
-      DetectSource::SteamLibrary,
       &mut String::new(),
+      &SteamIdLookup {
+        app_id: Some("999"),
+        // Custom override with no executables: the id is the only evidence.
+        process_path: "/opt/custom",
+        source: DetectSource::SteamLibrary,
+        steam_map: &empty_map,
+        entries: &[],
+        custom: &[entry],
+      },
     )
     .expect("custom sku hits");
     assert_eq!(hit.source, DetectSource::SteamLibrary);
