@@ -211,9 +211,11 @@ fi
 
 if [ "$NO_SYSTEMD" -eq 0 ]; then
   systemctl --user daemon-reload || warn "daemon-reload failed; run it manually"
-  systemctl --user enable --now "$UNIT_NAME" \
-    && log "service enabled and started" \
-    || warn "could not enable/start; run: systemctl --user enable --now $UNIT_NAME"
+  if systemctl --user enable --now "$UNIT_NAME"; then
+    log "service enabled and started"
+  else
+    warn "could not enable/start; run: systemctl --user enable --now $UNIT_NAME"
+  fi
   USER_NAME="${USER:-$(id -un)}"
   loginctl enable-linger "$USER_NAME" 2>/dev/null \
     || sudo -n loginctl enable-linger "$USER_NAME" 2>/dev/null \

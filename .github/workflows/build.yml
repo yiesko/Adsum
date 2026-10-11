@@ -68,7 +68,7 @@ jobs:
         run: |
           # Add [arch=amd64] to the initial entries of the sources.list
           sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list
-  
+
           echo "deb [arch=armhf,arm64] http://ports.ubuntu.com/ubuntu-ports/ $(lsb_release -cs) main restricted" | sudo tee -a /etc/apt/sources.list
           echo "deb [arch=armhf,arm64] http://ports.ubuntu.com/ubuntu-ports/ $(lsb_release -cs)-updates main restricted" | sudo tee -a /etc/apt/sources.list
           echo "deb [arch=armhf,arm64] http://ports.ubuntu.com/ubuntu-ports/ $(lsb_release -cs) universe" | sudo tee -a /etc/apt/sources.list
@@ -79,7 +79,7 @@ jobs:
           echo "deb [arch=armhf,arm64] http://ports.ubuntu.com/ubuntu-ports/ $(lsb_release -cs)-security main restricted" | sudo tee -a /etc/apt/sources.list
           echo "deb [arch=armhf,arm64] http://ports.ubuntu.com/ubuntu-ports/ $(lsb_release -cs)-security universe" | sudo tee -a /etc/apt/sources.list
           echo "deb [arch=armhf,arm64] http://ports.ubuntu.com/ubuntu-ports/ $(lsb_release -cs)-security multiverse" | sudo tee -a /etc/apt/sources.list
-  
+
       # ARM-linux related sources and dpkg config and such
       - name: (Linux) ARM setup
         if: matrix.config.target == 'aarch64-unknown-linux-gnu' || matrix.config.target == 'armv7-unknown-linux-gnueabihf'
@@ -94,7 +94,7 @@ jobs:
           sudo apt-get install -y \
             libssl-dev:armhf \
             gcc-arm-linux-gnueabihf
-    
+
       - name: (Linux) (ARM64) Install dependencies
         if: matrix.config.target == 'aarch64-unknown-linux-gnu'
         run: |
