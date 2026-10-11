@@ -1621,6 +1621,35 @@ mod tick2_tests {
     }
   }
 
+  /// The premise the platform-aware provenance assertion rests on: an
+  /// executable's `os` tag decides which automaton — if any — carries its
+  /// pattern. `win32` is native on Windows and Proton-only elsewhere, so
+  /// on Windows the automaton runs before the store-id tier and elsewhere
+  /// it runs after it, or never. Pinned here because the assertion that
+  /// depends on it cannot run the other two platforms locally.
+  #[test]
+  fn os_matches_only_the_running_platform() {
+    assert_eq!(
+      os_matches("win32"),
+      cfg!(target_os = "windows"),
+      "a `win32` pattern is native only on Windows"
+    );
+    assert_eq!(
+      os_matches("linux"),
+      cfg!(target_os = "linux"),
+      "a `linux` pattern is native only on Linux"
+    );
+    assert_eq!(
+      os_matches("darwin"),
+      cfg!(target_os = "macos"),
+      "a `darwin` pattern is native only on macOS"
+    );
+    assert!(
+      !os_matches(""),
+      "an empty tag is never `os_matches`: it is native everywhere via a different branch"
+    );
+  }
+
   /// An entry that declares no executables cannot be corroborated, so the
   /// store id has to stand on its own: this is the case the tier exists for.
   #[test]
