@@ -15,7 +15,7 @@ tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal"] }
 ```
 
 Add `rsrpc-detect` from the same repository if you need to name
-`DetectableActivity` yourself (to build entries by hand, for example):
+`DetectableActivity` yourself (to build entries by hand, for example) — its path is `rsrpc_detect::db::DetectableActivity`:
 
 ```toml
 rsrpc-detect = { git = "https://github.com/yiesko/discord-rich-presence", tag = "v0.38.0" }
@@ -74,7 +74,10 @@ async fn from_body(body: String) -> Result<Daemon, Box<dyn std::error::Error>> {
 `RPCConfig` is `#[non_exhaustive]`, so build it with
 `RPCConfig::builder()` (or start from `RPCConfig::default()` and set
 fields). The builder is the forward-compatible choice: new fields will
-never break it.
+never break it. Note that `#[non_exhaustive]` also means
+`RPCConfig { port: 1400, ..Default::default() }` does **not** compile —
+outside the crate the struct literal is restricted. Use the builder, or
+mutate a `default()`:
 
 ```rust
 use rsrpc_core::RPCConfig;
@@ -92,7 +95,7 @@ Every field, with its default:
 | Field | Default | Meaning (CLI equivalent) |
 |---|---|---|
 | `enable_process_scanner` | `true` | Run the process scanner (`-n` disables) |
-| `enable_proc_events` | `true` | Netlink `cn_proc` fast path (`--no-proc-events` disables) |
+| `enable_proc_events` | `true` | Netlink `cn_proc` fast path, **Linux only** (`--no-proc-events` disables) |
 | `enable_ipc_connector` | `true` | Serve game clients over IPC (`discord-ipc-0..9`) |
 | `enable_websocket_connector` | `true` | Serve game clients over WebSocket |
 | `enable_secondary_events` | `true` | Forward browser/deep-link/callback commands |
@@ -106,7 +109,7 @@ Every field, with its default:
 | `initial_db_etag` / `initial_db_content_hash` | `None` / `None` | Seeds for the first conditional refresh (set these when you fetched the body yourself) |
 | `ignored_ids` | `[]` | App ids the scanner never publishes (`--ignore-ids`) |
 | `exclusions_url` | `None` | Discord exclusions feed (`--exclusions-url`) |
-| `app_version` | this crate's version | Version stamped into state snapshots |
+| `app_version` | `rsrpc-core`'s own version — **`0.1.0`**, not the CLI's | Version stamped into state snapshots. The CLI overrides it with `0.38.0`; embedding it yourself does not, so set it if the value matters |
 | `state_file` | `false` | Presence snapshots to `<tmpdir>/rsrpc-state-{0..9}` (`--state-file`): owner-only files, shared slots under concurrency |
 | `bridge_allowed_origins` | `[]` | Extra browser origins driving bridge commands (`--bridge-allowed-origins`): normalized to browser form, then exact match |
 
@@ -130,8 +133,11 @@ let total: usize = daemon.database_len();
 ## Staging overrides and callbacks
 
 ```rust
-// Add or replace entries before run_until(): they bypass the OS filter
-// (win32 entries work under Proton/Wine) and win over the main database.
+// Staging is `&mut self`, so the daemon must be mutable. Both happen
+// before run_until(), which consumes the daemon.
+// Overrides bypass the OS filter (win32 entries work under Proton/Wine)
+// but do NOT outrank the main database — see process-detection.md.
+let mut daemon = Daemon::from_bundled(RPCConfig::default())?;
 daemon.append_detectables(overrides);
 daemon.remove_detectable_by_name("Game Name");
 
@@ -175,6 +181,13 @@ Fallible calls return `Result<T, rsrpc_protocol::error::RsrpcError>`, a
 `std::error::Error`, so `Box<dyn std::error::Error>` works with `?`
 without depending on `rsrpc-protocol` directly. Add that crate (same
 repository, same tag) if you want to `match` on specific variants.
+
+The exception is `rsrpc_core::overrides`, which does not use that enum:
+`parse_overrides` and `load_file` return `Result<Vec<_>, String>` carrying
+a ready-made message, because a malformed override file is a user-facing
+condition rather than a protocol error. `String` converts into
+`Box<dyn Error>`, so `?` still works in a function returning the boxed
+error — you just cannot `match` on a variant.
 
 Bind failures surface from `run_until`; nothing in the library exits the
 process — your code decides what a failed bind means.
