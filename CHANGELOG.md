@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.38.1] - 2026-10-15
+
+### Security
+- Bumped `rustls` to 0.23.46 in all three workspaces; RUSTSEC-2026-0346,
+  -0347, -0348 and -0349 were published on 2026-10-14 and are patched at
+  >= 0.23.46. The crate is reached only through `ureq`, the HTTPS client,
+  and the gate went red on a push that had not touched it.
+
 ## [0.38.0] - 2026-10-11
 
 > **Note on 0.37.0.** A `0.37.0` was prepared on 2026-09-25 and documented,
