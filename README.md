@@ -109,7 +109,7 @@ Logs go to stderr. `RUST_LOG` overrides the log level; when investigating detect
 
 ```toml
 [dependencies]
-rsrpc-core = { git = "https://github.com/yiesko/discord-rich-presence", tag = "v0.38.0" }
+rsrpc-core = { git = "https://github.com/yiesko/discord-rich-presence", tag = "v0.38.1" }
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal"] }
 ```
 

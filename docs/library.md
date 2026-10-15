@@ -10,7 +10,7 @@ your own future completes.
 
 ```toml
 [dependencies]
-rsrpc-core = { git = "https://github.com/yiesko/discord-rich-presence", tag = "v0.38.0" }
+rsrpc-core = { git = "https://github.com/yiesko/discord-rich-presence", tag = "v0.38.1" }
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal"] }
 ```
 
@@ -18,7 +18,7 @@ Add `rsrpc-detect` from the same repository if you need to name
 `DetectableActivity` yourself (to build entries by hand, for example) — its path is `rsrpc_detect::db::DetectableActivity`:
 
 ```toml
-rsrpc-detect = { git = "https://github.com/yiesko/discord-rich-presence", tag = "v0.38.0" }
+rsrpc-detect = { git = "https://github.com/yiesko/discord-rich-presence", tag = "v0.38.1" }
 ```
 
 ## Minimal example
@@ -109,7 +109,7 @@ Every field, with its default:
 | `initial_db_etag` / `initial_db_content_hash` | `None` / `None` | Seeds for the first conditional refresh (set these when you fetched the body yourself) |
 | `ignored_ids` | `[]` | App ids the scanner never publishes (`--ignore-ids`) |
 | `exclusions_url` | `None` | Discord exclusions feed (`--exclusions-url`) |
-| `app_version` | `rsrpc-core`'s own version — **`0.1.0`**, not the CLI's | Version stamped into state snapshots. The CLI overrides it with `0.38.0`; embedding it yourself does not, so set it if the value matters |
+| `app_version` | `rsrpc-core`'s own version — **`0.1.0`**, not the CLI's | Version stamped into state snapshots. The CLI overrides it with `0.38.1`; embedding it yourself does not, so set it if the value matters |
 | `state_file` | `false` | Presence snapshots to `<tmpdir>/rsrpc-state-{0..9}` (`--state-file`): owner-only files, shared slots under concurrency |
 | `bridge_allowed_origins` | `[]` | Extra browser origins driving bridge commands (`--bridge-allowed-origins`): normalized to browser form, then exact match |
 
