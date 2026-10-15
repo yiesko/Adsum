@@ -208,18 +208,19 @@ jobs:
 
       - name: Changelog
         run: |
-          PREV_TAG=$(git describe --tags --abbrev=0 HEAD~1 2>/dev/null || true)
-          if [ -z "$PREV_TAG" ]; then
-            RANGE="HEAD"
-          else
-            RANGE="$PREV_TAG..HEAD"
+          # The release body is this tag's changelog section. A missing one
+          # stops the release: assembling a body from fallbacks is the
+          # behaviour this step replaced.
+          VERSION="${GITHUB_REF_NAME#v}"
+          if ! awk -v v="$VERSION" '
+            index($0, "## [" v "]") == 1 { found = 1; next }
+            found && index($0, "## [") == 1 { exit }
+            found { print }
+            END { exit !found }
+          ' CHANGELOG.md > RELEASE_NOTES.md; then
+            echo "::error::CHANGELOG.md has no '## [${VERSION}]' section; refusing to publish a release without human-readable notes"
+            exit 1
           fi
-          {
-            echo "## Commits in ${{ github.ref_name }} ($RANGE)"
-            echo ""
-            git log "$RANGE" --pretty=format:'- %s (%h)' --reverse
-            echo ""
-          } > RELEASE_NOTES.md
 
       - name: Create release using all artifacts
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
