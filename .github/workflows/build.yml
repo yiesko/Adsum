@@ -235,7 +235,7 @@ jobs:
             SHA256SUMS.txt.minisig
           token: ${{ secrets.GITHUB_TOKEN }}
           # Release name is the tag name
-          name: ${{ github.ref_name }} - ${{ github.sha }}
+          name: ${{ github.ref_name }}
           draft: false
           body_path: RELEASE_NOTES.md
           generate_release_notes: true
