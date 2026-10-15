@@ -49,8 +49,14 @@ updates:
       prefix: "ci(deps)"
       prefix-development: "ci(deps)"
     groups:
-      # One PR per action, not one per line: a bump that moves two steps of
-      # the same action (init and analyze, say) belongs in a single change.
+      # `init` and `analyze` must be the same version or the job dies, and
+      # `group-by` below reads them as two dependencies and splits them, so
+      # collect the family first — groups match in order.
+      codeql-action:
+        patterns: ["github/codeql-action/*"]
+
+      # One PR per action, not one per line: a bump that moves the same
+      # action across several files belongs in a single change.
       workspace-routine:
         patterns: ["*"]
         update-types: [minor, patch]
