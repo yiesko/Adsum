@@ -11,9 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 - Bumped `rustls` to 0.23.46 in all three workspaces; RUSTSEC-2026-0346,
-  -0347, -0348 and -0349 were published on 2026-10-14 and are patched at
-  >= 0.23.46. The crate is reached only through `ureq`, the HTTPS client,
-  and the gate went red on a push that had not touched it.
+  -0347, -0348 and -0349 were published on 2026-10-14 and are fixed in
+  0.23.46 and later. The crate is reached only through `ureq`, the HTTPS
+  client, and the gate went red on a push that had not touched it.
 
 ## [0.38.0] - 2026-10-11
 
