@@ -723,3 +723,138 @@ fn close_echo_carries_the_clients_own_nonce() {
     server.join().expect("server thread");
   }
 }
+
+/// A publication (non-null activity) with pid 0 is rejected: an error
+/// reply flows back, nothing reaches the sink, and the connection stays
+/// alive for a later valid publish.
+#[test]
+fn set_activity_publish_with_zero_pid_is_rejected() {
+  let (mut client, mut rx, server) = spawn_server();
+  write_frame(
+    &mut client,
+    PacketType::Handshake,
+    r#"{"v":1,"client_id":"test-app"}"#,
+  );
+  let (_, body) = read_frame(&mut client);
+  assert!(body.contains("READY"), "expected READY, got: {body}");
+
+  write_frame(
+    &mut client,
+    PacketType::Frame,
+    r#"{"cmd":"SET_ACTIVITY","args":{"pid":0,"activity":{"name":"G","type":0}},"nonce":"n-zero"}"#,
+  );
+  let (_, reply) = read_frame(&mut client);
+  assert!(
+    reply.contains("\"code\":4005"),
+    "expected 4005, got: {reply}"
+  );
+  assert!(
+    reply.contains("Missing or invalid pid"),
+    "expected message, got: {reply}"
+  );
+  assert!(
+    reply.contains("\"nonce\":\"n-zero\""),
+    "nonce must echo, got: {reply}"
+  );
+
+  // Nothing downstream.
+  let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+  while std::time::Instant::now() < deadline {
+    assert!(
+      rx.try_recv().is_err(),
+      "rejected publish must not reach the sink"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(10));
+  }
+
+  // Connection stays alive: a valid publish forwards normally.
+  write_frame(
+    &mut client,
+    PacketType::Frame,
+    r#"{"cmd":"SET_ACTIVITY","args":{"pid":5,"activity":{"name":"G","type":0}},"nonce":"n-ok"}"#,
+  );
+  let (_, echo) = read_frame(&mut client);
+  assert!(echo.contains("SET_ACTIVITY"), "expected echo, got: {echo}");
+  let cmd = recv_cmd(&mut rx);
+  assert_eq!(cmd.args.as_ref().and_then(|a| a.pid), Some(5));
+
+  write_frame(&mut client, PacketType::Close, "{}");
+  let clear = recv_cmd(&mut rx);
+  assert_eq!(clear.args.as_ref().and_then(|a| a.pid), Some(5));
+
+  server.join().expect("server thread");
+}
+
+/// A publication without a pid field is rejected the same way.
+#[test]
+fn set_activity_publish_without_pid_is_rejected() {
+  let (mut client, mut rx, server) = spawn_server();
+  write_frame(
+    &mut client,
+    PacketType::Handshake,
+    r#"{"v":1,"client_id":"test-app"}"#,
+  );
+  let (_, body) = read_frame(&mut client);
+  assert!(body.contains("READY"), "expected READY, got: {body}");
+
+  write_frame(
+    &mut client,
+    PacketType::Frame,
+    r#"{"cmd":"SET_ACTIVITY","args":{"activity":{"name":"G","type":0}},"nonce":"n-missing"}"#,
+  );
+  let (_, reply) = read_frame(&mut client);
+  assert!(
+    reply.contains("\"code\":4005"),
+    "expected 4005, got: {reply}"
+  );
+  assert!(
+    reply.contains("Missing or invalid pid"),
+    "expected message, got: {reply}"
+  );
+
+  let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+  while std::time::Instant::now() < deadline {
+    assert!(
+      rx.try_recv().is_err(),
+      "rejected publish must not reach the sink"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(10));
+  }
+
+  drop(client);
+  server.join().expect("server thread");
+  let _ = rx;
+}
+
+/// A clear (activity == null) with a valid pid still forwards.
+#[test]
+fn set_activity_clear_with_valid_pid_forwards() {
+  let (mut client, mut rx, server) = spawn_server();
+  write_frame(
+    &mut client,
+    PacketType::Handshake,
+    r#"{"v":1,"client_id":"test-app"}"#,
+  );
+  let (_, body) = read_frame(&mut client);
+  assert!(body.contains("READY"), "expected READY, got: {body}");
+
+  write_frame(
+    &mut client,
+    PacketType::Frame,
+    r#"{"cmd":"SET_ACTIVITY","args":{"pid":11,"activity":null},"nonce":"n-clear"}"#,
+  );
+  let (_, echo) = read_frame(&mut client);
+  assert!(echo.contains("SET_ACTIVITY"), "expected echo, got: {echo}");
+  let cmd = recv_cmd(&mut rx);
+  assert_eq!(cmd.args.as_ref().and_then(|a| a.pid), Some(11));
+  assert!(
+    cmd
+      .args
+      .as_ref()
+      .and_then(|a| a.activity.as_ref())
+      .is_none()
+  );
+
+  drop(client);
+  server.join().expect("server thread");
+}

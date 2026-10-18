@@ -571,6 +571,28 @@ fn handle_set_activity(
     }
   };
 
+  // A publication (non-null activity) must carry a real pid: a missing or
+  // zero pid would leave an orphan presence downstream (the bridge only
+  // treats clears with pid != 0 as genuine). Reject before any state
+  // mutation or sink forwarding, mirroring the missing-args path above.
+  // Clears (activity == None) keep pid 0 and are handled by the router.
+  if args.activity.is_some() && args.pid.unwrap_or(0) == 0 {
+    tracing::warn!("[ipc] Missing or invalid pid, skipping");
+    let resp = encode(
+      PacketType::Frame,
+      &commands::rpc_error(
+        &activity_cmd.cmd,
+        &activity_cmd.nonce,
+        4005,
+        "Missing or invalid pid",
+      ),
+    );
+    if let Err(err) = stream.write_all(&resp) {
+      tracing::debug!("[ipc] Peer gone, dropping reply: {err}");
+    }
+    return;
+  }
+
   activity_cmd.application_id = Some(ipc.client_id());
   let pid = args.pid.unwrap_or_default();
   ipc.set_pid(pid);
