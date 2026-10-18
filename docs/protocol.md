@@ -1,6 +1,6 @@
-# Protocol: how games talk to rsRPC
+# Protocol: how games talk to Adsum
 
-rsRPC plays the part of the local Discord client. Games connect to it the
+Adsum plays the part of the local Discord client. Games connect to it the
 way they would connect to Discord, publish Rich Presence, and get
 officially-shaped replies. Two transports are served:
 
@@ -68,13 +68,13 @@ id):
 }
 ```
 
-The `user` object is rsRPC's identity — see
+The `user` object is Adsum's identity — see
 [web-client.md](web-client.md) for how to change it.
 
 ## Commands
 
 Both transports share one reply vocabulary (see
-`crates/rsrpc-protocol/src/commands.rs`), but they do **not** route
+`crates/adsum-protocol/src/commands.rs`), but they do **not** route
 identically. Where a row below differs, the difference is called out — the
 most important ones are `DEEP_LINK` and a malformed `SET_ACTIVITY`.
 
@@ -104,7 +104,7 @@ command in silence.
   pid)` within 5 seconds is dropped before it reaches the broadcast. A
   client that counts frames will count fewer than it published.
 
-### Commands rsRPC cannot back
+### Commands Adsum cannot back
 
 These answer with official-shaped errors instead of hanging:
 

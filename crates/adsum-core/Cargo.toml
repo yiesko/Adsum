@@ -1,0 +1,31 @@
+[package]
+name = "adsum-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Adsum daemon wiring: config, database loading, one-shot diagnostics, async run"
+license.workspace = true
+repository.workspace = true
+keywords = ["discord", "rich-presence", "rpc", "daemon"]
+categories = ["network-programming", "asynchronous"]
+
+[lints]
+workspace = true
+
+[dependencies]
+adsum-types = { path = "../adsum-types" }
+adsum-protocol = { path = "../adsum-protocol" }
+adsum-detect = { path = "../adsum-detect" }
+adsum-telemetry = { path = "../adsum-telemetry" }
+adsum-transport-ipc = { path = "../adsum-transport-ipc" }
+adsum-transport-ws = { path = "../adsum-transport-ws" }
+adsum-bridge = { path = "../adsum-bridge" }
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "time", "macros", "sync"] }
+serde_json.workspace = true
+ureq.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "time", "macros", "sync"] }
+serde_json.workspace = true

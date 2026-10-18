@@ -1,30 +1,30 @@
-# Using rsRPC as a library
+# Using Adsum as a library
 
-The `rsrpc-core` crate exposes the daemon: load a detectable database,
+The `adsum-core` crate exposes the daemon: load a detectable database,
 stage overrides, run one-shot diagnostics, or run the whole bridge until
 your own future completes.
 
 ## Add the dependency
 
-`rsrpc-core` is not published to crates.io — depend on the git tag:
+`adsum-core` is not published to crates.io — depend on the git tag:
 
 ```toml
 [dependencies]
-rsrpc-core = { git = "https://github.com/yiesko/discord-rich-presence", tag = "v0.38.1" }
+adsum-core = { git = "https://github.com/yiesko/adsum", tag = "v0.38.1" }
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal"] }
 ```
 
-Add `rsrpc-detect` from the same repository if you need to name
-`DetectableActivity` yourself (to build entries by hand, for example) — its path is `rsrpc_detect::db::DetectableActivity`:
+Add `adsum-detect` from the same repository if you need to name
+`DetectableActivity` yourself (to build entries by hand, for example) — its path is `adsum_detect::db::DetectableActivity`:
 
 ```toml
-rsrpc-detect = { git = "https://github.com/yiesko/discord-rich-presence", tag = "v0.38.1" }
+adsum-detect = { git = "https://github.com/yiesko/adsum", tag = "v0.38.1" }
 ```
 
 ## Minimal example
 
 ```rust
-use rsrpc_core::{Daemon, RPCConfig};
+use adsum_core::{Daemon, RPCConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -42,7 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 daemon should stop (a Ctrl+C signal, a channel closing, a test ending).
 Teardown is total — transports, bridge, scanner threads and the event
 pump all stop and join, in reverse startup order. When `run_until`
-returns, no rsRPC thread is still running, so embedding more than one
+returns, no Adsum thread is still running, so embedding more than one
 daemon lifetime per process is safe.
 
 ## Loading the database
@@ -55,7 +55,7 @@ daemon lifetime per process is safe.
 | `Daemon::from_parsed(entries, config)` | A `Vec<DetectableActivity>` you parsed yourself. Never fails — parsing already happened. |
 
 ```rust
-use rsrpc_core::{Daemon, RPCConfig};
+use adsum_core::{Daemon, RPCConfig};
 
 // From a file.
 let daemon = Daemon::from_file(
@@ -80,7 +80,7 @@ outside the crate the struct literal is restricted. Use the builder, or
 mutate a `default()`:
 
 ```rust
-use rsrpc_core::RPCConfig;
+use adsum_core::RPCConfig;
 
 let config = RPCConfig::builder()
     .port(1400)
@@ -109,14 +109,14 @@ Every field, with its default:
 | `initial_db_etag` / `initial_db_content_hash` | `None` / `None` | Seeds for the first conditional refresh (set these when you fetched the body yourself) |
 | `ignored_ids` | `[]` | App ids the scanner never publishes (`--ignore-ids`) |
 | `exclusions_url` | `None` | Discord exclusions feed (`--exclusions-url`) |
-| `app_version` | `rsrpc-core`'s own version — **`0.1.0`**, not the CLI's | Version stamped into state snapshots. The CLI overrides it with `0.38.1`; embedding it yourself does not, so set it if the value matters |
-| `state_file` | `false` | Presence snapshots to `<tmpdir>/rsrpc-state-{0..9}` (`--state-file`): owner-only files, shared slots under concurrency |
+| `app_version` | `adsum-core`'s own version — **`0.1.0`**, not the CLI's | Version stamped into state snapshots. The CLI overrides it with `0.38.1`; embedding it yourself does not, so set it if the value matters |
+| `state_file` | `false` | Presence snapshots to `<tmpdir>/adsum-state-{0..9}` (`--state-file`): owner-only files, shared slots under concurrency |
 | `bridge_allowed_origins` | `[]` | Extra browser origins driving bridge commands (`--bridge-allowed-origins`): normalized to browser form, then exact match |
 
 ## One-shot diagnostics (no threads)
 
 ```rust
-use rsrpc_core::{Daemon, DetectedGame, DetectableSummary};
+use adsum_core::{Daemon, DetectedGame, DetectableSummary};
 
 // One process scan: staged overrides and the ignore-list apply, exactly
 // what run_until() would publish. Returns id/name/pid.
@@ -151,7 +151,7 @@ Both must happen before `run_until`, which consumes the daemon. To parse
 override files yourself:
 
 ```rust
-use rsrpc_core::overrides;
+use adsum_core::overrides;
 
 let entries = overrides::parse_overrides(r#"[{"id":"1","name":"G","hook":false}]"#)?;
 let from_file = overrides::load_file(std::path::Path::new("overrides.json"))?;
@@ -159,8 +159,8 @@ let from_dir = overrides::load_dir(std::path::Path::new("overrides.d")); // brok
 ```
 
 `overrides::default_file_path()` and `overrides::default_dir_path()` return
-the same locations the CLI checks (`$RSRPC_OVERRIDES_FILE` /
-`~/.config/rsrpc/overrides.json`, and the `.d` variants).
+the same locations the CLI checks (`$ADSUM_OVERRIDES_FILE` /
+`~/.config/adsum/overrides.json`, and the `.d` variants).
 
 ## Known limitation: `run_until` consumes the daemon
 
@@ -169,20 +169,20 @@ the same locations the CLI checks (`$RSRPC_OVERRIDES_FILE` /
 `detect_once` and `database_summary` must run **before** it. One-shot use
 never needs `run_until` at all.
 
-Teardown is total (see above): when `run_until` returns, no rsRPC
+Teardown is total (see above): when `run_until` returns, no Adsum
 thread is still running, so starting another daemon afterwards is
 safe — only the consumed `Daemon` value itself is single-use.
 
 ## Errors
 
-Fallible calls return `Result<T, rsrpc_protocol::error::RsrpcError>`, a
+Fallible calls return `Result<T, adsum_protocol::error::AdsumError>`, a
 `thiserror` enum with a variant per failure kind (`InvalidJson`,
 `UnreadableFile`, `IpcBind`, `WsBind`, `BridgeBind`, …). It implements
 `std::error::Error`, so `Box<dyn std::error::Error>` works with `?`
-without depending on `rsrpc-protocol` directly. Add that crate (same
+without depending on `adsum-protocol` directly. Add that crate (same
 repository, same tag) if you want to `match` on specific variants.
 
-The exception is `rsrpc_core::overrides`, which does not use that enum:
+The exception is `adsum_core::overrides`, which does not use that enum:
 `parse_overrides` and `load_file` return `Result<Vec<_>, String>` carrying
 a ready-made message, because a malformed override file is a user-facing
 condition rather than a protocol error. `String` converts into

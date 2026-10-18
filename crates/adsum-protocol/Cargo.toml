@@ -1,0 +1,34 @@
+[package]
+name = "adsum-protocol"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Adsum wire protocol: errors, bridge payloads, reply builders, flood guard"
+license.workspace = true
+repository.workspace = true
+keywords = ["discord", "rich-presence", "rpc"]
+categories = ["network-programming"]
+
+[lints]
+workspace = true
+
+[dependencies]
+adsum-types = { path = "../adsum-types" }
+bytes.workspace = true
+tungstenite.workspace = true
+serde = { workspace = true, features = ["rc"] }
+serde_json.workspace = true
+serde_with.workspace = true
+rmp-serde.workspace = true
+thiserror.workspace = true
+rustc-hash.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+adsum-types = { path = "../adsum-types" }
+criterion = "0.8.2"
+
+[[bench]]
+name = "comparison"
+harness = false

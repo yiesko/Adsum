@@ -1,5 +1,5 @@
 [package]
-name = "rsrpc-fuzz"
+name = "adsum-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
@@ -11,14 +11,14 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 serde_json = "1.0"
 
-[dependencies.rsrpc-detect]
-path = "../crates/rsrpc-detect"
-[dependencies.rsrpc-types]
-path = "../crates/rsrpc-types"
-[dependencies.rsrpc-protocol]
-path = "../crates/rsrpc-protocol"
-[dependencies.rsrpc-transport-ipc]
-path = "../crates/rsrpc-transport-ipc"
+[dependencies.adsum-detect]
+path = "../crates/adsum-detect"
+[dependencies.adsum-types]
+path = "../crates/adsum-types"
+[dependencies.adsum-protocol]
+path = "../crates/adsum-protocol"
+[dependencies.adsum-transport-ipc]
+path = "../crates/adsum-transport-ipc"
 
 [[bin]]
 name = "activity_full"

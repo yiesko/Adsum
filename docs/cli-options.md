@@ -1,6 +1,6 @@
 # CLI options
 
-`rsrpc-cli` is configured with flags on the command line. Almost every flag
+`adsum` is configured with flags on the command line. Almost every flag
 also has an environment variable, so you can set values once in your shell
 profile or in a systemd unit instead of repeating them. `--yes` is the only
 flag without an environment variable.
@@ -12,11 +12,11 @@ accept `1`, `0`, `true`, `false`, `yes`, `no`, `on`, and `off`.
 
 | Flag | Environment variable | Default | What it does |
 |---|---|---|---|
-| `-d, --detectable-file <FILE>` | `RSRPC_DETECTABLE_FILE` | — | Load your game list from this file instead of the built-in one. |
-| `-n, --no-process-scan` (alias `--no-process-scanning`) | `RSRPC_NO_PROCESS_SCAN` | off | Turn off process detection entirely. |
-| `--no-proc-events` | `RSRPC_NO_PROC_EVENTS` | off | Turn off only the fast event watcher (the netlink `cn_proc` path). Polling keeps running. |
-| `--scan-interval-secs <SECS>` | `RSRPC_SCAN_INTERVAL` | `5` | Base seconds between scans. While the event watcher is live, quiet periods stretch ×2 per empty tick (5 → 10 → 20 → 30 seconds). |
-| `--ignore-ids <IDS>` | `RSRPC_IGNORE_IDS` | — | Comma-separated application IDs the scanner never publishes. |
+| `-d, --detectable-file <FILE>` | `ADSUM_DETECTABLE_FILE` | — | Load your game list from this file instead of the built-in one. |
+| `-n, --no-process-scan` (alias `--no-process-scanning`) | `ADSUM_NO_PROCESS_SCAN` | off | Turn off process detection entirely. |
+| `--no-proc-events` | `ADSUM_NO_PROC_EVENTS` | off | Turn off only the fast event watcher (the netlink `cn_proc` path). Polling keeps running. |
+| `--scan-interval-secs <SECS>` | `ADSUM_SCAN_INTERVAL` | `5` | Base seconds between scans. While the event watcher is live, quiet periods stretch ×2 per empty tick (5 → 10 → 20 → 30 seconds). |
+| `--ignore-ids <IDS>` | `ADSUM_IGNORE_IDS` | — | Comma-separated application IDs the scanner never publishes. |
 
 `--ignore-ids` applies to the process scanner only. Frames that a game
 forwards through the bridge are always passed on. See
@@ -26,12 +26,12 @@ forwards through the bridge are always passed on. See
 
 | Flag | Environment variable | Default | What it does |
 |---|---|---|---|
-| `--bridge-port <PORT>` | `RSRPC_BRIDGE_PORT` | `1337` | First JSON bridge port to try. |
-| `--bridge-port-end <PORT>` | `RSRPC_BRIDGE_PORT_END` | `1347` | Last JSON bridge port to try (inclusive). |
-| `--msgpack-port <PORT>` | `RSRPC_MSGPACK_PORT` | `1338` | MessagePack bridge port. It steps forward if the port is taken. |
-| `--bridge-allowed-origins <URLS>` | `RSRPC_BRIDGE_ALLOWED_ORIGINS` | empty | Extra browser origins allowed to drive bridge commands (comma-separated; normalized to browser form — lowercase, no trailing slash, no default port — then exact match), beyond Discord's own pages. Absent `Origin` (native clients) always passes. |
-| `--ws-port-start <PORT>` | `RSRPC_WS_PORT_START` | `6463` | First websocket port offered to games. |
-| `--ws-port-end <PORT>` | `RSRPC_WS_PORT_END` | `6472` | Last websocket port for games (inclusive). |
+| `--bridge-port <PORT>` | `ADSUM_BRIDGE_PORT` | `1337` | First JSON bridge port to try. |
+| `--bridge-port-end <PORT>` | `ADSUM_BRIDGE_PORT_END` | `1347` | Last JSON bridge port to try (inclusive). |
+| `--msgpack-port <PORT>` | `ADSUM_MSGPACK_PORT` | `1338` | MessagePack bridge port. It steps forward if the port is taken. |
+| `--bridge-allowed-origins <URLS>` | `ADSUM_BRIDGE_ALLOWED_ORIGINS` | empty | Extra browser origins allowed to drive bridge commands (comma-separated; normalized to browser form — lowercase, no trailing slash, no default port — then exact match), beyond Discord's own pages. Absent `Origin` (native clients) always passes. |
+| `--ws-port-start <PORT>` | `ADSUM_WS_PORT_START` | `6463` | First websocket port offered to games. |
+| `--ws-port-end <PORT>` | `ADSUM_WS_PORT_END` | `6472` | Last websocket port for games (inclusive). |
 
 The JSON bridge scans its range until it finds a free port, like arRPC does.
 See [protocol.md](protocol.md) for what runs on each port.
@@ -40,18 +40,18 @@ See [protocol.md](protocol.md) for what runs on each port.
 
 | Flag | Environment variable | Default | What it does |
 |---|---|---|---|
-| `--db-url <URL>` | `RSRPC_DB_URL` | official Discord endpoint when `--enable-db-update` is set | Fetch the game list from this URL at startup. |
-| `--enable-db-update` | `RSRPC_ENABLE_DB_UPDATE` | off | Refresh the game list every hour in the background. |
-| `--exclusions-url <URL>` | `RSRPC_EXCLUSIONS_URL` | official Discord endpoint when `--enable-db-update` is set | Source for Discord's detection exclusions (installer and crash-reporter names). An empty value disables the fetch. |
+| `--db-url <URL>` | `ADSUM_DB_URL` | official Discord endpoint when `--enable-db-update` is set | Fetch the game list from this URL at startup. |
+| `--enable-db-update` | `ADSUM_ENABLE_DB_UPDATE` | off | Refresh the game list every hour in the background. |
+| `--exclusions-url <URL>` | `ADSUM_EXCLUSIONS_URL` | official Discord endpoint when `--enable-db-update` is set | Source for Discord's detection exclusions (installer and crash-reporter names). An empty value disables the fetch. |
 
-Without any of these flags, rsRPC uses the snapshot bundled inside the
+Without any of these flags, Adsum uses the snapshot bundled inside the
 binary, so it works with no network access at all.
 
 **Which source wins**, in order:
 
 1. `--no-process-scan` gives an empty list (there is nothing to detect).
 2. `--detectable-file` loads your file.
-3. `--db-url` fetches your URL; if the fetch fails, rsRPC falls back to the
+3. `--db-url` fetches your URL; if the fetch fails, Adsum falls back to the
    bundled snapshot and says so on stderr.
 4. `--enable-db-update` fetches Discord's official list; same offline
    fallback.
@@ -62,7 +62,7 @@ Fetched lists are trimmed to the fields detection needs: `id`, `name`,
 and `third_party_skus` (`distributor`, `id`).
 
 The bundled snapshot lives at
-`crates/rsrpc-detect/resources/detectable.json`. Regenerate it with:
+`crates/adsum-detect/resources/detectable.json`. Regenerate it with:
 
 ```bash
 cargo run --manifest-path tools/updater/Cargo.toml
@@ -72,8 +72,8 @@ cargo run --manifest-path tools/updater/Cargo.toml
 
 | Flag | Environment variable | Default location |
 |---|---|---|
-| `--overrides-file <FILE>` | `RSRPC_OVERRIDES_FILE` | `$XDG_CONFIG_HOME/rsrpc/overrides.json`, else `~/.config/rsrpc/overrides.json` |
-| `--overrides-dir <DIR>` | `RSRPC_OVERRIDES_DIR` | `$XDG_CONFIG_HOME/rsrpc/overrides.d`, else `~/.config/rsrpc/overrides.d` |
+| `--overrides-file <FILE>` | `ADSUM_OVERRIDES_FILE` | `$XDG_CONFIG_HOME/adsum/overrides.json`, else `~/.config/adsum/overrides.json` |
+| `--overrides-dir <DIR>` | `ADSUM_OVERRIDES_DIR` | `$XDG_CONFIG_HOME/adsum/overrides.d`, else `~/.config/adsum/overrides.d` |
 
 Each file is a JSON array (or a single object) of `DetectableActivity`
 entries. Resolution order is flag, then environment variable, then the
@@ -90,20 +90,20 @@ detected under Proton/Wine. Details:
 
 | Flag | Environment variable | What it does |
 |---|---|---|
-| `--list-detected` | `RSRPC_LIST_DETECTED` | Run one scan, print what would be published, and exit. |
-| `--list-database` | `RSRPC_LIST_DATABASE` | Print database counts and the first ten entries, then exit. |
-| `--state-file` | `RSRPC_STATE_FILE` | Write presence snapshots to `<tmpdir>/rsrpc-state-{0..9}` (arRPC layout) for external tooling. Off by default. Snapshots are owner-only; concurrent daemons share slots (last writer wins). |
-| `-D, --debug` | `RSRPC_DEBUG` | Print the resolved configuration and enable debug logging. |
+| `--list-detected` | `ADSUM_LIST_DETECTED` | Run one scan, print what would be published, and exit. |
+| `--list-database` | `ADSUM_LIST_DATABASE` | Print database counts and the first ten entries, then exit. |
+| `--state-file` | `ADSUM_STATE_FILE` | Write presence snapshots to `<tmpdir>/adsum-state-{0..9}` (arRPC layout) for external tooling. Off by default. Snapshots are owner-only; concurrent daemons share slots (last writer wins). |
+| `-D, --debug` | `ADSUM_DEBUG` | Print the resolved configuration and enable debug logging. |
 
 ```bash
-./rsrpc-cli --list-detected
-# [rsrpc] Database: bundled (24299 entries)
+./adsum --list-detected
+# [adsum] Database: bundled (24299 entries)
 # How to Fish (id 1542021058834468927) pid 1234
 ```
 
 ```bash
-./rsrpc-cli --list-database
-# [rsrpc] Database: bundled (24299 entries)
+./adsum --list-database
+# [adsum] Database: bundled (24299 entries)
 # 24299 database entries, 11229 executables
 # Overwatch (356875221078245376)
 # ...
@@ -117,11 +117,11 @@ When nothing matches, `--list-detected` prints
 
 | Flag | Environment variable | What it does |
 |---|---|---|
-| `--check-update` | `RSRPC_CHECK_UPDATE` | Check for a newer release and exit. Exit code `2` means one is available, `0` means there is nothing to do — which is either "you are up to date" or "no build exists for your platform". The printed line says which; do not treat `0` alone as up-to-date on a non-Linux host. |
-| `--update` | `RSRPC_UPDATE` | Download and stage the newest release. It applies on the next start. |
+| `--check-update` | `ADSUM_CHECK_UPDATE` | Check for a newer release and exit. Exit code `2` means one is available, `0` means there is nothing to do — which is either "you are up to date" or "no build exists for your platform". The printed line says which; do not treat `0` alone as up-to-date on a non-Linux host. |
+| `--update` | `ADSUM_UPDATE` | Download and stage the newest release. It applies on the next start. |
 | `--yes` | *(none)* | Answer "yes" to the staging prompt, for scripts. |
-| `--rollback` | `RSRPC_ROLLBACK` | Restore the binary that the last update replaced, then exit. |
-| `--auto-update` | `RSRPC_AUTO_UPDATE` | Also stage available updates in the background while the daemon runs. |
+| `--rollback` | `ADSUM_ROLLBACK` | Restore the binary that the last update replaced, then exit. |
+| `--auto-update` | `ADSUM_AUTO_UPDATE` | Also stage available updates in the background while the daemon runs. |
 
 Full details in [self-update.md](self-update.md).
 
@@ -131,17 +131,17 @@ These have no command-line flag:
 
 | Variable | What it does |
 |---|---|
-| `RSRPC_USER_ID`, `RSRPC_USER_USERNAME`, `RSRPC_USER_GLOBAL_NAME`, `RSRPC_USER_DISCRIMINATOR`, `RSRPC_USER_AVATAR` | Change the identity rsRPC reports to clients. Blank values are ignored. |
-| `RSRPC_OTA_DIR` | Where updates are staged (default `~/.cache/rsrpc/ota/`). |
-| `RSRPC_OTA_APPLIED` | **Internal.** Set by rsRPC on the re-executed process so a staged update applies at most once per boot chain. Setting it yourself makes the next start skip the pending update and turns `--rollback` into a no-op — leave it alone. |
-| `RSRPC_STEAM_ROOT` | Point at a specific Steam install directory. |
-| `RSRPC_STEAM_LIBRARIES` | Point at specific Steam library folders (`:`-separated). |
-| `RUST_LOG` | Full `tracing` filter; overrides the `--debug`/`RSRPC_DEBUG` choice (see below). |
+| `ADSUM_USER_ID`, `ADSUM_USER_USERNAME`, `ADSUM_USER_GLOBAL_NAME`, `ADSUM_USER_DISCRIMINATOR`, `ADSUM_USER_AVATAR` | Change the identity Adsum reports to clients. Blank values are ignored. |
+| `ADSUM_OTA_DIR` | Where updates are staged (default `~/.cache/adsum/ota/`). |
+| `ADSUM_OTA_APPLIED` | **Internal.** Set by Adsum on the re-executed process so a staged update applies at most once per boot chain. Setting it yourself makes the next start skip the pending update and turns `--rollback` into a no-op — leave it alone. |
+| `ADSUM_STEAM_ROOT` | Point at a specific Steam install directory. |
+| `ADSUM_STEAM_LIBRARIES` | Point at specific Steam library folders (`:`-separated). |
+| `RUST_LOG` | Full `tracing` filter; overrides the `--debug`/`ADSUM_DEBUG` choice (see below). |
 
 ## Logging
 
 Logs go to stderr through `tracing`. `RUST_LOG` takes precedence when it is
-set. Otherwise `--debug` or `RSRPC_DEBUG=1` selects `debug`, and the default
+set. Otherwise `--debug` or `ADSUM_DEBUG=1` selects `debug`, and the default
 is `info`.
 
 Severity levels, from chattiest to quietest:

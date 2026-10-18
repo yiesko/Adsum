@@ -1,0 +1,44 @@
+[package]
+name = "adsum-bridge"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "arRPC-compatible activity bridge: fan-out, replay cache, handoff, debounced snapshots"
+license.workspace = true
+repository.workspace = true
+keywords = ["discord", "rich-presence", "rpc"]
+categories = ["network-programming", "asynchronous"]
+
+[lints]
+workspace = true
+
+[dependencies]
+adsum-types = { path = "../adsum-types" }
+adsum-protocol = { path = "../adsum-protocol" }
+adsum-telemetry = { path = "../adsum-telemetry" }
+adsum-ws = { path = "../adsum-ws" }
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "time", "macros", "sync"] }
+tokio-util = { version = "0.7", default-features = false }
+bytes.workspace = true
+tungstenite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rmp-serde.workspace = true
+tracing.workspace = true
+rustc-hash.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "time", "macros", "sync"] }
+adsum-ws = { path = "../adsum-ws", features = ["test-util"] }
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+serde_json.workspace = true
+rmp-serde.workspace = true
+tracing-subscriber = { workspace = true, features = ["fmt", "std"] }

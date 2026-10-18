@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# rsRPC uninstaller. Stops + disables the user service and removes what
+# Adsum uninstaller. Stops + disables the user service and removes what
 # install.sh laid down. Config, caches and backups are kept unless
 # --purge is given.
 #
 #   ./scripts/uninstall.sh [--purge] [--yes]
 set -euo pipefail
 
-APP="rsrpc-cli"
-UNIT_NAME="rsrpc.service"
+APP="adsum"
+UNIT_NAME="adsum.service"
 BIN_DIR="${HOME}/.local/bin"
 UNIT_DIR="${HOME}/.config/systemd/user"
 
@@ -19,7 +19,7 @@ while [ $# -gt 0 ]; do
     --yes) YES=1 ;;
     -h|--help)
       echo "Usage: uninstall.sh [--purge] [--yes]"
-      echo "  --purge  also remove config (~/.config/rsrpc), caches (~/.cache/rsrpc) and .bak-* backups"
+      echo "  --purge  also remove config (~/.config/adsum), caches (~/.cache/adsum) and .bak-* backups"
       exit 0
       ;;
     *) echo "[uninstall] ERROR: unknown argument: $1" >&2; exit 1 ;;
@@ -46,11 +46,11 @@ rm -f "${UNIT_DIR}/${UNIT_NAME}" "${BIN_DIR}/${APP}"
 log "removed unit and binary"
 
 if [ "$PURGE" -eq 1 ]; then
-  rm -rf "${UNIT_DIR}/${UNIT_NAME}.d" "${HOME}/.config/rsrpc" "${HOME}/.cache/rsrpc"
+  rm -rf "${UNIT_DIR}/${UNIT_NAME}.d" "${HOME}/.config/adsum" "${HOME}/.cache/adsum"
   rm -f "${BIN_DIR}/${APP}".bak-* "${UNIT_DIR}/${UNIT_NAME}".bak-*
   log "purged config, caches, drop-ins and backups"
 else
-  log "kept: config (~/.config/rsrpc), caches (~/.cache/rsrpc), .bak-* backups"
+  log "kept: config (~/.config/adsum), caches (~/.cache/adsum), .bak-* backups"
 fi
 
 systemctl --user daemon-reload 2>/dev/null || true

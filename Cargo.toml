@@ -1,5 +1,5 @@
 [workspace]
-members = ["cli", "crates/rsrpc-ws", "crates/rsrpc-types", "crates/rsrpc-protocol", "crates/rsrpc-transport-ws", "crates/rsrpc-transport-ipc", "crates/rsrpc-bridge", "crates/rsrpc-telemetry", "crates/rsrpc-proc-events", "crates/rsrpc-steam", "crates/rsrpc-detect", "crates/rsrpc-core"]
+members = ["adsum-cli", "crates/adsum-ws", "crates/adsum-types", "crates/adsum-protocol", "crates/adsum-transport-ws", "crates/adsum-transport-ipc", "crates/adsum-bridge", "crates/adsum-telemetry", "crates/adsum-proc-events", "crates/adsum-steam", "crates/adsum-detect", "crates/adsum-core"]
 resolver = "2"
 
 # Shared package metadata: every member inherits these so author,
@@ -8,7 +8,7 @@ resolver = "2"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
-repository = "https://github.com/yiesko/discord-rich-presence"
+repository = "https://github.com/yiesko/adsum"
 authors = ["spikehd", "yieskoW"]
 
 # Shared dependency pins: members inherit with `dep = { workspace = true }`

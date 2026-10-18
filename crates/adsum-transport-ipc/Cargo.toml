@@ -1,0 +1,28 @@
+[package]
+name = "adsum-transport-ipc"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Discord IPC transport: framed protocol, Unix socket and Windows pipe servers with JoinSet lifecycle"
+license.workspace = true
+repository.workspace = true
+keywords = ["discord", "rich-presence", "rpc", "ipc"]
+categories = ["network-programming", "asynchronous"]
+
+[lints]
+workspace = true
+
+[dependencies]
+adsum-types = { path = "../adsum-types" }
+adsum-protocol = { path = "../adsum-protocol" }
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "time", "macros", "sync"] }
+tokio-util = "0.7"
+interprocess = "2.2"
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "time", "macros", "sync"] }
+serde_json.workspace = true

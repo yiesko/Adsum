@@ -3,10 +3,10 @@
 use std::io::{Cursor, Read, Write};
 
 use libfuzzer_sys::fuzz_target;
-use rsrpc_transport_ipc::EventSink;
-use rsrpc_transport_ipc::frame::{IpcFacilitator, MAX_IPC_PAYLOAD, PacketType, handle_stream};
-use rsrpc_types::AppId;
-use rsrpc_types::user::RpcUser;
+use adsum_transport_ipc::EventSink;
+use adsum_transport_ipc::frame::{IpcFacilitator, MAX_IPC_PAYLOAD, PacketType, handle_stream};
+use adsum_types::AppId;
+use adsum_types::user::RpcUser;
 use serde_json::Value;
 
 // Per-connection state with a drain-free sink: the queue is oversized so

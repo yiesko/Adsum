@@ -5,10 +5,10 @@ on:
     paths:
       - '.github/workflows/fuzz.yml'
       - 'fuzz/**'
-      - 'crates/rsrpc-transport-ipc/**'
-      - 'crates/rsrpc-protocol/**'
-      - 'crates/rsrpc-detect/**'
-      - 'crates/rsrpc-types/**'
+      - 'crates/adsum-transport-ipc/**'
+      - 'crates/adsum-protocol/**'
+      - 'crates/adsum-detect/**'
+      - 'crates/adsum-types/**'
       - 'Cargo.lock'
       - 'fuzz/Cargo.lock'
   schedule:

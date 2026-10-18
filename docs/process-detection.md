@@ -1,6 +1,6 @@
 # Process detection
 
-rsRPC finds running games without asking them anything. It scans the process
+Adsum finds running games without asking them anything. It scans the process
 list, matches executables against the detectable database, and publishes a
 Rich Presence card for whatever it finds. This page explains how that
 matching works and how it coexists with games that report themselves.
@@ -119,13 +119,13 @@ the moment it starts and clears the moment it exits.
 The kernel delivery is officially lossy, so the watcher is best-effort: it
 can rarely go silent for stretches. When its self-test fails it resubscribes
 instead of dying, and polling backstops everything either way. Use
-`--no-proc-events` / `RSRPC_NO_PROC_EVENTS=1` to disable the watcher and
+`--no-proc-events` / `ADSUM_NO_PROC_EVENTS=1` to disable the watcher and
 run polling only, or `-n` / `--no-process-scan` to disable detection
 entirely.
 
 ## IPC-wins handoff (generic card vs. companion)
 
-When a game is only process-detected, rsRPC shows a generic card right away.
+When a game is only process-detected, Adsum shows a generic card right away.
 The moment a game SDK (or a companion like wwrpc) sends its own
 `SET_ACTIVITY` for the same app, the generic card is withdrawn and the
 game's own presence takes over. When that source clears, the generic card
@@ -142,10 +142,10 @@ companions. The flag remains for slots you want silent no matter what.
 
 ## What the scanner never publishes
 
-- `--ignore-ids <IDS>` / `RSRPC_IGNORE_IDS` — comma-separated application
+- `--ignore-ids <IDS>` / `ADSUM_IGNORE_IDS` — comma-separated application
   IDs the scanner treats as absent. **Scan-only by design**: frames that a
   game forwards through the bridge are always passed on, so a game that
-  really is talking to rsRPC is never silenced by this list.
+  really is talking to Adsum is never silenced by this list.
 - Anything on Discord's exclusion list.
 - Anything that fails the OS filter (main database only; overrides bypass it).
 - Steam's own helpers, by basename — a first cheap line, not the rule. The
@@ -175,10 +175,10 @@ bundled database:
 ```
 
 - Files are a JSON array or a single object.
-- Resolution: `--overrides-file` > `$RSRPC_OVERRIDES_FILE` >
-  `$XDG_CONFIG_HOME/rsrpc/overrides.json` > `~/.config/rsrpc/overrides.json`;
-  the directory variant (`--overrides-dir`, `$RSRPC_OVERRIDES_DIR`,
-  `~/.config/rsrpc/overrides.d`) works the same way and is merged with the
+- Resolution: `--overrides-file` > `$ADSUM_OVERRIDES_FILE` >
+  `$XDG_CONFIG_HOME/adsum/overrides.json` > `~/.config/adsum/overrides.json`;
+  the directory variant (`--overrides-dir`, `$ADSUM_OVERRIDES_DIR`,
+  `~/.config/adsum/overrides.d`) works the same way and is merged with the
   file.
 - Overrides are staged before anything else, so `--list-detected` shows
   exactly what the daemon would publish.
@@ -194,13 +194,13 @@ bundled database:
 
 The library exposes the same capability through
 `append_detectables` / `remove_detectable_by_name` and
-`rsrpc_core::overrides` — see [library.md](library.md).
+`adsum_core::overrides` — see [library.md](library.md).
 
 ## Checking your setup
 
 ```bash
-./rsrpc-cli --list-detected
-# [rsrpc] Database: bundled (24299 entries)
+./adsum --list-detected
+# [adsum] Database: bundled (24299 entries)
 # How to Fish (id 1542021058834468927) pid 1234
 ```
 

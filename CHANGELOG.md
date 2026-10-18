@@ -43,7 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The bridge now validates the WebSocket `Origin` header like the game
   transport already did: absent `Origin` (native clients) and Discord's
   own pages pass, anything else is closed at connect before READY unless
-  listed in `--bridge-allowed-origins` / `RSRPC_BRIDGE_ALLOWED_ORIGINS`.
+  listed in `--bridge-allowed-origins` / `ADSUM_BRIDGE_ALLOWED_ORIGINS`.
   A malicious page can no longer read local activities or send bridge
   commands through `ws://127.0.0.1:1337`; frames pipelined past the
   close are dropped as unregistered. Client ids are now unique
@@ -108,9 +108,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fix, see below.
 
 ### Changed
-- Folded `rsrpc-state` into `rsrpc-bridge` (12 crates down to 11): the
+- Folded `adsum-state` into `adsum-bridge` (12 crates down to 11): the
   snapshot slots had exactly one consumer, so the crate boundary only
-  added hops. `rsrpc-telemetry` stays separate: four crates share it,
+  added hops. `adsum-telemetry` stays separate: four crates share it,
   and folding it into the bridge would point their dependencies the
   wrong way. `BindPaths=/tmp` in the unit stays as is: tightening was
   investigated, but BindPaths takes no globs, the sockets only exist at
@@ -143,16 +143,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of parking blocking threads without bound, leaving room in the
   32-thread blocking pool for unrelated work.
 - Split the two biggest modules internally, same crates and same
-  behavior: `crates/rsrpc-detect/src/server.rs` is now foundation plus
+  behavior: `crates/adsum-detect/src/server.rs` is now foundation plus
   `runtime` (threads, shutdown, join), `database` (bundle ownership and
   swaps), `scanner` (enumeration and classification), `steam`
   (library roots) alongside the existing `bundle`/`db`/`refresh`/`scan`
-  modules; `crates/rsrpc-bridge/src/bridge.rs` is now construction plus pumps
+  modules; `crates/adsum-bridge/src/bridge.rs` is now construction plus pumps
   alongside `consumer` (fan-out and pruning), `router` (activity
   decisions), `replay` (cache and ghost-reap pid resolution), `snapshot`
   (persistence) and `control` (`SET_USER`/`RESET_USER`). `Shared` fields
   are crate-visible for the new units; wire protocols unchanged. One
-  breaking change for library callers: `rsrpc_proc_events::watch` now
+  breaking change for library callers: `adsum_proc_events::watch` now
   takes a shutdown flag (`watch(events, stop)`), so the watcher thread
   joins on directed shutdown instead of blocking on netlink.
 - CodeQL now scans the workspace as one job with the v4 action inputs, and
@@ -175,17 +175,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The flood-guard key builds once per call instead of twice (an `AppId`
   key would allocate identically, since callers hold `&str`).
 - Scanner threads now belong to the daemon lifecycle: `ProcessServer`
-  gained directed `shutdown()` + `join()` (plus `rsrpc-*` thread names),
+  gained directed `shutdown()` + `join()` (plus `adsum-*` thread names),
   every long sleep became an interruptible park, the netlink watcher
   honors a stop flag (including its self-test), and `Daemon::run_until`
   shuts down, joins and drops the scanner on success and bind failures.
   Future abandonment (dropping the future via `select!`/timeout/abort)
   signals shutdown through a cancellation guard instead, so threads exit
   on their own within about one poll interval. When `run_until` returns,
-  no rsRPC thread is still running, so library callers may run another
-  daemon afterwards (`crates/rsrpc-detect/src/server.rs`,
-  `crates/rsrpc-proc-events/src/lib.rs`,
-  `crates/rsrpc-core/src/daemon.rs`).
+  no Adsum thread is still running, so library callers may run another
+  daemon afterwards (`crates/adsum-detect/src/server.rs`,
+  `crates/adsum-proc-events/src/lib.rs`,
+  `crates/adsum-core/src/daemon.rs`).
 - The module split broke non-Linux builds (the Linux-only `/proc`
   reader was imported unconditionally: E0432 on every Windows/macOS
   job). The reader import and its Linux-only companions are now gated
@@ -272,27 +272,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - `--rollback` no longer re-executes into an infinite toggle loop. The
   re-exec passes the original argv back and `cmd_rollback` had no
-  applied-guard, so every pass swapped `rsrpc-cli`/`rsrpc-cli.prev` again
+  applied-guard, so every pass swapped `adsum-cli`/`adsum-cli.prev` again
   (reproduced: 460 swaps in 3 seconds, killed by timeout). It now does
   one swap, re-execs once and exits, mirroring the guard in
   `apply_pending_on_boot` (`cli/src/update.rs`).
-- `RSRPC_STATE_FILE` is wired up again: `--state-file` /
-  `RSRPC_STATE_FILE` points the bridge at the temp-dir snapshot slots
-  (`<tmpdir>/rsrpc-state-{0..9}`), as documented since 0.32.0. The env
+- `ADSUM_STATE_FILE` is wired up again: `--state-file` /
+  `ADSUM_STATE_FILE` points the bridge at the temp-dir snapshot slots
+  (`<tmpdir>/adsum-state-{0..9}`), as documented since 0.32.0. The env
   check was lost in the 0.36.0 workspace refactor while
   `BridgeConfig::state_dir` stayed `None`, so the CLI activation never
   happened; `RPCConfig::state_file` now carries it through to
-  `Bridge::bind` (`crates/rsrpc-core/src/{config,daemon}.rs`,
+  `Bridge::bind` (`crates/adsum-core/src/{config,daemon}.rs`,
   `cli/src/main.rs`).
-- `systemd/rsrpc.service` keeps `%h/.local/bin` writable via
+- `systemd/adsum.service` keeps `%h/.local/bin` writable via
   `ReadWritePaths`: under `ProtectHome=read-only` + `ProtectSystem=strict`
   the sandboxed service could not swap in its own staged self-updates
   (discarded at boot with `cannot replace binary`), and the dead
-  `RSRPC_LOGS_ENABLED=1` line (no longer read by the logger) is gone.
+  `ADSUM_LOGS_ENABLED=1` line (no longer read by the logger) is gone.
 
 ### Changed
-- The repository moved from `yiesko/rsRPC` to
-  `yiesko/discord-rich-presence`; every checked-in URL (crates,
+- The repository moved from `yiesko/Adsum` to
+  `yiesko/adsum`; every checked-in URL (crates,
   install script, docs, changelog links, self-update API) now points
   at the new location.
 - The README was rewritten in plain English with a screenshots section,
@@ -305,13 +305,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 - The `lib/` monolith is now a 12-crate workspace plus the thin `cli`
-  binary (`rsrpc-ws`, `rsrpc-types`, `rsrpc-protocol`, `rsrpc-transport-ws`,
-  `rsrpc-transport-ipc`, `rsrpc-state`, `rsrpc-bridge`, `rsrpc-telemetry`,
-  `rsrpc-proc-events`, `rsrpc-steam`, `rsrpc-detect`, `rsrpc-core`): one
+  binary (`adsum-ws`, `adsum-types`, `adsum-protocol`, `adsum-transport-ws`,
+  `adsum-transport-ipc`, `adsum-state`, `adsum-bridge`, `adsum-telemetry`,
+  `adsum-proc-events`, `adsum-steam`, `adsum-detect`, `adsum-core`): one
   Tokio runtime owned by the caller, `[workspace.lints]` on every member,
-  fuzz targets under `fuzz/`, benches under `rsrpc-detect` /
-  `rsrpc-protocol`. The old `rsrpc` library name is gone: embedders use
-  `rsrpc-core::Daemon` / `RPCConfig::builder()`. `Message::Text(String)`
+  fuzz targets under `fuzz/`, benches under `adsum-detect` /
+  `adsum-protocol`. The old `adsum` library name is gone: embedders use
+  `adsum-core::Daemon` / `RPCConfig::builder()`. `Message::Text(String)`
   is now `Text(Utf8Bytes)` and bridge payloads are `Arc<CachedActivity>`
   (`json: Utf8Bytes, msgpack: Bytes, is_clear: bool`).
 
@@ -322,14 +322,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Previously a bridge client that died without a clean disconnect (killed
   process, closed browser tab) and only received `INVITE_BROWSER` /
   `DEEP_LINK` events would keep its `Responder` and queued frames pinned in
-  memory forever (`Shared::broadcast_raw` in `crates/rsrpc-bridge/src/bridge.rs`).
+  memory forever (`Shared::broadcast_raw` in `crates/adsum-bridge/src/bridge.rs`).
 - WebSocket game-client handlers (`handle_browser_command`,
   `handle_deep_link`, `handle_connections_callback`, `handle_set_activity`)
   now report whether their reply was delivered and the pump
-  (`Event::Disconnect` in `crates/rsrpc-transport-ws/src/transport.rs:801`)
+  (`Event::Disconnect` in `crates/adsum-transport-ws/src/transport.rs:801`)
   removes the client and clears every published pid when delivery fails,
   freeing the per-client slots the same way a clean `Disconnect` does
-  (`crates/rsrpc-transport-ws/src/handlers.rs:291`). Verified with real
+  (`crates/adsum-transport-ws/src/handlers.rs:291`). Verified with real
   `Responder` tests (RFC6455 handshake + killed-connection simulation with
   condition-wait for `send==false` and `Disconnect`).
 - Hourly bundle-swap RSS floor ratchet: the swap ran `malloc_trim` while
@@ -339,7 +339,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports the result (six consecutive recounts showed the old
   generation always releases within 30 s); the post-retrim line also
   reports live vs free heap bytes from `mallinfo2` (glibc-only,
-  cfg-gated) (`crates/rsrpc-detect/src/db.rs`, `server.rs`). The
+  cfg-gated) (`crates/adsum-detect/src/db.rs`, `server.rs`). The
   canonical content hash is factored per entry (byte-identical stream,
   pinned by a fold test).
 - First-sighting `INFO` logs report every new id again, restoring main-branch
@@ -356,14 +356,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   plus a `StatsSnapshot` census (`rss` via `/proc/self/statm` on Linux,
   `n/a` elsewhere) with bridge `json`/`msgpack` and `ws` client counts and
   all three queue depths
-  (`crates/rsrpc-telemetry/src/lib.rs:20`). Helpers, rendering and the
-  daemon wiring are covered by `crates/rsrpc-telemetry/tests/telemetry.rs`
+  (`crates/adsum-telemetry/src/lib.rs:20`). Helpers, rendering and the
+  daemon wiring are covered by `crates/adsum-telemetry/tests/telemetry.rs`
   (gauge sharing, `rss_bytes`, snapshot shape) and the bridge census
   suite (live counts, session-boundary lines): the bridge logs the
   census hourly plus `game-start`/`game-end` on process-table
   transitions, with consumer counts and input queue depths sampled live.
-- Tests `crates/rsrpc-ws/tests/integration.rs` and
-  `crates/rsrpc-transport-ws/tests/integration.rs` (dead vs live
+- Tests `crates/adsum-ws/tests/integration.rs` and
+  `crates/adsum-transport-ws/tests/integration.rs` (dead vs live
   `Responder` liveness).
 
 ### Changed
@@ -384,23 +384,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path and normalized folders (lowercase stage skipped on the
   already-lowercase hot path). Behavior is byte-identical, covered by
   parity and no-realloc regression tests
-  (`crates/rsrpc-detect/src/scan.rs`, `server.rs`).
+  (`crates/adsum-detect/src/scan.rs`, `server.rs`).
 - Single-pass automaton build: entries are walked once, partitioning
   executables into native and Proton pattern vectors (identical
   contents, order and filters as the two walks), with pattern, index
   and aux-map vectors pre-sized from the entry counts and each source
   vector dropped right after its automaton compiles — peak is one
   automaton plus one vector plus builder scratch
-  (`crates/rsrpc-detect/src/bundle.rs`).
+  (`crates/adsum-detect/src/bundle.rs`).
 - `tokio-util` trimmed to default features workspace-wide: only
   `sync::CancellationToken` is used, so the explicit full features
   pulled codec, compat, io, net, rt and time machinery for nothing
-  (`crates/rsrpc-bridge/Cargo.toml`, `crates/rsrpc-ws/Cargo.toml`).
+  (`crates/adsum-bridge/Cargo.toml`, `crates/adsum-ws/Cargo.toml`).
 
 ## [0.35.0] - 2026-09-15
 
 ### Breaking
-- Removed `rsrpc::cmd::Button` (unreferenced; buttons travel as plain
+- Removed `adsum::cmd::Button` (unreferenced; buttons travel as plain
   values) and the deprecated `get_user_response` shim (its one-release
   cycle since 0.33.0 is over — use `user_response`); `empty_activity`
   is now private. New `RPCConfig::initial_db_content_hash` field
@@ -466,12 +466,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enable/start/linger, optional opt-in auto-update drop-in; idempotent
   re-runs update. `scripts/uninstall.sh` removes service + binary
   (`--purge` also drops config/caches/backups). Ships
-  `systemd/rsrpc.service` (hardened user unit: `ProtectSystem=strict`
+  `systemd/adsum.service` (hardened user unit: `ProtectSystem=strict`
   + host `/tmp` bind for the IPC fan-out, `AF_NETLINK` for the proc
   watcher, personal overrides via commented drop-in examples).
 - Proc-events honesty knob: the `watcher live` line now states the
   best-effort nature inline, and `--no-proc-events` /
-  `RSRPC_NO_PROC_EVENTS=1` disables the netlink watcher thread entirely
+  `ADSUM_NO_PROC_EVENTS=1` disables the netlink watcher thread entirely
   (process polling continues either way).
 
 ### Fixed
@@ -480,7 +480,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it back — printing success while changing nothing and leaving no
   backup behind. Rollback is now a true exchange (rolling back twice
   restores the starting state), and the sidecar name is a single
-  predictable suffix (`rsrpc-cli.prev`).
+  predictable suffix (`adsum-cli.prev`).
 - Proc-events watcher resubscribes instead of dying on one failed
   self-test: a transient kernel stall no longer pins polling until the
   next daemon restart (first failure still warns, later retries stay in
@@ -504,15 +504,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   legacy non-prehashed signatures rejected). CI signs with
   `MINISIGN_SECRET_KEY` and self-verifies before publishing; the secret
   key lives only in GitHub Secrets plus an offline backup.
-- Self-update (OTA) for `rsrpc-cli` (Linux x86_64 + ARM64): `--check-update`
+- Self-update (OTA) for `adsum-cli` (Linux x86_64 + ARM64): `--check-update`
   (exit 2 when a newer release exists), `--update [--yes]` (downloads,
   SHA256-verifies against the release manifest, stages under
-  `~/.cache/rsrpc/ota/`), `--rollback` (restores the kept `.prev` image),
-  and opt-in `--auto-update`/`RSRPC_AUTO_UPDATE=1` for background staging
+  `~/.cache/adsum/ota/`), `--rollback` (restores the kept `.prev` image),
+  and opt-in `--auto-update`/`ADSUM_AUTO_UPDATE=1` for background staging
   in the daemon (daily check + log either way). Staged binaries apply on
   the next start via atomic swap + re-exec (same PID on Linux); dev builds,
   `cargo install` copies, foreign names and read-only dirs are refused with
-  a plain message. CI publishes raw `rsrpc-cli-{target}` binaries plus
+  a plain message. CI publishes raw `adsum-cli-{target}` binaries plus
   `SHA256SUMS.txt` on tag releases.
 
 ### Fixed
@@ -530,7 +530,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CURRENT_USER_UPDATE` are ever dispatched; voice/guild/message/invite/
   relationship/entitlement subscriptions are ACKed and then silent (they
   need the real Discord client).
-- **Breaking:** fallible APIs now return `rsrpc::error::RsrpcError`
+- **Breaking:** fallible APIs now return `adsum::error::AdsumError`
   (`thiserror`) instead of boxed errors; `ClientConnector::new`,
   `WebsocketConnector::new` and `RPCServer::start` return `Result`
   (bind failures surface to the caller — the library never exits the
@@ -553,9 +553,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Discord detection exclusions (`GET /games/detectable/exclusions`):
   installer/crash-reporter basenames + regex patterns are dropped before
   any matching. Fetched hourly alongside the DB when `--enable-db-update`
-  is set (`--exclusions-url`/`RSRPC_EXCLUSIONS_URL` overrides); empty set
+  is set (`--exclusions-url`/`ADSUM_EXCLUSIONS_URL` overrides); empty set
   behaves exactly like before.
-- `tools/updater` now uses the shared `rsrpc::detection::trim_detectable`
+- `tools/updater` now uses the shared `adsum::detection::trim_detectable`
   instead of a hand-rolled copy (the copy had silently dropped aliases
   from the bundled snapshot).
 - Steam library provider: install-dir -> AppId from Steam's own files
@@ -563,8 +563,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for games whose per-process store id is unreadable. Roots are found
   dynamically (running `steam` via `/proc`, `PATH`, mounted partitions
   via `/proc/mounts`, home fallbacks — a secondary library never shadows
-  the primary root); `$RSRPC_STEAM_ROOT` overrides exclusively,
-  `$RSRPC_STEAM_LIBRARIES` (`:`-separated) adds manually. A JSON cache
+  the primary root); `$ADSUM_STEAM_ROOT` overrides exclusively,
+  `$ADSUM_STEAM_LIBRARIES` (`:`-separated) adds manually. A JSON cache
   with per-library fingerprints revalidates by stat and reparses only
   what changed. Precedence: Steam AppId, Proton patterns, Steam
   install-dir, stem/folder — except shortcut-range AppIds (high bit set,
@@ -583,11 +583,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AF_NETLINK`, otherwise the subscription fails and the scanner stays
   on polling (this was the production failure mode — diagnosed via the
   missing `watcher live` line).
-- Overrides v2: `--overrides-dir`/`RSRPC_OVERRIDES_DIR` loads every
+- Overrides v2: `--overrides-dir`/`ADSUM_OVERRIDES_DIR` loads every
   `*.json` in a directory (array or single object per file, sorted,
   corrupt files skipped with a warning) additive to `--overrides-file`
   — the home for MultiMC/Prism/Hydra mappings and Proton-only titles.
-  Loading moved into a library module (`rsrpc::overrides`, shared
+  Loading moved into a library module (`adsum::overrides`, shared
   defaults) and `append_detectables` stages pre-start: `--list-detected`
   now applies staged overrides AND the ignore-list, so diagnostics show
   exactly what the daemon would publish (previously main-DB-only).
@@ -615,16 +615,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - EXIT-wake storm: tracked short-lived Proton helpers unparked the scan
   loop several times per second (0.76s effective cadence during NFS).
   Wakes are debounced to at most one per second now.
-- Exclusive sources diluted on refresh: `RSRPC_STEAM_ROOT` (and injected
+- Exclusive sources diluted on refresh: `ADSUM_STEAM_ROOT` (and injected
   layouts) were merged with re-discovered roots on every folders change.
   Refresh re-resolves from the same source discovery used.
-- `RSRPC_DEBUG=1` (and friends) rejected by clap bool parsing, crashing
+- `ADSUM_DEBUG=1` (and friends) rejected by clap bool parsing, crashing
   the daemon at startup: all env-backed bool flags accept
   `1/0/true/false/yes/no/on/off` now.
 - Dead re-entrancy guard (`scanning` checked but never set): real RAII
   guard, acquired atomically and released on every exit path.
 - IPC/bridge bind exhaustion no longer panics the daemon: `create_socket`
-  failures surface as typed `RsrpcError::IpcBind` / `WsBind` (keeping the
+  failures surface as typed `AdsumError::IpcBind` / `WsBind` (keeping the
   last `io::Error` as source) through the fallible `start()`; `to_fs_name`
   failures propagate instead of unwrapping.
 - Poison-tolerance gaps closed: the last bare `lock().unwrap()`s on hot
@@ -635,7 +635,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keep the current generation with a warning instead of panicking the
   refresh thread or startup; same fail-open as the empty-DB guard.
 - Error fidelity: `InvalidJson` keeps the serde error as `source`;
-  `database_summary` returns `RsrpcError`; bridge bind message lowercased
+  `database_summary` returns `AdsumError`; bridge bind message lowercased
   without log prefix; `# Errors` on all fallible constructors.
 - Custom steam SKUs participate in AppId matching (linear fallback,
   canonical map wins); main patterns beat custom ones across 64-bit
@@ -739,14 +739,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default 1337-1347 like arRPC) with MessagePack collision skip.
 - Bounded bridge replay cache (50 entries, oldest-first eviction) with
   30s rebroadcast refresh for late/missed clients.
-- Runtime identity: `RSRPC_USER_*` startup overrides plus bridge
+- Runtime identity: `ADSUM_USER_*` startup overrides plus bridge
   `SET_USER`/`RESET_USER` with ACKs (whitelisted keys only, blank
   strings ignored like the env overrides, huge integers clamped
   instead of wrapping); READY frames reflect the current identity on
   every transport.
-- Presence state snapshot (`RSRPC_STATE_FILE=1` writes
-  `<tmpdir>/rsrpc-state-{0..9}` with servers + activities, arRPC
-  layout, `rsrpc-` prefix); `--list-database` summary diagnostics.
+- Presence state snapshot (`ADSUM_STATE_FILE=1` writes
+  `<tmpdir>/adsum-state-{0..9}` with servers + activities, arRPC
+  layout, `adsum-` prefix); `--list-database` summary diagnostics.
 - Official-protocol gaps closed: `GET_USER` (current identity, or
   `null` for other ids) on IPC + websocket; `GIFT_CODE_BROWSER`
   forwarded like the other `*_BROWSER` commands (`4016` on missing
@@ -765,13 +765,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--ignore-ids` stays as full-silence opt-in, no longer needed for
   companions.
 - Stale IPC socket PING/PONG probe (1s): wedged holders are reclaimed,
-  live holders (Discord/arRPC/rsRPC) are left alone.
-- `--ignore-ids` / `RSRPC_IGNORE_IDS`: scan-only coexistence filter —
+  live holders (Discord/arRPC/Adsum) are left alone.
+- `--ignore-ids` / `ADSUM_IGNORE_IDS`: scan-only coexistence filter —
   ignored application IDs behave as absent (null event, clear) so a
   richer publisher owns those slots; forwarded client frames always
   pass, and `--list-detected` still shows ignored games.
-- Log severity system (`DEBUG`/`INFO`/`WARN`/`ERROR`): `RSRPC_LOG_LEVEL`
-  sets the floor (default `info`), `--debug` / `RSRPC_DEBUG=1` forces
+- Log severity system (`DEBUG`/`INFO`/`WARN`/`ERROR`): `ADSUM_LOG_LEVEL`
+  sets the floor (default `info`), `--debug` / `ADSUM_DEBUG=1` forces
   debug and prints the resolved config; `INFO` keeps the historical
   untagged shape, other levels are tagged.
 - Presence log lines: `Published: {name} (app {id}, pid {pid})` via a
@@ -838,15 +838,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Stuck presence after game close.
 
-[Unreleased]: https://github.com/yiesko/discord-rich-presence/compare/v0.38.0...HEAD
-[0.38.0]: https://github.com/yiesko/discord-rich-presence/releases/tag/v0.38.0
-[0.36.1]: https://github.com/yiesko/discord-rich-presence/releases/tag/v0.36.1
-[0.36.0]: https://github.com/yiesko/discord-rich-presence/releases/tag/v0.36.0
-[0.35.0]: https://github.com/yiesko/discord-rich-presence/releases/tag/v0.35.0
-[0.34.0]: https://github.com/yiesko/discord-rich-presence/releases/tag/v0.34.0
-[0.33.1]: https://github.com/yiesko/discord-rich-presence/releases/tag/v0.33.1
-[0.32.2]: https://github.com/yiesko/discord-rich-presence/releases/tag/v0.32.2
-[0.32.1]: https://github.com/yiesko/discord-rich-presence/releases/tag/v0.32.1
-[0.32.0]: https://github.com/yiesko/discord-rich-presence/releases/tag/v0.32.0
-[0.31.0]: https://github.com/yiesko/discord-rich-presence/releases/tag/v0.31.0
-[0.30.0]: https://github.com/yiesko/discord-rich-presence/releases/tag/v0.30.0
+[Unreleased]: https://github.com/yiesko/adsum/compare/v0.38.0...HEAD
+[0.38.0]: https://github.com/yiesko/adsum/releases/tag/v0.38.0
+[0.36.1]: https://github.com/yiesko/adsum/releases/tag/v0.36.1
+[0.36.0]: https://github.com/yiesko/adsum/releases/tag/v0.36.0
+[0.35.0]: https://github.com/yiesko/adsum/releases/tag/v0.35.0
+[0.34.0]: https://github.com/yiesko/adsum/releases/tag/v0.34.0
+[0.33.1]: https://github.com/yiesko/adsum/releases/tag/v0.33.1
+[0.32.2]: https://github.com/yiesko/adsum/releases/tag/v0.32.2
+[0.32.1]: https://github.com/yiesko/adsum/releases/tag/v0.32.1
+[0.32.0]: https://github.com/yiesko/adsum/releases/tag/v0.32.0
+[0.31.0]: https://github.com/yiesko/adsum/releases/tag/v0.31.0
+[0.30.0]: https://github.com/yiesko/adsum/releases/tag/v0.30.0

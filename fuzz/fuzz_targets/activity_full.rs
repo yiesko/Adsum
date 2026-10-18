@@ -9,7 +9,7 @@ fuzz_target!(|data: &[u8]| {
     let Ok(text) = std::str::from_utf8(data) else {
         return;
     };
-    let Ok(mut cmd) = serde_json::from_str::<rsrpc_types::cmd::ActivityCmd>(text) else {
+    let Ok(mut cmd) = serde_json::from_str::<adsum_types::cmd::ActivityCmd>(text) else {
         return;
     };
     cmd.fix();
@@ -17,5 +17,5 @@ fuzz_target!(|data: &[u8]| {
     // `cached_activity` consumes the command — the activity moves into the
     // payload instead of being cloned for it — so the fuzz input runs the
     // whole of what the bridge does with a command before the fan-out.
-    let _ = rsrpc_protocol::commands::cached_activity(cmd, None);
+    let _ = adsum_protocol::commands::cached_activity(cmd, None);
 });

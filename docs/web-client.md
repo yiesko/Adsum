@@ -1,7 +1,7 @@
 # Web client (browser, Vencord, Node)
 
-`plugin/rsrpc.js` is an optional JavaScript client that receives activity
-from the rsRPC bridge. It is **not** part of the Rust build: nothing is
+`plugin/adsum.js` is an optional JavaScript client that receives activity
+from the Adsum bridge. It is **not** part of the Rust build: nothing is
 bundled with `include_str!` or `build.rs`, and the server works fine
 without it. Any arRPC-compatible websocket client can consume the bridge
 instead.
@@ -32,20 +32,20 @@ WebSocket has no CORS gate of its own, so the bridge checks the
   `https://ptb.discord.com`) pass without extra configuration.
 - Anything else is refused at connect (closed before READY) unless
   listed in `--bridge-allowed-origins` /
-  `RSRPC_BRIDGE_ALLOWED_ORIGINS` (comma-separated; normalized to
+  `ADSUM_BRIDGE_ALLOWED_ORIGINS` (comma-separated; normalized to
   browser form — lowercase, no trailing slash, no default port —
   then exact match).
 
-## Using `RsRpcClient`
+## Using `AdsumClient`
 
 ```javascript
-const client = new RsRpcClient(false); // false = JSON (default, arRPC-compatible)
+const client = new AdsumClient(false); // false = JSON (default, arRPC-compatible)
 client.onActivity = (data) => console.log('Activity:', data);
 client.connect();
 ```
 
 ```javascript
-const client = new RsRpcClient(true, { // true = MessagePack
+const client = new AdsumClient(true, { // true = MessagePack
     jsonPort: 1337,
     msgpackPort: 1338,
     reconnectInterval: 5000, // ms between reconnect attempts
@@ -71,7 +71,7 @@ client.disconnect();
 **The first message on every connection is not an activity.** Once the origin
 check passes, the bridge sends a `READY` payload with the user identity
 before anything else, and only then replays whatever cards are cached. The
-bundled `RsRpcClient` hands *every* frame to `onActivity`, so a consumer
+bundled `AdsumClient` hands *every* frame to `onActivity`, so a consumer
 written from this page alone receives that identity object first and has to
 tolerate it:
 
@@ -107,19 +107,19 @@ ones.
 
 ## Vencord plugin and userscript
 
-When `Vencord` is present, `rsrpc.js` registers itself as a plugin named
-**rsRPC** ("High-performance Discord RPC bridge with optional MessagePack").
+When `Vencord` is present, `adsum.js` registers itself as a plugin named
+**Adsum** ("High-performance Discord RPC bridge with optional MessagePack").
 Its only setting, `useMsgPack`, toggles the MessagePack transport
 (marked experimental). On each activity it forwards the data into
 Discord's local presence via `setLocalPresence`.
 
 The same file works in a browser console or as a userscript — open it, run
-`new RsRpcClient(...)` as above, and read `onActivity`.
+`new AdsumClient(...)` as above, and read `onActivity`.
 
 ## Node and bundlers
 
 ```javascript
-const { RsRpcClient } = require('./plugin/rsrpc.js');
+const { AdsumClient } = require('./plugin/adsum.js');
 ```
 
 (Node needs a global `WebSocket`, which recent Node versions provide.)
@@ -128,13 +128,13 @@ const { RsRpcClient } = require('./plugin/rsrpc.js');
 
 These arrive on the JSON port as plain text frames:
 
-- `{"type":"SET_USER","patch":{...}}` — patch the identity rsRPC reports.
+- `{"type":"SET_USER","patch":{...}}` — patch the identity Adsum reports.
   Only these keys are accepted: `id`, `username`, `global_name`,
   `discriminator` (strings; blank values ignored), `avatar` (a string, or
   `null` to clear), `bot`, `flags`, `premium_type`. Acknowledged with
   `SET_USER_ACK`.
 - `{"type":"RESET_USER"}` — restore the startup identity (defaults plus
-  `RSRPC_USER_*`). Acknowledged with `RESET_USER_ACK`.
+  `ADSUM_USER_*`). Acknowledged with `RESET_USER_ACK`.
 
 Both replies look like
 `{"type":"SET_USER_ACK","nonce":...,"data":{"success":true,"user":{...}}}`

@@ -5,7 +5,7 @@ on:
     paths:
       - '.github/workflows/build.yml'
       - 'crates/**/*'
-      - 'cli/**/*'
+      - 'adsum-cli/**/*'
       - 'tools/**/*'
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -13,7 +13,7 @@ on:
     paths:
       - '.github/workflows/build.yml'
       - 'crates/**/*'
-      - 'cli/**/*'
+      - 'adsum-cli/**/*'
       - 'tools/**/*'
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -107,13 +107,13 @@ jobs:
 
       - name: Build
         if: matrix.config.target != 'armv7-unknown-linux-gnueabihf' && matrix.config.target != 'aarch64-unknown-linux-gnu'
-        run: cargo build -p rsrpc-cli --release --locked --target ${{ matrix.config.target }}
+        run: cargo build -p adsum-cli --release --locked --target ${{ matrix.config.target }}
         env:
           RUSTFLAGS: -Awarnings
 
       - name: (Linux) (ARMv7) Build
         if: matrix.config.target == 'armv7-unknown-linux-gnueabihf'
-        run: cargo build -p rsrpc-cli --release --locked --target ${{ matrix.config.target }} --config target.armv7-unknown-linux-gnueabihf.linker=\'arm-linux-gnueabihf-gcc\'
+        run: cargo build -p adsum-cli --release --locked --target ${{ matrix.config.target }} --config target.armv7-unknown-linux-gnueabihf.linker=\'arm-linux-gnueabihf-gcc\'
         env:
           RUSTFLAGS: -Awarnings -L/usr/lib/arm-linux-gnueabihf
           CC: arm-linux-gnueabihf-gcc
@@ -122,7 +122,7 @@ jobs:
 
       - name: (Linux) (ARM64) Build
         if: matrix.config.target == 'aarch64-unknown-linux-gnu'
-        run: cargo build -p rsrpc-cli --release --locked --target ${{ matrix.config.target }} --config target.aarch64-unknown-linux-gnu.linker=\'aarch64-linux-gnu-gcc\'
+        run: cargo build -p adsum-cli --release --locked --target ${{ matrix.config.target }} --config target.aarch64-unknown-linux-gnu.linker=\'aarch64-linux-gnu-gcc\'
         env:
           RUSTFLAGS: -Awarnings -L/usr/lib/aarch64-linux-gnu
           CC: aarch64-linux-gnu-gcc
@@ -132,9 +132,9 @@ jobs:
       - name: Upload binary
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: rsrpc-${{ matrix.config.target }}
+          name: adsum-${{ matrix.config.target }}
           # Find exec based on platform
-          path: target/${{ matrix.config.target }}/release/rsrpc-cli${{ matrix.config.platform == 'windows-latest' && '.exe' || '' }}
+          path: target/${{ matrix.config.target }}/release/adsum${{ matrix.config.platform == 'windows-latest' && '.exe' || '' }}
 
   release:
     needs: build
@@ -177,10 +177,10 @@ jobs:
           # the zip step above already removed the artifact dirs, so the
           # binaries are pulled back out of their zips. The unit file
           # rides the same manifest so install.sh verifies it identically.
-          unzip -p rsrpc-x86_64-unknown-linux-gnu.zip rsrpc-cli > ./rsrpc-cli-x86_64-unknown-linux-gnu
-          unzip -p rsrpc-aarch64-unknown-linux-gnu.zip rsrpc-cli > ./rsrpc-cli-aarch64-unknown-linux-gnu
-          chmod +x rsrpc-cli-x86_64-unknown-linux-gnu rsrpc-cli-aarch64-unknown-linux-gnu
-          sha256sum rsrpc-cli-x86_64-unknown-linux-gnu rsrpc-cli-aarch64-unknown-linux-gnu rsrpc*.zip systemd/rsrpc.service > SHA256SUMS.txt
+          unzip -p adsum-x86_64-unknown-linux-gnu.zip adsum > ./adsum-x86_64-unknown-linux-gnu
+          unzip -p adsum-aarch64-unknown-linux-gnu.zip adsum > ./adsum-aarch64-unknown-linux-gnu
+          chmod +x adsum-x86_64-unknown-linux-gnu adsum-aarch64-unknown-linux-gnu
+          sha256sum adsum-x86_64-unknown-linux-gnu adsum-aarch64-unknown-linux-gnu adsum*.zip systemd/adsum.service > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Sign OTA manifest
@@ -201,7 +201,7 @@ jobs:
           MS=/tmp/minisign/minisign-linux/x86_64/minisign
           printf '%s' "$MINISIGN_SECRET_KEY" > /tmp/ota.sec
           chmod 600 /tmp/ota.sec
-          "$MS" -S -s /tmp/ota.sec -m SHA256SUMS.txt -t "rsrpc release ${{ github.ref_name }}"
+          "$MS" -S -s /tmp/ota.sec -m SHA256SUMS.txt -t "adsum release ${{ github.ref_name }}"
           shred -u /tmp/ota.sec || rm -f /tmp/ota.sec
           # Self-check with the embedded pubkey before publishing.
           "$MS" -V -P RWT97nYjybg6X/Q35LBD/thrjkAmYmEHbRm8TQjvpJeLO2kNONgb4ibw -m SHA256SUMS.txt
@@ -227,10 +227,10 @@ jobs:
         if: github.event_name != 'schedule'
         with:
           files: |
-            rsrpc*.zip
-            rsrpc-cli-x86_64-unknown-linux-gnu
-            rsrpc-cli-aarch64-unknown-linux-gnu
-            systemd/rsrpc.service
+            adsum*.zip
+            adsum-x86_64-unknown-linux-gnu
+            adsum-aarch64-unknown-linux-gnu
+            systemd/adsum.service
             SHA256SUMS.txt
             SHA256SUMS.txt.minisig
           token: ${{ secrets.GITHUB_TOKEN }}

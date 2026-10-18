@@ -1,16 +1,16 @@
-# rsRPC
+# Adsum
 
-[![Latest release](https://img.shields.io/github/v/release/yiesko/discord-rich-presence)](https://github.com/yiesko/discord-rich-presence/releases/latest)
-[![Build](https://img.shields.io/github/actions/workflow/status/yiesko/discord-rich-presence/build.yml?branch=main&label=build)](https://github.com/yiesko/discord-rich-presence/actions/workflows/build.yml)
-[![Code quality](https://img.shields.io/github/actions/workflow/status/yiesko/discord-rich-presence/code_quality.yml?branch=main&label=quality)](https://github.com/yiesko/discord-rich-presence/actions/workflows/code_quality.yml)
-[![License: MIT](https://img.shields.io/github/license/yiesko/discord-rich-presence)](LICENSE)
+[![Latest release](https://img.shields.io/github/v/release/yiesko/adsum)](https://github.com/yiesko/adsum/releases/latest)
+[![Build](https://img.shields.io/github/actions/workflow/status/yiesko/adsum/build.yml?branch=main&label=build)](https://github.com/yiesko/adsum/actions/workflows/build.yml)
+[![Code quality](https://img.shields.io/github/actions/workflow/status/yiesko/adsum/code_quality.yml?branch=main&label=quality)](https://github.com/yiesko/adsum/actions/workflows/code_quality.yml)
+[![License: MIT](https://img.shields.io/github/license/yiesko/adsum)](LICENSE)
 
 **A standalone Discord Rich Presence server, CLI, and Rust library.**
 
-rsRPC implements Discord-compatible local RPC endpoints for supported alternative clients. It detects running games, accepts activity from games and companion apps, and forwards presence to clients through a local WebSocket bridge. It continues the work of the original [SpikeHD/rsRPC](https://github.com/SpikeHD/rsRPC) project and is inspired by [OpenAsar/arRPC](https://github.com/OpenAsar/arRPC).
+Adsum implements Discord-compatible local RPC endpoints for supported alternative clients. It detects running games, accepts activity from games and companion apps, and forwards presence to clients through a local WebSocket bridge. It continues the work of the original [SpikeHD/rsRPC](https://github.com/SpikeHD/rsRPC) project and is inspired by [OpenAsar/arRPC](https://github.com/OpenAsar/arRPC).
 
 > [!IMPORTANT]
-> **rsRPC does not replace or work alongside the official Discord desktop client's RPC implementation.** Use it with a supported alternative client that can disable its bundled RPC server and consume rsRPC's bridge. The OAuth `AUTHORIZE` flow is not supported; see [Known limitations](#known-limitations).
+> **Adsum does not replace or work alongside the official Discord desktop client's RPC implementation.** Use it with a supported alternative client that can disable its bundled RPC server and consume Adsum's bridge. The OAuth `AUTHORIZE` flow is not supported; see [Known limitations](#known-limitations).
 
 ## Features
 
@@ -26,9 +26,9 @@ rsRPC implements Discord-compatible local RPC endpoints for supported alternativ
 
 ## Screenshots
 
-A game can report its own activity over IPC while a companion application reports a listening activity, and both can coexist through rsRPC:
+A game can report its own activity over IPC while a companion application reports a listening activity, and both can coexist through Adsum:
 
-![Roblox running through Sober alongside a Limusic listening activity through rsRPC](assets/rpc_sober_limusic.png)
+![Roblox running through Sober alongside a Limusic listening activity through Adsum](assets/rpc_sober_limusic.png)
 
 A closer look at the listening activity:
 
@@ -36,26 +36,26 @@ A closer look at the listening activity:
 
 ## Compatible Discord clients
 
-The following alternative clients have an RPC or bridge integration that rsRPC can work with:
+The following alternative clients have an RPC or bridge integration that Adsum can work with:
 
 - [Equibop](https://github.com/Equicord/Equibop)
 - [Vesktop](https://github.com/Vencord/Vesktop)
 - [Dorion](https://github.com/SpikeHD/Dorion)
 - [GoofCord](https://github.com/Milkshiift/GoofCord)
 
-If a client bundles its own RPC server, disable that server before running rsRPC. The client-side plugin or integration must consume rsRPC's bridge, which defaults to `ws://127.0.0.1:1337`. The exact configuration depends on the client.
+If a client bundles its own RPC server, disable that server before running Adsum. The client-side plugin or integration must consume Adsum's bridge, which defaults to `ws://127.0.0.1:1337`. The exact configuration depends on the client.
 
 ## Install (Linux + systemd)
 
 The installer requires [`minisign`](https://github.com/jedisct1/minisign) to verify release signatures. Review the [installer script](scripts/install.sh) before running it.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/yiesko/discord-rich-presence/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/yiesko/adsum/main/scripts/install.sh | bash
 ```
 
 The installer detects your architecture, downloads the latest release binary and systemd user unit, verifies both against the signed checksum manifest, then enables and starts the user service. Running it again updates the installation.
 
-For systems without systemd, download a binary from [Releases](https://github.com/yiesko/discord-rich-presence/releases) and run it directly. The bundled game database does not require a network connection.
+For systems without systemd, download a binary from [Releases](https://github.com/yiesko/adsum/releases) and run it directly. The bundled game database does not require a network connection.
 
 See [systemd installation and operations](docs/systemd-user-units.md) for install options, updates, and uninstall instructions.
 
@@ -64,14 +64,14 @@ See [systemd installation and operations](docs/systemd-user-units.md) for instal
 After installing, the systemd user service starts automatically. Use the installed binary for one-shot diagnostics; these commands do not start a second long-running server:
 
 ```bash
-~/.local/bin/rsrpc-cli --list-detected
-~/.local/bin/rsrpc-cli --list-database
+~/.local/bin/adsum --list-detected
+~/.local/bin/adsum --list-database
 ```
 
 Follow the running service's logs:
 
 ```bash
-journalctl --user -u rsrpc.service -f
+journalctl --user -u adsum.service -f
 ```
 
 `--list-detected` runs a single scan and exits. It applies the configured overrides and ignore list, so its output shows what the scanner would publish. For every CLI flag and environment variable, see [CLI options](docs/cli-options.md).
@@ -82,7 +82,7 @@ Linux is the primary platform for development and for real-world testing. CI run
 
 ## Known limitations
 
-- **No OAuth / `AUTHORIZE` flow.** rsRPC cannot complete authorization that requires the official Discord client and an application's private `client_secret`. Games that depend on this flow may need direct access to the official client; stop rsRPC while using them.
+- **No OAuth / `AUTHORIZE` flow.** Adsum cannot complete authorization that requires the official Discord client and an application's private `client_secret`. Games that depend on this flow may need direct access to the official client; stop Adsum while using them.
 - **Unreadable Linux command lines are skipped.** Detection reads `/proc/<pid>/cmdline`. If the kernel denies access — for example, for another user's process or under a restrictive `hidepid` mount — that process is skipped before game matching runs.
 - **Some database entries have no declared executables.** Those entries can be matched by Steam AppID alone, so a helper process that inherits such an ID can still cause a false positive. Tightening that fallback any further would also lose detections for games that provide no executable names.
 
@@ -94,27 +94,27 @@ Most options have both a CLI flag and an environment variable. These are the mai
 
 | Setting | Environment variable | Default | Purpose |
 |---|---|---|---|
-| JSON bridge port range | `RSRPC_BRIDGE_PORT` / `RSRPC_BRIDGE_PORT_END` | `1337`–`1347` | WebSocket JSON bridge |
-| MessagePack bridge port | `RSRPC_MSGPACK_PORT` | `1338` | WebSocket MessagePack bridge |
-| Scan interval | `RSRPC_SCAN_INTERVAL` | `5` seconds | Base process-scan cadence |
-| Database refresh | `RSRPC_ENABLE_DB_UPDATE` | Off | Refresh the game database hourly |
-| Ignored game IDs | `RSRPC_IGNORE_IDS` | None | Skip these IDs in process detection |
-| Background update staging | `RSRPC_AUTO_UPDATE` | Off | Stage verified updates in the background |
+| JSON bridge port range | `ADSUM_BRIDGE_PORT` / `ADSUM_BRIDGE_PORT_END` | `1337`–`1347` | WebSocket JSON bridge |
+| MessagePack bridge port | `ADSUM_MSGPACK_PORT` | `1338` | WebSocket MessagePack bridge |
+| Scan interval | `ADSUM_SCAN_INTERVAL` | `5` seconds | Base process-scan cadence |
+| Database refresh | `ADSUM_ENABLE_DB_UPDATE` | Off | Refresh the game database hourly |
+| Ignored game IDs | `ADSUM_IGNORE_IDS` | None | Skip these IDs in process detection |
+| Background update staging | `ADSUM_AUTO_UPDATE` | Off | Stage verified updates in the background |
 
-Logs go to stderr. `RUST_LOG` overrides the log level; when investigating detection, prefer a scoped filter such as `RUST_LOG=rsrpc_detect=debug` instead of enabling debug output for every component.
+Logs go to stderr. `RUST_LOG` overrides the log level; when investigating detection, prefer a scoped filter such as `RUST_LOG=adsum_detect=debug` instead of enabling debug output for every component.
 
-## Using rsRPC as a Rust library
+## Using Adsum as a Rust library
 
-`rsrpc-core` is currently consumed from a Git tag rather than crates.io:
+`adsum-core` is currently consumed from a Git tag rather than crates.io:
 
 ```toml
 [dependencies]
-rsrpc-core = { git = "https://github.com/yiesko/discord-rich-presence", tag = "v0.38.1" }
+adsum-core = { git = "https://github.com/yiesko/adsum", tag = "v0.38.1" }
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal"] }
 ```
 
 ```rust
-use rsrpc_core::{Daemon, RPCConfig};
+use adsum_core::{Daemon, RPCConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -135,9 +135,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 Requirements: [Rust and Cargo](https://www.rust-lang.org/) 1.95 or newer.
 
 ```bash
-git clone https://github.com/yiesko/discord-rich-presence
-cd discord-rich-presence
-cargo build --release -p rsrpc-cli
+git clone https://github.com/yiesko/adsum
+cd adsum
+cargo build --release -p adsum-cli
 cargo test --workspace --locked
 cargo test --benches --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -167,9 +167,9 @@ cargo run --manifest-path tools/updater/Cargo.toml
 
 The feature scope is frozen. Work focuses on fixing bugs, improving detection accuracy, security, performance, tests and documentation rather than adding new features. Feature requests outside that scope are unlikely to be accepted.
 
-Useful contributions include reproducible bug reports, false-positive and false-negative examples, regression tests, documentation fixes, and real-world validation on Windows and macOS. When reporting a detection issue, please include the operating system, the affected game's process path if you are comfortable sharing it, and the output of `rsrpc-cli --list-detected`.
+Useful contributions include reproducible bug reports, false-positive and false-negative examples, regression tests, documentation fixes, and real-world validation on Windows and macOS. When reporting a detection issue, please include the operating system, the affected game's process path if you are comfortable sharing it, and the output of `adsum --list-detected`.
 
-[Report a bug or detection issue](https://github.com/yiesko/discord-rich-presence/issues/new) · [Browse open issues](https://github.com/yiesko/discord-rich-presence/issues)
+[Report a bug or detection issue](https://github.com/yiesko/adsum/issues/new) · [Browse open issues](https://github.com/yiesko/adsum/issues)
 
 ## Credits
 
@@ -179,4 +179,4 @@ Useful contributions include reproducible bug reports, false-positive and false-
 
 ## License
 
-rsRPC is licensed under the [MIT License](LICENSE).
+Adsum is licensed under the [MIT License](LICENSE).

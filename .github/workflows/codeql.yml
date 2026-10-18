@@ -10,13 +10,13 @@ on:
     paths:
       - ".github/workflows/**"
       - "crates/**"
-      - "cli/**"
+      - "adsum-cli/**"
       - "Cargo.lock"
   pull_request:
     paths:
       - ".github/workflows/**"
       - "crates/**"
-      - "cli/**"
+      - "adsum-cli/**"
       - "Cargo.lock"
   schedule:
     # Weekly, independent of what landed: an untouched default branch still

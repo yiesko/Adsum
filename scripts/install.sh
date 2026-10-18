@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# rsRPC one-liner installer (Linux, systemd user service).
+# Adsum one-liner installer (Linux, systemd user service).
 #
-#   curl -fsSL https://raw.githubusercontent.com/yiesko/discord-rich-presence/main/scripts/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/yiesko/adsum/main/scripts/install.sh | bash
 #
 # What it does: detects the arch, downloads the matching release binary
 # (+ unit file) for the newest tag, verifies both against the
@@ -23,14 +23,14 @@
 #   -h, --help       usage
 set -euo pipefail
 
-REPO="yiesko/discord-rich-presence"
-APP="rsrpc-cli"
+REPO="yiesko/adsum"
+APP="adsum"
 # Release-signing pubkey (same key the binary itself embeds for OTA).
 PUBKEY="RWT97nYjybg6X/Q35LBD/thrjkAmYmEHbRm8TQjvpJeLO2kNONgb4ibw"
 
 BIN_DIR="${HOME}/.local/bin"
 UNIT_DIR="${HOME}/.config/systemd/user"
-UNIT_NAME="rsrpc.service"
+UNIT_NAME="adsum.service"
 DROPIN_DIR="${UNIT_DIR}/${UNIT_NAME}.d"
 
 YES=0 FORCE=0 NO_SYSTEMD=0 AUTO_UPDATE=0 BINARY="" UNIT="" TAG=""
@@ -44,7 +44,7 @@ usage() {
 Usage: install.sh [--yes] [--force] [--no-systemd] [--auto-update]
                   [--binary PATH] [--unit PATH] [--tag TAG] [-h|--help]
 
-Installs (or updates) the rsrpc-cli binary, systemd user unit, and
+Installs (or updates) the adsum binary, systemd user unit, and
 optionally enables the service + background update staging.
 EOF
   exit "${1:-0}"
@@ -205,7 +205,7 @@ if [ "$AUTO_UPDATE" -eq 0 ] && [ "$YES" -eq 0 ] && [ "$NO_SYSTEMD" -eq 0 ] && [ 
 fi
 if [ "$AUTO_UPDATE" -eq 1 ] && [ "$NO_SYSTEMD" -eq 0 ]; then
   mkdir -p "$DROPIN_DIR"
-  printf '[Service]\nEnvironment=RSRPC_AUTO_UPDATE=1\n' > "${DROPIN_DIR}/10-auto-update.conf"
+  printf '[Service]\nEnvironment=ADSUM_AUTO_UPDATE=1\n' > "${DROPIN_DIR}/10-auto-update.conf"
   log "auto-update staging enabled"
 fi
 

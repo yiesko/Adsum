@@ -5,7 +5,7 @@ on:
     paths:
       - '.github/workflows/code_quality.yml'
       - 'crates/**'
-      - 'cli/**'
+      - 'adsum-cli/**'
       - 'tools/**'
       - 'plugin/**'
       - 'scripts/**'
@@ -17,7 +17,7 @@ on:
     paths:
       - '.github/workflows/code_quality.yml'
       - 'crates/**'
-      - 'cli/**'
+      - 'adsum-cli/**'
       - 'tools/**'
       - 'plugin/**'
       - 'scripts/**'
@@ -185,16 +185,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
 
       - name: Plugin syntax
-        run: node --check plugin/rsrpc.js
+        run: node --check plugin/adsum.js
 
       - name: Systemd unit
         run: |
           # verify only checks the ExecStart path exists and is
           # executable; the runner has no installed binary, so stub it.
           mkdir -p ~/.local/bin
-          touch ~/.local/bin/rsrpc-cli
-          chmod +x ~/.local/bin/rsrpc-cli
-          systemd-analyze verify ./systemd/rsrpc.service
+          touch ~/.local/bin/adsum
+          chmod +x ~/.local/bin/adsum
+          systemd-analyze verify ./systemd/adsum.service
 
       - name: Fuzz workspace check
         run: cargo check --manifest-path fuzz/Cargo.toml --all-targets --locked

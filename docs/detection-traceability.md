@@ -11,7 +11,7 @@ Lifecycle lines (detection, publish, takeover, clear, resume) are
 (`RUST_LOG=debug`). Logs go to stderr — the journal under systemd:
 
 ```bash
-journalctl --user -u rsrpc.service --since "10 minutes ago" | grep -E "Detected|Published|Yielding|Clearing|cleared|took over|now owns|Reaping|went away without CLEAR"
+journalctl --user -u adsum.service --since "10 minutes ago" | grep -E "Detected|Published|Yielding|Clearing|cleared|took over|now owns|Reaping|went away without CLEAR"
 ```
 
 ## Detection: source and latency
@@ -50,9 +50,9 @@ question, and its answer is at `DEBUG`, not `INFO`. Turn it on scoped to the
 scanner — it is the noisy component:
 
 ```bash
-systemctl --user edit rsrpc.service   # [Service]
-# Environment=RUST_LOG=rsrpc_detect=debug
-systemctl --user daemon-reload && systemctl --user restart rsrpc
+systemctl --user edit adsum.service   # [Service]
+# Environment=RUST_LOG=adsum_detect=debug
+systemctl --user daemon-reload && systemctl --user restart adsum
 ```
 
 Then watch for the reason a candidate was dropped:
@@ -75,7 +75,7 @@ empty — which is a genuinely undetected process, not a silenced one.
 Turning the level back off:
 
 ```bash
-systemctl --user revert rsrpc.service && systemctl --user restart rsrpc
+systemctl --user revert adsum.service && systemctl --user restart adsum
 ```
 
 Unreadable command lines are a different matter entirely: a process whose
