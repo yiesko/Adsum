@@ -54,6 +54,7 @@ impl ActivityCmd {
       .args
       .as_mut()
       .and_then(|args| args.activity.as_mut())
+      .and_then(|activity| activity.as_mut())
       .and_then(|activity| activity.timestamps.as_mut())
     {
       let cur = std::time::SystemTime::now()
@@ -76,7 +77,11 @@ impl ActivityCmd {
 
   pub fn fix_buttons(&mut self) {
     // If `buttons` are an array of objects, we need to map the labels to `buttons` (as a string array) and the urls to `metadata.button_urls` (as an array of strings)
-    if let Some(activity) = self.args.as_mut().and_then(|args| args.activity.as_mut())
+    if let Some(activity) = self
+      .args
+      .as_mut()
+      .and_then(|args| args.activity.as_mut())
+      .and_then(|activity| activity.as_mut())
       && let Some(buttons) = activity.buttons.take()
     {
       let mut button_urls: Vec<String> = Vec::with_capacity(buttons.len());
@@ -111,7 +116,11 @@ impl ActivityCmd {
   }
 
   pub fn fix_flags(&mut self) {
-    if let Some(activity) = self.args.as_mut().and_then(|args| args.activity.as_mut())
+    if let Some(activity) = self
+      .args
+      .as_mut()
+      .and_then(|args| args.activity.as_mut())
+      .and_then(|activity| activity.as_mut())
       && activity.instance.unwrap_or(false)
       && activity.flags.is_none()
     {
@@ -124,7 +133,10 @@ impl ActivityCmd {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct ActivityCmdArgs {
   pub pid: Option<u64>,
-  pub activity: Option<Activity>,
+  /// Outer `None` = field absent (malformed for `SET_ACTIVITY`),
+  /// `Some(None)` = explicit `activity: null` clear, `Some(Some(_))` = publish.
+  #[serde(default, with = "serde_with::rust::double_option")]
+  pub activity: Option<Option<Activity>>,
   // For INVITE_BROWSER / GUILD_TEMPLATE_BROWSER / GIFT_CODE_BROWSER
   pub code: Option<String>,
   // For GET_USER

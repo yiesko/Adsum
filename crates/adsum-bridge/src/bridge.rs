@@ -539,15 +539,27 @@ async fn command_pump(
       biased;
       () = token.cancelled() => break,
       cmd = rx.recv() => {
-        let Some(cmd) = cmd else { break };
+        let Some(mut cmd) = cmd else { break };
         if cmd.cmd != "SET_ACTIVITY" {
-          // Non-activity events (INVITE_BROWSER, ...) fan out as-is.
+          // Non-activity events (INVITE_BROWSER, ...) fan out as-is, in the
+          // legacy shape: an explicit `activity: null` is not re-emitted.
+          strip_explicit_null_activity(&mut cmd);
           shared.broadcast_raw(&cmd);
           continue;
         }
         shared.handle_set_activity(cmd).await;
       }
     }
+  }
+}
+
+/// Drop an explicit `activity: null` from a non-activity command, restoring
+/// the legacy fan-out shape that omitted the key entirely.
+fn strip_explicit_null_activity(cmd: &mut ActivityCmd) {
+  if let Some(args) = cmd.args.as_mut()
+    && matches!(args.activity, Some(None))
+  {
+    args.activity = None;
   }
 }
 
@@ -1020,6 +1032,34 @@ pub(crate) mod tests {
     assert!(
       len <= crate::config::MAX_CACHED_ACTIVITIES,
       "cache must stay bounded, got {len}"
+    );
+  }
+
+  /// Non-`SET_ACTIVITY` fan-out keeps the legacy shape: an explicit null
+  /// activity is dropped, and a real activity is left untouched.
+  #[test]
+  fn raw_fanout_drops_an_explicit_null_activity() {
+    let mut cmd: ActivityCmd = serde_json::from_str(
+      r#"{"cmd":"INVITE_BROWSER","args":{"pid":3,"activity":null,"code":"abc"},"nonce":"n"}"#,
+    )
+    .expect("test command builds");
+    strip_explicit_null_activity(&mut cmd);
+    let args = cmd.args.as_ref().expect("args stay");
+    assert!(args.activity.is_none(), "an explicit null must be dropped");
+    assert_eq!(args.code.as_deref(), Some("abc"));
+
+    let mut publish: ActivityCmd = serde_json::from_str(
+      r#"{"cmd":"INVITE_BROWSER","args":{"pid":3,"activity":{"name":"G","type":0}},"nonce":"n"}"#,
+    )
+    .expect("test command builds");
+    strip_explicit_null_activity(&mut publish);
+    assert!(
+      publish
+        .args
+        .as_ref()
+        .and_then(|args| args.activity.as_ref())
+        .is_some_and(|activity| activity.is_some()),
+      "a real activity must survive"
     );
   }
 

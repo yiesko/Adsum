@@ -25,6 +25,8 @@ fn hostile_timestamps_saturate_instead_of_overflowing() {
     .activity
     .as_ref()
     .unwrap()
+    .as_ref()
+    .unwrap()
     .timestamps
     .as_ref()
     .unwrap();
@@ -69,6 +71,7 @@ fn fix_buttons_preserves_existing_metadata() {
     .args
     .as_ref()
     .and_then(|a| a.activity.as_ref())
+    .and_then(|a| a.as_ref())
     .expect("activity");
   let metadata = activity.metadata.as_ref().expect("metadata");
   // The derived field...
@@ -103,6 +106,7 @@ fn fix_buttons_without_urls_leaves_metadata_absent() {
     .args
     .as_ref()
     .and_then(|a| a.activity.as_ref())
+    .and_then(|a| a.as_ref())
     .expect("activity");
   assert!(
     activity.metadata.is_none(),
@@ -140,6 +144,7 @@ fn fix_buttons_mixes_shapes_and_ignores_non_string_urls() {
     .args
     .as_ref()
     .and_then(|a| a.activity.as_ref())
+    .and_then(|a| a.as_ref())
     .expect("activity");
   let labels = activity.buttons.as_ref().expect("buttons");
   assert_eq!(labels.len(), 4, "every label kept: {labels:?}");
@@ -178,7 +183,15 @@ fn application_ids_keep_their_wire_bytes() {
   // Outer id: present, as a plain JSON string.
   assert_eq!(cmd.application_id.as_deref(), Some("12345"));
   // Inner (activity) id likewise.
-  let activity = cmd.args.as_ref().unwrap().activity.as_ref().unwrap();
+  let activity = cmd
+    .args
+    .as_ref()
+    .unwrap()
+    .activity
+    .as_ref()
+    .unwrap()
+    .as_ref()
+    .unwrap();
   assert_eq!(activity.application_id.as_deref(), Some("67890"));
 
   // Byte-exact round trip: a missing id stays omitted, not `null`.
@@ -195,6 +208,8 @@ fn application_ids_keep_their_wire_bytes() {
       .as_ref()
       .unwrap()
       .activity
+      .as_ref()
+      .unwrap()
       .as_ref()
       .unwrap()
       .application_id
@@ -241,6 +256,8 @@ fn command_clones_share_the_application_id() {
     .activity
     .as_ref()
     .unwrap()
+    .as_ref()
+    .unwrap()
     .application_id
     .as_ref()
     .unwrap()
@@ -261,6 +278,8 @@ fn command_clones_share_the_application_id() {
         .activity
         .as_ref()
         .unwrap()
+        .as_ref()
+        .unwrap()
         .application_id
         .as_ref()
         .unwrap()
@@ -269,4 +288,66 @@ fn command_clones_share_the_application_id() {
     ),
     "cloning a command must share the activity's application id too"
   );
+}
+
+/// The `activity` field distinguishes absent (malformed), `null` (clear) and
+/// an object (publish), and each shape serializes back unchanged.
+#[test]
+fn activity_field_presence_round_trips() {
+  let absent: ActivityCmd = serde_json::from_value(serde_json::json!({
+    "cmd": "SET_ACTIVITY",
+    "args": {"pid": 7},
+    "nonce": "n",
+  }))
+  .expect("fixture parses");
+  assert!(absent.args.as_ref().expect("args").activity.is_none());
+  let absent_json = serde_json::to_string(&absent).expect("serializable");
+  assert!(
+    !absent_json.contains("\"activity\""),
+    "an absent field must stay omitted: {absent_json}"
+  );
+
+  let clear: ActivityCmd = serde_json::from_value(serde_json::json!({
+    "cmd": "SET_ACTIVITY",
+    "args": {"pid": 7, "activity": null},
+    "nonce": "n",
+  }))
+  .expect("fixture parses");
+  assert!(matches!(
+    clear.args.as_ref().expect("args").activity,
+    Some(None)
+  ));
+  let clear_json = serde_json::to_string(&clear).expect("serializable");
+  assert!(
+    clear_json.contains("\"activity\":null"),
+    "an explicit null must stay on the wire: {clear_json}"
+  );
+  let clear_back: ActivityCmd = serde_json::from_str(&clear_json).expect("round-trips");
+  assert!(matches!(
+    clear_back.args.as_ref().expect("args").activity,
+    Some(None)
+  ));
+
+  let published: ActivityCmd = serde_json::from_value(serde_json::json!({
+    "cmd": "SET_ACTIVITY",
+    "args": {"pid": 7, "activity": {"name": "G", "type": 0}},
+    "nonce": "n",
+  }))
+  .expect("fixture parses");
+  assert!(matches!(
+    published.args.as_ref().expect("args").activity,
+    Some(Some(_))
+  ));
+  let published_json = serde_json::to_string(&published).expect("serializable");
+  let published_body: serde_json::Value =
+    serde_json::from_str(&published_json).expect("valid json");
+  assert_eq!(
+    published_body["args"]["activity"]["name"], "G",
+    "an object must stay an object: {published_json}"
+  );
+  let published_back: ActivityCmd = serde_json::from_str(&published_json).expect("round-trips");
+  assert!(matches!(
+    published_back.args.as_ref().expect("args").activity,
+    Some(Some(_))
+  ));
 }

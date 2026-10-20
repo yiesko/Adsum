@@ -39,17 +39,14 @@ pub(crate) fn channel_depth<T>(tx: Option<&mpsc::Sender<T>>) -> usize {
     .unwrap_or(0)
 }
 
-/// Whether a command is a genuine clear from a real connection (null
-/// activity + nonzero pid). Messages that never identified a game (pid 0)
-/// are not clears.
+/// Whether a command is a genuine clear from a real connection (explicit
+/// `activity: null` + nonzero pid). A command that omits the field, or never
+/// identified a game (pid 0), is not a clear.
 pub(crate) fn is_genuine_clear(cmd: &ActivityCmd) -> bool {
-  match cmd.args.as_ref().and_then(|args| args.pid) {
-    Some(pid) if pid != 0 => cmd
-      .args
-      .as_ref()
-      .is_some_and(|args| args.activity.is_none()),
-    _ => false,
-  }
+  let Some(args) = cmd.args.as_ref() else {
+    return false;
+  };
+  args.pid.is_some_and(|pid| pid != 0) && matches!(args.activity, Some(None))
 }
 
 /// Build the generic process-detection payload for a scanned game.
@@ -144,6 +141,7 @@ impl Shared {
     let pid = args.and_then(|args| args.pid).unwrap_or_default();
     if let Some(app) = args
       .and_then(|args| args.activity.as_ref())
+      .and_then(|activity| activity.as_ref())
       .and_then(|activity| activity.application_id.clone())
     {
       let (previous, generic) = {
@@ -254,6 +252,17 @@ impl Shared {
   /// Handle one `SET_ACTIVITY` command: fingerprint, flood-guard,
   /// handoff, change detection, clear resume, envelope build, fan-out.
   pub(crate) async fn handle_set_activity(&self, mut cmd: ActivityCmd) {
+    // Defensive: IPC rejects an absent `args` before this path; WS forwards
+    // one for the bridge to drop here. Both reject an absent `activity`
+    // field (WS only while `SET_ACTIVITY` is enabled). Neither is a clear.
+    let Some(args) = cmd.args.as_ref() else {
+      tracing::warn!("[bridge] Invalid activity command, skipping");
+      return;
+    };
+    if args.activity.is_none() {
+      tracing::warn!("[bridge] Missing activity field, skipping");
+      return;
+    }
     // Fingerprint first (runs `fix()`): flood-dropped publishes return
     // before the envelope (JSON + MessagePack) is ever built.
     let fingerprint = commands::activity_fingerprint(&mut cmd);
@@ -267,17 +276,15 @@ impl Shared {
       tracing::debug!("[bridge] Dropping duplicate SET_ACTIVITY (app {app_key}, pid {pid})");
       return;
     }
-    // Reject early, exactly where the payload build used to reject it: the
-    // side effects below run for anything the build would have accepted.
-    if cmd.args.is_none() {
-      tracing::warn!("[bridge] Invalid activity command, skipping");
-      return;
-    }
     // An `AppId` clone is a refcount bump, not a byte copy, so this is
     // cheap — and it keeps `app_key` alive for the log at the bottom
     // without borrowing `cmd` past the move below.
     let app_key = cmd.application_id.as_deref().unwrap_or("");
-    let activity = cmd.args.as_ref().and_then(|args| args.activity.as_ref());
+    let activity = cmd
+      .args
+      .as_ref()
+      .and_then(|args| args.activity.as_ref())
+      .and_then(|activity| activity.as_ref());
     // One socket id per publish, shared by the change check below and the
     // fan-out: the decimal used to be rendered twice, each time through a
     // heap-allocated `String`.
@@ -557,6 +564,84 @@ mod tests {
     );
   }
 
+  /// Only an explicit `activity: null` with a nonzero pid is a genuine
+  /// clear; an omitted field is malformed input, not a clear.
+  #[test]
+  fn genuine_clear_requires_an_explicit_null_activity() {
+    let clear: ActivityCmd = serde_json::from_str(
+      r#"{"cmd":"SET_ACTIVITY","args":{"pid":1,"activity":null},"nonce":"n"}"#,
+    )
+    .expect("parses");
+    assert!(is_genuine_clear(&clear));
+
+    let missing: ActivityCmd =
+      serde_json::from_str(r#"{"cmd":"SET_ACTIVITY","args":{"pid":1},"nonce":"n"}"#)
+        .expect("parses");
+    assert!(!is_genuine_clear(&missing));
+
+    let zero: ActivityCmd = serde_json::from_str(
+      r#"{"cmd":"SET_ACTIVITY","args":{"pid":0,"activity":null},"nonce":"n"}"#,
+    )
+    .expect("parses");
+    assert!(!is_genuine_clear(&zero));
+  }
+
+  /// A `SET_ACTIVITY` that omits the `activity` field is ignored: it neither
+  /// publishes nor clears the cached card.
+  #[tokio::test]
+  async fn missing_activity_field_neither_publishes_nor_clears() {
+    let shared = crate::bridge::shared_for_test();
+    let publish: ActivityCmd = serde_json::from_str(
+      r#"{"cmd":"SET_ACTIVITY","application_id":"app-1","args":{"pid":1,
+            "activity":{"name":"G","type":0}},"nonce":"n1"}"#,
+    )
+    .expect("parses");
+    shared.handle_set_activity(publish).await;
+    let before = seq_of(&shared, 1);
+    assert!(before >= 1, "the publish must be cached");
+
+    let missing: ActivityCmd = serde_json::from_str(
+      r#"{"cmd":"SET_ACTIVITY","application_id":"app-1","args":{"pid":1},"nonce":"n2"}"#,
+    )
+    .expect("parses");
+    shared.handle_set_activity(missing).await;
+    assert_eq!(
+      seq_of(&shared, 1),
+      before,
+      "a missing activity field must not clear the cached card"
+    );
+  }
+
+  /// A `SET_ACTIVITY` that omits `args` entirely is dropped by the bridge:
+  /// it neither publishes nor clears the cached card.
+  #[tokio::test]
+  async fn absent_args_neither_publishes_nor_clears() {
+    let shared = crate::bridge::shared_for_test();
+    let publish: ActivityCmd = serde_json::from_str(
+      r#"{"cmd":"SET_ACTIVITY","application_id":"app-1","args":{"pid":1,
+            "activity":{"name":"G","type":0}},"nonce":"n1"}"#,
+    )
+    .expect("parses");
+    shared.handle_set_activity(publish).await;
+    let before = seq_of(&shared, 1);
+    assert!(before >= 1, "the publish must be cached");
+
+    let absent: ActivityCmd =
+      serde_json::from_str(r#"{"cmd":"SET_ACTIVITY","application_id":"app-1","nonce":"n2"}"#)
+        .expect("parses");
+    shared.handle_set_activity(absent).await;
+    assert_eq!(
+      seq_of(&shared, 1),
+      before,
+      "absent args must not change the cached card"
+    );
+    assert_eq!(
+      shared.cache.lock().unwrap_or_else(|e| e.into_inner()).len(),
+      1,
+      "the publish must stay cached"
+    );
+  }
+
   /// A clear evicts rather than stamps, and a republish after it gets a
   /// later sequence than the pre-clear one.
   #[tokio::test]
@@ -577,7 +662,7 @@ mod tests {
       evt: None,
       args: Some(adsum_types::cmd::ActivityCmdArgs {
         pid: Some(1),
-        activity: None,
+        activity: Some(None),
         code: None,
         user_id: None,
       }),

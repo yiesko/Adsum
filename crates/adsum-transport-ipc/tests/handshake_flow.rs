@@ -151,8 +151,7 @@ fn handshake_set_activity_close_flow() {
     clear
       .args
       .as_ref()
-      .and_then(|a| a.activity.as_ref())
-      .is_none()
+      .is_some_and(|a| matches!(a.activity, Some(None)))
   );
 
   server.join().expect("server thread");
@@ -206,6 +205,7 @@ fn set_activity_forwards_the_fixed_shape() {
     .args
     .as_ref()
     .and_then(|a| a.activity.as_ref())
+    .and_then(|a| a.as_ref())
     .and_then(|act| act.metadata.as_ref())
     .and_then(|m| m.button_urls.as_ref())
     .expect("forwarded command carries the fixed button_urls");
@@ -225,8 +225,7 @@ fn set_activity_forwards_the_fixed_shape() {
     clear
       .args
       .as_ref()
-      .and_then(|a| a.activity.as_ref())
-      .is_none()
+      .is_some_and(|a| matches!(a.activity, Some(None)))
   );
 
   server.join().expect("server thread");
@@ -285,8 +284,7 @@ fn invalid_utf8_body_clears_published_pid() {
     clear
       .args
       .as_ref()
-      .and_then(|a| a.activity.as_ref())
-      .is_none(),
+      .is_some_and(|a| matches!(a.activity, Some(None))),
     "expected null-activity clear, got: {clear:?}"
   );
 
@@ -383,6 +381,85 @@ fn malformed_activity_disturbs_no_presence() {
   server.join().expect("server thread");
 }
 
+/// A `SET_ACTIVITY` with `args` but no `activity` field is malformed, not a
+/// clear: it gets the official 4005 and never enters tracking, so only the
+/// later valid pid is cleared on disconnect.
+#[test]
+fn set_activity_without_activity_field_is_rejected() {
+  // Distinct from the valid pid below: a clear for it would prove that the
+  // malformed command entered the tracking history.
+  const SENTINEL_PID: u64 = 991;
+  let (mut client, mut rx, server) = spawn_server();
+  write_frame(
+    &mut client,
+    PacketType::Handshake,
+    r#"{"v":1,"client_id":"test-app"}"#,
+  );
+  let (_, body) = read_frame(&mut client);
+  assert!(body.contains("READY"), "expected READY, got: {body}");
+
+  write_frame(
+    &mut client,
+    PacketType::Frame,
+    &format!(r#"{{"cmd":"SET_ACTIVITY","args":{{"pid":{SENTINEL_PID}}},"nonce":"n-missing"}}"#),
+  );
+  let (_, reply) = read_frame(&mut client);
+  assert!(
+    reply.contains("\"code\":4005"),
+    "expected 4005, got: {reply}"
+  );
+  assert!(
+    reply.contains("Missing activity field"),
+    "expected message, got: {reply}"
+  );
+  assert!(
+    reply.contains("\"nonce\":\"n-missing\""),
+    "nonce must echo, got: {reply}"
+  );
+
+  // Nothing downstream: the malformed command must not clear any pid.
+  let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+  while std::time::Instant::now() < deadline {
+    assert!(
+      rx.try_recv().is_err(),
+      "missing activity field must not disturb presence"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(10));
+  }
+
+  // Connection alive: a valid publish forwards, and its disconnect clear
+  // carries the explicit null activity.
+  publish_pid(&mut client, &mut rx, 7);
+  drop(client);
+
+  // Collect every clear the disconnect ships: only the valid pid may ever
+  // be cleared, so the sentinel proves it never entered tracking.
+  let mut cleared = vec![recv_clear_pid(&mut rx)];
+  let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+  while std::time::Instant::now() < deadline {
+    if let Ok(cmd) = rx.try_recv() {
+      assert!(
+        cmd
+          .args
+          .as_ref()
+          .is_some_and(|a| matches!(a.activity, Some(None))),
+        "expected clear, got: {cmd:?}"
+      );
+      cleared.push(
+        cmd
+          .args
+          .as_ref()
+          .and_then(|a| a.pid)
+          .expect("clear carries pid"),
+      );
+    }
+    std::thread::sleep(std::time::Duration::from_millis(10));
+  }
+  assert_eq!(cleared, vec![7], "only the valid pid may receive a clear");
+
+  server.join().expect("server thread");
+}
+
 /// Oversize frames close with 1003 and still clear the presence.
 #[test]
 fn oversize_frame_close_still_clears_presence() {
@@ -406,8 +483,7 @@ fn oversize_frame_close_still_clears_presence() {
     clear
       .args
       .as_ref()
-      .and_then(|a| a.activity.as_ref())
-      .is_none()
+      .is_some_and(|a| matches!(a.activity, Some(None)))
   );
 
   server.join().expect("server thread");
@@ -434,8 +510,7 @@ fn unknown_packet_type_close_still_clears_presence() {
     clear
       .args
       .as_ref()
-      .and_then(|a| a.activity.as_ref())
-      .is_none()
+      .is_some_and(|a| matches!(a.activity, Some(None)))
   );
 
   server.join().expect("server thread");
@@ -468,8 +543,7 @@ fn recv_clear_pid(rx: &mut tokio::sync::mpsc::Receiver<ActivityCmd>) -> u64 {
     cmd
       .args
       .as_ref()
-      .and_then(|a| a.activity.as_ref())
-      .is_none(),
+      .is_some_and(|a| matches!(a.activity, Some(None))),
     "expected clear"
   );
   cmd
@@ -644,8 +718,7 @@ fn clean_close_clear_survives_a_full_sink() {
     clear
       .args
       .as_ref()
-      .and_then(|a| a.activity.as_ref())
-      .is_none(),
+      .is_some_and(|a| matches!(a.activity, Some(None))),
     "expected null-activity clear"
   );
 
@@ -708,8 +781,7 @@ fn close_echo_carries_the_clients_own_nonce() {
       if cmd
         .args
         .as_ref()
-        .and_then(|a| a.activity.as_ref())
-        .is_none()
+        .is_some_and(|a| matches!(a.activity, Some(None)))
       {
         break cmd;
       }
@@ -851,8 +923,7 @@ fn set_activity_clear_with_valid_pid_forwards() {
     cmd
       .args
       .as_ref()
-      .and_then(|a| a.activity.as_ref())
-      .is_none()
+      .is_some_and(|a| matches!(a.activity, Some(None)))
   );
 
   drop(client);

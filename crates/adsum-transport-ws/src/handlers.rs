@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use adsum_protocol::commands;
 use adsum_types::AppId;
-use adsum_types::cmd::{ActivityCmd, ActivityCmdArgs};
+use adsum_types::cmd::{Activity, ActivityCmd, ActivityCmdArgs};
 use adsum_types::user::RpcUser;
 use adsum_ws::{Message, Responder};
 use serde::Serialize;
@@ -62,22 +62,38 @@ struct BrowserEcho<'a> {
   /// The command's args, nested under `data` exactly where the wire
   /// contract puts them (`args`/`evt` stay absent). Written through the
   /// struct serializer: no intermediate map, no re-serialization.
-  #[serde(
-    serialize_with = "serialize_args_as_data",
-    skip_serializing_if = "Option::is_none"
-  )]
-  data: Option<&'a ActivityCmdArgs>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  data: Option<BrowserEchoArgs<'a>>,
   nonce: &'a Value,
 }
 
-/// Serialize args into the `data` value, borrowing the struct.
-fn serialize_args_as_data<S: serde::Serializer>(
-  args: &Option<&ActivityCmdArgs>,
-  serializer: S,
-) -> Result<S::Ok, S::Error> {
-  match args {
-    Some(args) => args.serialize(serializer),
-    None => serializer.serialize_none(),
+/// Borrowed args echoed under `data`, in their legacy shape: an explicit
+/// `activity: null` is omitted (as when an absent field skipped the key),
+/// while a real activity still serializes as the object.
+#[derive(Serialize)]
+struct BrowserEchoArgs<'a> {
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pid: Option<u64>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  activity: Option<&'a Activity>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  code: Option<&'a str>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  user_id: Option<&'a str>,
+}
+
+impl<'a> BrowserEchoArgs<'a> {
+  /// Borrow the command args for the echo, dropping an explicit null.
+  fn borrow(args: &'a ActivityCmdArgs) -> Self {
+    Self {
+      pid: args.pid,
+      activity: args
+        .activity
+        .as_ref()
+        .and_then(|activity| activity.as_ref()),
+      code: args.code.as_deref(),
+      user_id: args.user_id.as_deref(),
+    }
   }
 }
 
@@ -86,7 +102,7 @@ impl<'a> BrowserEcho<'a> {
     Self {
       application_id: event.application_id.as_ref(),
       cmd: &event.cmd,
-      data: event.args.as_ref(),
+      data: event.args.as_ref().map(BrowserEchoArgs::borrow),
       nonce: &event.nonce,
     }
   }
@@ -202,6 +218,18 @@ pub(crate) async fn handle_unknown(cmd: &str, event: &ActivityCmd, responder: &R
   .await
 }
 
+/// Refuse a `SET_ACTIVITY` that carries `args` but omits the `activity`
+/// field: omission is malformed input, not a clear (only `null` clears).
+pub(crate) async fn handle_missing_activity(event: &ActivityCmd, responder: &Responder) -> bool {
+  reply(
+    responder,
+    Message::Text(
+      commands::rpc_error(&event.cmd, &event.nonce, 4005, "Missing activity field").into(),
+    ),
+  )
+  .await
+}
+
 /// How a `SET_ACTIVITY` command reaches the sink.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Forward {
@@ -301,7 +329,7 @@ pub(crate) fn clear_for_slot(published: &PublishedSlot) -> ActivityCmd {
       // pid 0 is never a genuine clear, so it is safely ignored
       // downstream — same convention as the old whole-command clear.
       pid: Some(published.pid),
-      activity: None,
+      activity: Some(None),
       code: None,
       user_id: None,
     }),
@@ -373,7 +401,7 @@ mod tests {
 
   /// Args with `None` fields omit those keys, exactly as the old
   /// `HashMap`-from-`to_value` shape did — the map dropped absent keys,
-  /// and so does `skip_serializing_none` on the args struct.
+  /// and so does the borrowed echo struct.
   #[test]
   fn a_browser_echo_omits_absent_arg_keys() {
     let event = ActivityCmd {
@@ -399,6 +427,37 @@ mod tests {
     assert!(!data.contains_key("pid"), "an absent key stays absent");
     assert!(!data.contains_key("activity"), "an absent key stays absent");
     assert!(!data.contains_key("user_id"), "an absent key stays absent");
+  }
+
+  /// A browser echo keeps the legacy `activity` shape: an explicit null is
+  /// omitted from `data`, while a real activity still travels as an object.
+  #[test]
+  fn a_browser_echo_keeps_the_legacy_activity_shape() {
+    let with_null: ActivityCmd = serde_json::from_str(
+      r#"{"cmd":"INVITE_BROWSER","args":{"pid":3,"activity":null,"code":"abc"},"nonce":"n5"}"#,
+    )
+    .expect("the command parses");
+    let body: Value =
+      serde_json::from_str(&serde_json::to_string(&BrowserEcho::borrow(&with_null)).unwrap())
+        .expect("the echo is JSON");
+    let data = body["data"].as_object().expect("data is an object");
+    assert!(
+      !data.contains_key("activity"),
+      "an explicit null stays omitted"
+    );
+    assert_eq!(data["code"], "abc");
+
+    let with_activity: ActivityCmd = serde_json::from_str(
+      r#"{"cmd":"INVITE_BROWSER","args":{"pid":3,"activity":{"name":"G","type":0},"code":"abc"},"nonce":"n6"}"#,
+    )
+    .expect("the command parses");
+    let body: Value =
+      serde_json::from_str(&serde_json::to_string(&BrowserEcho::borrow(&with_activity)).unwrap())
+        .expect("the echo is JSON");
+    assert_eq!(
+      body["data"]["activity"]["name"], "G",
+      "a real activity still travels as an object"
+    );
   }
 
   /// A `GET_USER` reply carries the borrowed user, id included.

@@ -100,6 +100,10 @@ MessagePack frames carry the same field names. A clear is `activity: null`
 on an otherwise normal frame — it is not a separate message type, and the
 `pid`/`socketId` still tell you what was cleared.
 
+On the game-facing side, `activity` is mandatory whenever `args` is present:
+a `SET_ACTIVITY` that omits the field is malformed, not a clear. Only an
+explicit `activity: null` clears the published card.
+
 Frames you send back are echoed to you and not forwarded, and bridge
 clients do not publish presence: only `SET_USER`/`RESET_USER` are treated as
 control, and anything else returns as an echo. Binary frames echo like text

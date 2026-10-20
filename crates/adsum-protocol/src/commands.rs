@@ -117,7 +117,8 @@ pub fn empty_cached(pid: u64, socket_id: SocketId) -> Option<Arc<CachedActivity>
 /// match what [`cached_activity`] stores — two commands differing only in
 /// the outer id must not share a fingerprint.
 ///
-/// Returns `None` when there is no activity (a clear).
+/// Returns `None` when the command carries no activity value (an explicit
+/// clear or a command that omits the field; the transports reject the latter).
 ///
 /// The bytes come back as [`Bytes`] so every later holder — the flood
 /// guard, the cached payload — keeps a strong reference to one buffer
@@ -126,7 +127,7 @@ pub fn empty_cached(pid: u64, socket_id: SocketId) -> Option<Arc<CachedActivity>
 pub fn activity_fingerprint(cmd: &mut ActivityCmd) -> Option<Bytes> {
   cmd.fix();
   let application_id = cmd.application_id.clone();
-  let activity = cmd.args.as_mut()?.activity.as_mut()?;
+  let activity = cmd.args.as_mut()?.activity.as_mut()?.as_mut()?;
   activity.application_id = application_id;
   serde_json::to_vec(activity).ok().map(Bytes::from)
 }
@@ -147,8 +148,9 @@ pub fn activity_fingerprint(cmd: &mut ActivityCmd) -> Option<Bytes> {
 /// the SDK handoff, clear resume) read those facts before handing it over —
 /// this function is the last thing that runs before the fan-out.
 ///
-/// Returns `None` when the command cannot be converted into a valid payload
-/// (e.g. it is missing its arguments entirely).
+/// Returns `None` when the command cannot be converted into a valid payload:
+/// it is missing its arguments entirely, or it carries `args` without the
+/// `activity` field (absent is malformed input, not a clear).
 #[must_use]
 pub fn cached_activity(
   mut cmd: ActivityCmd,
@@ -158,14 +160,16 @@ pub fn cached_activity(
 
   // Owned command: take the activity out instead of cloning it. The
   // application id moves too — nothing else reads it afterwards.
-  let mut args = cmd.args.take()?;
+  let args = cmd.args.take()?;
 
-  if args.activity.is_none() {
+  // The field itself must be present: absent is malformed input, not a
+  // clear, and the transports reject it before reaching here.
+  let activity = args.activity?;
+
+  let Some(mut activity) = activity else {
     let pid = args.pid.unwrap_or_default();
     return empty_cached(pid, SocketId::from(pid.to_string()));
-  }
-
-  let mut activity = args.activity.take()?;
+  };
   activity.application_id = cmd.application_id;
 
   let payload = ActivityPayload {
@@ -177,8 +181,8 @@ pub fn cached_activity(
   Some(Arc::new(CachedActivity {
     json: serde_json::to_string(&payload).ok()?.into(),
     msgpack: rmp_serde::to_vec_named(&payload).ok().map(Bytes::from)?,
-    // Reached only when `args.activity` is `Some`: the serialized body
-    // carries a real activity object, never null.
+    // Reached only when `args.activity` is `Some(Some(_))`: the serialized
+    // body carries a real activity object, never null.
     is_clear: false,
     activity_json: fingerprint.unwrap_or_default(),
     // Provenance is stamped by the bridge caller (generic vs SDK paths
@@ -413,7 +417,8 @@ struct ActivityEcho<'a> {
 /// strict clients validating the echo see their own activity back.
 /// `application_id` (known from the handshake, absent from what the game
 /// sent) is attached as a routing enrichment; unknown keys tolerate it.
-/// Returns `None` when the command has no arguments.
+/// Returns `None` when the command has no arguments or omits the `activity`
+/// field entirely (malformed input, not a clear).
 ///
 /// Takes `&mut` because the echo's `application_id` is the command's, not
 /// the activity's: the activity's own copy is dropped first so the field
@@ -426,12 +431,20 @@ pub fn set_activity_response(cmd: &mut ActivityCmd) -> Option<String> {
   // field below is the only source: left in, `flatten` would write the
   // key a second time and the game would see two `application_id`s.
   // Dropping it also costs nothing: the string is discarded, not cloned.
-  if let Some(activity) = cmd.args.as_mut().and_then(|args| args.activity.as_mut()) {
+  if let Some(activity) = cmd
+    .args
+    .as_mut()
+    .and_then(|args| args.activity.as_mut())
+    .and_then(|activity| activity.as_mut())
+  {
     activity.application_id = None;
   }
 
   let args = cmd.args.as_ref()?;
-  let data = args.activity.as_ref().map(|activity| ActivityEcho {
+  // Absent `activity` (outer `None`) is malformed: no echo rather than a
+  // bogus `data: null`. An explicit clear still echoes null.
+  let activity = args.activity.as_ref()?;
+  let data = activity.as_ref().map(|activity| ActivityEcho {
     activity,
     application_id: cmd.application_id.as_deref(),
   });

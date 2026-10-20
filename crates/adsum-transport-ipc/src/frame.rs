@@ -209,7 +209,7 @@ pub fn send_empty(sink: &EventSink, pid: u64) {
   let activity = ActivityCmd {
     cmd: "SET_ACTIVITY".to_string(),
     args: Some(ActivityCmdArgs {
-      activity: None,
+      activity: Some(None),
       code: None,
       user_id: None,
       pid: Some(pid),
@@ -405,7 +405,7 @@ fn on_close(ipc: &mut dyn IpcFacilitator) {
     evt: None,
     args: Some(ActivityCmdArgs {
       pid: Some(ipc.pid()),
-      activity: None,
+      activity: Some(None),
       code: None,
       user_id: None,
     }),
@@ -571,12 +571,32 @@ fn handle_set_activity(
     }
   };
 
+  // The field itself is mandatory whenever `args` exists: omitting it is
+  // malformed input, not a clear (only an explicit `activity: null` is).
+  // Reject before any state mutation or sink forwarding, like missing args.
+  if args.activity.is_none() {
+    tracing::warn!("[ipc] Missing activity field, skipping");
+    let resp = encode(
+      PacketType::Frame,
+      &commands::rpc_error(
+        &activity_cmd.cmd,
+        &activity_cmd.nonce,
+        4005,
+        "Missing activity field",
+      ),
+    );
+    if let Err(err) = stream.write_all(&resp) {
+      tracing::debug!("[ipc] Peer gone, dropping reply: {err}");
+    }
+    return;
+  }
+
   // A publication (non-null activity) must carry a real pid: a missing or
   // zero pid would leave an orphan presence downstream (the bridge only
   // treats clears with pid != 0 as genuine). Reject before any state
   // mutation or sink forwarding, mirroring the missing-args path above.
-  // Clears (activity == None) keep pid 0 and are handled by the router.
-  if args.activity.is_some() && args.pid.unwrap_or(0) == 0 {
+  // Explicit clears (`Some(None)`) keep pid 0 and are handled by the router.
+  if matches!(args.activity, Some(Some(_))) && args.pid.unwrap_or(0) == 0 {
     tracing::warn!("[ipc] Missing or invalid pid, skipping");
     let resp = encode(
       PacketType::Frame,

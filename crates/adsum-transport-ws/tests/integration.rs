@@ -133,6 +133,7 @@ async fn disconnect_emits_clear_for_last_activity() {
       .args
       .as_ref()
       .and_then(|a| a.activity.as_ref())
+      .and_then(|a| a.as_ref())
       .is_some()
   );
   // Drain the reply so the client read buffer stays clean.
@@ -144,7 +145,7 @@ async fn disconnect_emits_clear_for_last_activity() {
   assert_eq!(clear.application_id.as_deref(), Some("test-app"));
   let args = clear.args.expect("clear carries args");
   assert_eq!(args.pid, Some(123));
-  assert!(args.activity.is_none());
+  assert!(matches!(args.activity, Some(None)));
 
   transport.shutdown().await;
 }
@@ -245,6 +246,121 @@ async fn disabled_set_activity_stays_silent() {
   transport.shutdown().await;
 }
 
+/// A `SET_ACTIVITY` with `args` but no `activity` field is malformed, not a
+/// clear: it gets 4005 and never enters tracking, so only the later valid
+/// pid is cleared on disconnect.
+#[tokio::test]
+async fn set_activity_without_activity_field_is_rejected() {
+  // Distinct from the valid pid below: a clear for it would prove that the
+  // malformed command entered the tracking history.
+  const SENTINEL_PID: u64 = 991;
+  let (transport, mut rx) = WsTransport::bind(config(), user()).await.unwrap();
+  let port = transport.bound_port();
+
+  let mut ws = connect(port, "?v=1&encoding=json&client_id=test-app").await;
+  let _ready = read_text(&mut ws).await;
+
+  ws.send(tungstenite::Message::Text(
+    format!(r#"{{"cmd":"SET_ACTIVITY","args":{{"pid":{SENTINEL_PID}}},"nonce":"n-missing"}}"#)
+      .into(),
+  ))
+  .await
+  .unwrap();
+
+  let reply = read_text(&mut ws).await;
+  assert_eq!(reply["cmd"], "SET_ACTIVITY");
+  assert_eq!(reply["evt"], "ERROR");
+  assert_eq!(reply["data"]["code"], 4005);
+  assert_eq!(reply["data"]["message"], "Missing activity field");
+  assert_eq!(reply["nonce"], "n-missing");
+  assert!(
+    tokio::time::timeout(Duration::from_millis(300), rx.recv())
+      .await
+      .is_err(),
+    "missing activity field must not reach the sink"
+  );
+
+  // Connection stays alive: a valid publish still flows and gets its echo.
+  ws.send(tungstenite::Message::Text(SET_ACTIVITY.into()))
+    .await
+    .unwrap();
+  let cmd = next_cmd(&mut rx).await;
+  assert_eq!(cmd.args.as_ref().and_then(|a| a.pid), Some(123));
+  let echo = read_text(&mut ws).await;
+  assert_eq!(echo["cmd"], "SET_ACTIVITY");
+
+  // Disconnect: collect every clear until a short window lapses. The
+  // sentinel never entered tracking, so only the valid pid may appear.
+  drop(ws);
+  let mut cleared = vec![recv_clear(&mut rx).await.1];
+  let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+  while tokio::time::Instant::now() < deadline {
+    if let Ok(cmd) = rx.try_recv() {
+      assert_eq!(cmd.cmd, "SET_ACTIVITY");
+      assert!(
+        cmd
+          .args
+          .as_ref()
+          .is_some_and(|a| matches!(a.activity, Some(None))),
+        "expected clear, got: {cmd:?}"
+      );
+      cleared.push(cmd.args.as_ref().and_then(|a| a.pid));
+    }
+    tokio::time::sleep(Duration::from_millis(10)).await;
+  }
+  assert_eq!(
+    cleared,
+    vec![Some(123)],
+    "only the valid pid may be cleared"
+  );
+
+  transport.shutdown().await;
+}
+
+/// A `SET_ACTIVITY` with no `args` keeps the legacy websocket path: no
+/// reply, and the command is forwarded for the bridge to drop.
+#[tokio::test]
+async fn set_activity_without_args_stays_legacy() {
+  let (transport, mut rx) = WsTransport::bind(config(), user()).await.unwrap();
+  let port = transport.bound_port();
+
+  let mut ws = connect(port, "?v=1&encoding=json&client_id=test-app").await;
+  let _ready = read_text(&mut ws).await;
+
+  ws.send(tungstenite::Message::Text(
+    r#"{"cmd":"SET_ACTIVITY","nonce":"n-noargs"}"#.into(),
+  ))
+  .await
+  .unwrap();
+
+  // Legacy: no reply is built for a missing `args`.
+  assert!(
+    tokio::time::timeout(Duration::from_millis(300), ws.next())
+      .await
+      .is_err(),
+    "missing args must stay silent"
+  );
+
+  // Legacy: it still reaches the sink, args-less, for the bridge to drop.
+  let cmd = next_cmd(&mut rx).await;
+  assert_eq!(cmd.cmd, "SET_ACTIVITY");
+  assert!(
+    cmd.args.is_none(),
+    "the forwarded command carries no args: {cmd:?}"
+  );
+
+  // The connection stays usable for a valid publish.
+  ws.send(tungstenite::Message::Text(SET_ACTIVITY.into()))
+    .await
+    .unwrap();
+  let published = next_cmd(&mut rx).await;
+  assert_eq!(published.args.as_ref().and_then(|a| a.pid), Some(123));
+  let echo = read_text(&mut ws).await;
+  assert_eq!(echo["cmd"], "SET_ACTIVITY");
+
+  transport.shutdown().await;
+}
+
 #[tokio::test]
 /// Dead sinks shed counted while the pump keeps answering clients.
 async fn closed_sink_counts_drops_and_stays_alive() {
@@ -320,8 +436,7 @@ async fn recv_clear(
     cmd
       .args
       .as_ref()
-      .and_then(|a| a.activity.as_ref())
-      .is_none(),
+      .is_some_and(|a| matches!(a.activity, Some(None))),
     "expected clear, got activity"
   );
   (
@@ -403,8 +518,7 @@ async fn published_pid_history_is_bounded() {
       && cmd
         .args
         .as_ref()
-        .and_then(|a| a.activity.as_ref())
-        .is_none()
+        .is_some_and(|a| matches!(a.activity, Some(None)))
       && let Some(pid) = cmd.args.as_ref().and_then(|a| a.pid)
     {
       pids.insert(pid);
@@ -501,8 +615,7 @@ async fn stalled_reader_does_not_freeze_the_pump() {
           && cmd
             .args
             .as_ref()
-            .and_then(|args| args.activity.as_ref())
-            .is_none()
+            .is_some_and(|args| matches!(args.activity, Some(None)))
       });
     if cleared {
       break;
@@ -548,8 +661,7 @@ async fn close_while_reply_is_undeliverable_clears_publication() {
         && cmd
           .args
           .as_ref()
-          .and_then(|a| a.activity.as_ref())
-          .is_none()
+          .is_some_and(|a| matches!(a.activity, Some(None)))
       {
         cleared = true;
       }
@@ -640,8 +752,7 @@ async fn shed_republish_keeps_prior_tracking() {
     clear
       .args
       .as_ref()
-      .and_then(|a| a.activity.as_ref())
-      .is_none()
+      .is_some_and(|a| matches!(a.activity, Some(None)))
   );
 
   transport.shutdown().await;
@@ -695,6 +806,7 @@ async fn staged_disconnect_clear_flushes_on_next_message() {
         .args
         .as_ref()
         .and_then(|a| a.activity.as_ref())
+        .and_then(|a| a.as_ref())
         .is_some(),
       "drains must be publishes, got: {republished:?}"
     );
@@ -719,8 +831,7 @@ async fn staged_disconnect_clear_flushes_on_next_message() {
     first
       .args
       .as_ref()
-      .and_then(|a| a.activity.as_ref())
-      .is_none(),
+      .is_some_and(|a| matches!(a.activity, Some(None))),
     "staged disconnect clear must lead, got: {first:?}"
   );
   let second = next_cmd(&mut rx).await;
@@ -767,6 +878,7 @@ async fn staged_disconnect_clear_lands_without_further_traffic() {
         .args
         .as_ref()
         .and_then(|a| a.activity.as_ref())
+        .and_then(|a| a.as_ref())
         .is_some(),
       "drains must be publishes, got: {queued:?}"
     );
@@ -779,8 +891,7 @@ async fn staged_disconnect_clear_lands_without_further_traffic() {
     clear
       .args
       .as_ref()
-      .and_then(|a| a.activity.as_ref())
-      .is_none(),
+      .is_some_and(|a| matches!(a.activity, Some(None))),
     "staged disconnect clear must arrive, got: {clear:?}"
   );
 
@@ -849,8 +960,7 @@ async fn staged_clears_serialize_before_newer_publishes() {
     first
       .args
       .as_ref()
-      .and_then(|a| a.activity.as_ref())
-      .is_none(),
+      .is_some_and(|a| matches!(a.activity, Some(None))),
     "staged clear must lead, got: {first:?}"
   );
   let second = next_cmd(&mut rx).await;
@@ -860,6 +970,7 @@ async fn staged_clears_serialize_before_newer_publishes() {
       .args
       .as_ref()
       .and_then(|a| a.activity.as_ref())
+      .and_then(|a| a.as_ref())
       .is_some(),
     "staged publish must follow the clear, got: {second:?}"
   );
@@ -931,8 +1042,7 @@ async fn staged_clear_waits_behind_staged_publish() {
     cleared_a
       .args
       .as_ref()
-      .and_then(|a| a.activity.as_ref())
-      .is_none(),
+      .is_some_and(|a| matches!(a.activity, Some(None))),
     "A's disconnect clear must lead, got: {cleared_a:?}"
   );
   let shown = next_cmd(&mut rx).await;
@@ -942,6 +1052,7 @@ async fn staged_clear_waits_behind_staged_publish() {
       .args
       .as_ref()
       .and_then(|a| a.activity.as_ref())
+      .and_then(|a| a.as_ref())
       .is_some(),
     "staged publish must lead its clear, got: {shown:?}"
   );
@@ -951,8 +1062,7 @@ async fn staged_clear_waits_behind_staged_publish() {
     cleared
       .args
       .as_ref()
-      .and_then(|a| a.activity.as_ref())
-      .is_none(),
+      .is_some_and(|a| matches!(a.activity, Some(None))),
     "staged clear must follow its publish, got: {cleared:?}"
   );
 
@@ -1002,6 +1112,7 @@ async fn genuine_clear_frees_tracking_capacity() {
         .args
         .as_ref()
         .and_then(|a| a.activity.as_ref())
+        .and_then(|a| a.as_ref())
         .is_some()
     {
       break;

@@ -120,8 +120,7 @@ async fn drop_without_shutdown_still_clears_presence() {
     clear
       .args
       .as_ref()
-      .and_then(|a| a.activity.as_ref())
-      .is_none()
+      .is_some_and(|a| matches!(a.activity, Some(None)))
   );
 }
 
@@ -222,8 +221,7 @@ async fn full_client_flow_over_real_socket() {
     clear
       .args
       .as_ref()
-      .and_then(|a| a.activity.as_ref())
-      .is_none()
+      .is_some_and(|a| matches!(a.activity, Some(None)))
   );
 
   transport.shutdown().await;

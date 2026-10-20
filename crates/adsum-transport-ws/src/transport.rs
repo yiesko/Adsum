@@ -100,7 +100,7 @@ impl PendingClear {
         // pid 0 is never a genuine clear, so it is safely ignored
         // downstream — same convention as the whole-command clear.
         pid: Some(self.pid),
-        activity: None,
+        activity: Some(None),
         code: None,
         user_id: None,
       }),
@@ -995,6 +995,24 @@ async fn on_message(
   // Every arm reports liveness: `false` means the game client died without
   // a clean `Disconnect` and its slot must be released now.
   //
+  // A `SET_ACTIVITY` with `args` but no `activity` field is malformed, not
+  // a clear: reject with the official error before tracking or forwarding.
+  // Missing `args` keeps its legacy silent path (forwarded, bridge drops).
+  if set_activity
+    && event.cmd == "SET_ACTIVITY"
+    && event
+      .args
+      .as_ref()
+      .is_some_and(|args| args.activity.is_none())
+  {
+    let alive = handlers::handle_missing_activity(&event, &slot.responder).await;
+    if !alive {
+      tracing::info!("[transport-ws] Client {id} send failed, pruning");
+      remove_and_clear(id, clients, total, sink, pending_clears).await;
+    }
+    return;
+  }
+
   // Two passes, because `SET_ACTIVITY` now consumes the command by value
   // (it owns data the sink needs) while every other arm only borrows it.
   // Matching directly on `event.cmd.as_str()` would hold a borrow of
@@ -1011,11 +1029,13 @@ async fn on_message(
       .clone()
       .or_else(|| slot.query_client_id.clone());
     let pid = event.args.as_ref().and_then(|a| a.pid).unwrap_or_default();
-    let is_clear = event
-      .args
-      .as_ref()
-      .and_then(|args| args.activity.as_ref())
-      .is_none();
+    let is_clear = match event.args.as_ref() {
+      // Only an explicit `activity: null` is a clear; a missing field was
+      // rejected above and never reaches here.
+      Some(args) => matches!(args.activity, Some(None)),
+      // No `args` at all keeps the legacy clear path: never track pid 0.
+      None => true,
+    };
     // Record first (one short write, no await inside): every forwarded
     // publication is tracked, so disconnect cleanup stays complete. The
     // pump is the only map mutator, so admission cannot change before
@@ -1255,7 +1275,7 @@ mod tests {
       evt: None,
       args: Some(ActivityCmdArgs {
         pid: Some(pid),
-        activity: Some(activity_with_details()),
+        activity: Some(Some(activity_with_details())),
         code: None,
         user_id: None,
       }),
@@ -1325,14 +1345,14 @@ mod tests {
         .args
         .as_ref()
         .and_then(|a| a.activity.as_ref())
+        .and_then(|a| a.as_ref())
         .is_some()
     );
     assert!(
       clear
         .args
         .as_ref()
-        .and_then(|a| a.activity.as_ref())
-        .is_none()
+        .is_some_and(|a| matches!(a.activity, Some(None)))
     );
   }
 

@@ -93,6 +93,13 @@ changes nothing. Over the **websocket** there is no error at all: no reply
 is built, the connection is reported as alive, and the bridge drops the
 command in silence.
 
+A `SET_ACTIVITY` that carries `args` but omits the `activity` field is also
+malformed, not a clear: only an explicit `activity: null` clears presence.
+With `SET_ACTIVITY` enabled, both transports answer error `4005` ("Missing
+activity field") and neither forwards nor tracks the command; with the
+feature disabled the websocket transport stays silent for every
+`SET_ACTIVITY`, as it does for the other malformed shape above.
+
 ### Limits that change what a client observes
 
 - **16 tracked pids per connection.** Beyond the cap, new pids are refused

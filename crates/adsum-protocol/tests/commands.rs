@@ -398,6 +398,14 @@ fn cached_payload_knows_whether_it_clears() {
   assert!(payload.is_clear);
 }
 
+/// A command that omits the `activity` field is malformed, not a clear:
+/// `cached_activity` refuses to build a payload for it.
+#[test]
+fn cached_activity_rejects_missing_activity_field() {
+  let cmd = parse_cmd(r#"{"cmd":"SET_ACTIVITY","args":{"pid":7},"nonce":"n"}"#);
+  assert!(cached_activity(cmd, None).is_none());
+}
+
 /// Canonical `SET_ACTIVITY` command fixture (app 123, pid 42).
 fn set_activity_cmd() -> ActivityCmd {
   parse_cmd(
@@ -422,13 +430,25 @@ fn activity_fingerprint_matches_standalone_serialization() {
     .args
     .as_ref()
     .and_then(|args| args.activity.as_ref())
+    .and_then(|activity| activity.as_ref())
     .expect("activity");
   assert_eq!(fp, serde_json::to_vec(activity).expect("serializable"));
 }
 
-/// Activity-less commands (clears) fingerprint to `None`.
+/// An explicit `activity: null` (a clear) fingerprints to `None`.
 #[test]
 fn activity_fingerprint_is_none_for_clears() {
+  use adsum_protocol::commands::activity_fingerprint;
+
+  let mut cmd =
+    parse_cmd(r#"{"cmd":"SET_ACTIVITY","args":{"pid":42,"activity":null},"nonce":"n1"}"#);
+  assert!(activity_fingerprint(&mut cmd).is_none());
+}
+
+/// A command that omits the `activity` field is malformed, not a clear, and
+/// still has no fingerprint: the bridge rejects it before this point.
+#[test]
+fn activity_fingerprint_is_none_for_missing_activity_field() {
   use adsum_protocol::commands::activity_fingerprint;
 
   let mut cmd = parse_cmd(r#"{"cmd":"SET_ACTIVITY","args":{"pid":42},"nonce":"n1"}"#);
@@ -488,7 +508,14 @@ fn set_activity_response_matches_the_dom_reference() {
 
   // Reference: the exact DOM path this replaced.
   let args = cmd.args.as_ref().expect("args");
-  let mut data = serde_json::to_value(args.activity.as_ref().expect("activity")).expect("value");
+  let mut data = serde_json::to_value(
+    args
+      .activity
+      .as_ref()
+      .and_then(|activity| activity.as_ref())
+      .expect("activity"),
+  )
+  .expect("value");
   data.as_object_mut().expect("object").insert(
     "application_id".to_string(),
     cmd
@@ -528,6 +555,14 @@ fn set_activity_response_echoes_clear_as_null_data() {
   });
   assert_eq!(got, reference);
   assert!(got["data"].is_null());
+}
+
+/// A command with `args` but no `activity` field gets no echo at all:
+/// absent is malformed input, not a clear.
+#[test]
+fn set_activity_response_skips_missing_activity_field() {
+  let mut cmd = parse_cmd(r#"{"cmd":"SET_ACTIVITY","args":{"pid":9},"nonce":"n"}"#);
+  assert!(set_activity_response(&mut cmd).is_none());
 }
 
 /// A `SET_ACTIVITY` command whose outer `application_id` and the
@@ -668,6 +703,8 @@ fn id_stamps_share_the_command_buffer() {
     .as_ref()
     .expect("args")
     .activity
+    .as_ref()
+    .expect("activity")
     .as_ref()
     .expect("activity")
     .application_id

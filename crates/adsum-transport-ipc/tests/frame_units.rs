@@ -16,7 +16,7 @@ fn send_empty_routes_as_set_activity_clear() {
   assert_eq!(cmd.cmd, "SET_ACTIVITY");
   let args = cmd.args.unwrap();
   assert_eq!(args.pid, Some(3));
-  assert!(args.activity.is_none());
+  assert!(matches!(args.activity, Some(None)));
 }
 
 /// Out-of-range packet types map to `None` (refused, never misread).
