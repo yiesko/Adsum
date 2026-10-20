@@ -1,7 +1,8 @@
 //! Classification: one process in, an optional hit out.
 //!
 //! Cheapest source first (native AC, cwd-joined bare exe, authoritative
-//! Steam AppId, Proton AC, install-dir prefix, stem/folder heuristics).
+//! Steam AppId, Epic sandbox id, Proton AC, install-dir prefix,
+//! stem/folder heuristics).
 //! Lazy `/proc` reads happen only on misses/hits — never for the table.
 
 use std::collections::HashSet;
@@ -308,6 +309,39 @@ pub fn app_id_from_args(arguments: Option<&str>) -> Option<&str> {
     let len = rest.bytes().take_while(u8::is_ascii_digit).count();
     if len > 0 {
       return Some(&rest[..len]);
+    }
+  }
+  None
+}
+
+/// Epic sandbox id (`-epicsandboxid=…`) from a process command line, the
+/// distributor evidence Heroic/Epic leaves when the sandbox hides environ.
+pub fn epic_id_from_args(arguments: Option<&str>) -> Option<&str> {
+  const NEEDLE: &[u8] = b"-epicsandboxid=";
+  let args = arguments?;
+  let bytes = args.as_bytes();
+  // Whole-string needle search, matched ASCII-case-insensitively in place:
+  // folding (and so allocating) the entire command line would pay for
+  // every scanned process just to find a token that is almost never there.
+  for (at, window) in bytes.windows(NEEDLE.len()).enumerate() {
+    if window[0] != b'-' || !window[1..].eq_ignore_ascii_case(&NEEDLE[1..]) {
+      continue;
+    }
+    // Token boundary: the `-` has to start an argument (`x-epicsandboxid=`
+    // is the tail of some other flag, not this one).
+    if at != 0 && !bytes[at - 1].is_ascii_whitespace() {
+      continue;
+    }
+    // Borrow the value run instead of collecting it: the members are
+    // single-byte ASCII, so the byte count is always a char boundary.
+    let value_at = at + NEEDLE.len();
+    let tail = &bytes[value_at..];
+    let len = tail
+      .iter()
+      .take_while(|byte| !byte.is_ascii_whitespace())
+      .count();
+    if len > 0 {
+      return Some(&args[value_at..value_at + len]);
     }
   }
   None
@@ -655,26 +689,9 @@ fn argv_names_an_executable(process_path: &str, obj: &ScannedEntry) -> bool {
     .any(|exe| exe_names_path(process_path, &exe.name))
 }
 
-/// Whether the declared executable `name` names the tail of `path` on a
-/// path-component boundary.
-///
-/// The boundary half of the corroboration rule the store-id tier applies
-/// ([`argv_names_an_executable`]), compared against the **normalized**
-/// name instead of the raw one: the automaton's pattern is the name after
-/// `normalize_exe_pattern` — Windows separators folded, the launcher
-/// marker turned into the leading `/` — so comparing the raw name here
-/// would reject every launcher entry the automaton just accepted.
-///
-/// The automaton matches a substring, so a hit on its own is not
-/// evidence: a process whose path merely *contains* a declared name
-/// (`.../hl2.exe.txt` holds `hl2.exe`) would otherwise read as the game,
-/// with no store id involved to catch it. The name has to END the
-/// string, and what precedes it has to be a separator.
-///
-/// Walks bytes from the end and folds case in place, so confirming a hit
-/// costs no allocation: the automaton fires once per detected process,
-/// but the scan tick classifies every process on the box.
-fn exe_names_path(path: &str, name: &str) -> bool {
+/// Whether `name` is the tail of `path` on a component boundary,
+/// case-insensitive and with Windows separators folded.
+fn names_tail(path: &str, name: &str) -> bool {
   // The launcher marker is arrpc's "the arguments carry the launcher"
   // flag, kept raw on the entry for the argument check in
   // `finish_direct_hit`; it is not part of the file name.
@@ -709,7 +726,63 @@ fn exe_names_path(path: &str, name: &str) -> bool {
       }
     }
   }
-  names_a_bundle(path, name)
+  false
+}
+
+/// Whether `dir` occurs anywhere in `path` (case-insensitive, `\` folded),
+/// so a near-miss component like `xgarrysmod` suppresses the fallback.
+fn dir_present_in_path(path: &str, dir: &str) -> bool {
+  #[inline]
+  fn fold(byte: u8) -> u8 {
+    if byte == b'\\' {
+      b'/'
+    } else {
+      byte.to_ascii_lowercase()
+    }
+  }
+  let dir = dir.as_bytes();
+  if dir.is_empty() {
+    return false;
+  }
+  path
+    .as_bytes()
+    .windows(dir.len())
+    .any(|window| window.iter().zip(dir).all(|(p, d)| fold(*p) == fold(*d)))
+}
+
+/// Corroboration rule: exact tail, then the bare basename when the declared
+/// directory is absent (Proton short launches), then the macOS bundle.
+fn exe_names_path(path: &str, name: &str) -> bool {
+  // The launcher marker is arrpc's "the arguments carry the launcher"
+  // flag, kept raw on the entry for the argument check in
+  // `finish_direct_hit`; it is not part of the file name.
+  let name = name.strip_prefix('>').unwrap_or(name);
+  // A name that normalizes to a bare `/` is dropped at bundle build time
+  // (it would match every path), so no hit can point at one — but a name
+  // that names nothing must never name anything.
+  if name.is_empty() {
+    return false;
+  }
+  // Full declared name first (multi-component entries launched with their
+  // full relative path).
+  if names_tail(path, name) {
+    return true;
+  }
+  // Bare-basename fallback for short Proton/Heroic launches: this tier runs
+  // only after a store id (Steam/Epic) already named the entry, so a generic
+  // basename at the tail is corroboration, not standalone evidence.
+  let basename = name.rsplit(['/', '\\']).next().unwrap_or(name);
+  let dirpart = name.rsplit_once(['/', '\\']).map(|(d, _)| d).unwrap_or("");
+  if basename != name && !basename.is_empty() {
+    // A declared directory present as a substring (case-insensitive,
+    // `\` folded) suppresses the fallback: the full name should have
+    // corroborated, or it is a near miss.
+    let dir_present = !dirpart.is_empty() && dir_present_in_path(path, dirpart);
+    if !dir_present && names_tail(path, basename) {
+      return true;
+    }
+  }
+  names_a_bundle(path.as_bytes(), name.as_bytes())
 }
 
 /// The macOS bundle interior, which every bundle Apple has ever shipped
@@ -940,6 +1013,58 @@ pub fn match_steam_id(
         appid
       );
       return live_or_none(obj, pid, lookup.source, stat);
+    }
+  }
+  None
+}
+
+/// Resolve an Epic sandbox id to an entry, corroborated by the process
+/// path; mirrors [`match_steam_id`] and runs before the fuzzy heuristics.
+pub fn match_epic_id(
+  pid: u64,
+  stat: &mut String,
+  epic_id: &str,
+  process_path: &str,
+  epic_map: &SortedIndex,
+  entries: &[Arc<ScannedEntry>],
+  custom: &[Arc<ScannedEntry>],
+) -> Option<ScannedHit> {
+  if let Some(&idx) = epic_map.get(epic_id) {
+    let obj = entries.get(idx)?;
+    if !argv_names_an_executable(process_path, obj) {
+      // The id is the game's, but this process does not run an executable
+      // it declares: named in the log, because a rejected hit is
+      // otherwise indistinguishable from a miss.
+      tracing::debug!(
+        "[Process Scanner] Epic sandbox id {epic_id} does not belong to {path} ({name}), skipping",
+        path = process_path,
+        name = obj.name,
+      );
+      return None;
+    }
+    tracing::debug!(
+      "[Process Scanner] Epic match: {} (sandbox {epic_id})",
+      obj.name
+    );
+    return live_or_none(obj, pid, DetectSource::EpicAppId, stat);
+  }
+  // Custom override carrying a bare epic SKU: searched linearly
+  // (user-sized, not DB-sized), same corroboration as the map path.
+  for obj in custom {
+    if obj.epic_ids.iter().any(|id| id.as_ref() == epic_id) {
+      if !argv_names_an_executable(process_path, obj) {
+        tracing::debug!(
+          "[Process Scanner] Epic sandbox id {epic_id} does not belong to {path} ({name}, custom), skipping",
+          path = process_path,
+          name = obj.name,
+        );
+        continue;
+      }
+      tracing::debug!(
+        "[Process Scanner] Epic match (custom): {} (sandbox {epic_id})",
+        obj.name
+      );
+      return live_or_none(obj, pid, DetectSource::EpicAppId, stat);
     }
   }
   None
@@ -1194,7 +1319,8 @@ impl ProcessServer {
   }
 
   /// Classify one enumerated process, cheapest source first:
-  /// native AC, bare-exe+cwd, authoritative Steam AppId, Proton (`win32`)
+  /// native AC, bare-exe+cwd, authoritative Steam AppId, Epic sandbox id,
+  /// Proton (`win32`)
   /// AC, Steam install-dir, then the stem/folder heuristics — except when
   /// the launcher supplied a shortcut-range AppId (Steam-assigned
   /// non-Steam id): then stem/folder run before the install-dir. Lazy `/proc` reads (cwd,
@@ -1364,6 +1490,27 @@ impl ProcessServer {
           },
         ) {
           return Some(hit);
+        }
+        // Epic sandbox id: Heroic/Epic puts it on the cmdline, and the
+        // service sandbox hides environ, so it is the only store id those
+        // games can show. Usually already lowercase: borrow it, fold on demand.
+        if let Some(id) = epic_id_from_args(process.arguments.as_deref()) {
+          let lowered_id = if id.bytes().any(|b| b.is_ascii_uppercase()) {
+            std::borrow::Cow::Owned(id.to_ascii_lowercase())
+          } else {
+            std::borrow::Cow::Borrowed(id)
+          };
+          if let Some(hit) = match_epic_id(
+            process.pid,
+            &mut scratch.match_scratch.stat,
+            lowered_id.as_ref(),
+            lowered,
+            &bundle.epic_map,
+            &bundle.list,
+            &bundle.custom,
+          ) {
+            return Some(hit);
+          }
         }
         // An AppId the launcher gave us but the database doesn't know needs
         // a second look: Steam itself assigns high-bit-set ids
@@ -1776,6 +1923,7 @@ mod tick2_tests {
         },
       ]),
       steam_ids: Box::new(["4000".into()]),
+      epic_ids: Box::new([]),
       aliases: Box::new([]),
     };
 
@@ -1849,6 +1997,7 @@ mod tick2_tests {
       name: "No Exes".into(),
       executables: Box::new([]),
       steam_ids: Box::new(["777".into()]),
+      epic_ids: Box::new([]),
       aliases: Box::new([]),
     };
     for path in ["/opt/whatever", "/usr/bin/steamwebhelper", "hl2.exe"] {
@@ -1898,6 +2047,26 @@ mod tick2_tests {
       ("hl2.exe", "hl2.exe"),
       // Multi-byte components on the way in do not disturb the tail.
       ("a.exe", "/games/ä/a.exe"),
+      // GTA V Enhanced: a multi-component name corroborates a bare path
+      // (Proton/Heroic short launch) via the basename fallback.
+      (
+        "grand theft auto v enhanced/gta5_enhanced.exe",
+        "gta5_enhanced.exe",
+      ),
+      // The real Heroic launch: `S:\Heroic\GTAVEnhanced\GTA5_Enhanced.exe`
+      // normalized. The declared directory is absent from the short path,
+      // so the bare basename still has to corroborate it.
+      (
+        "grand theft auto v enhanced/gta5_enhanced.exe",
+        "/S:/Heroic/GTAVEnhanced/GTA5_Enhanced.exe",
+      ),
+      // The declared `bin` directory is absent from the path, so the
+      // bare-basename fallback accepts the short launch: the basename
+      // corroborates it rather than refusing it.
+      (
+        "bin/gmad.exe",
+        "/C:/Steam/steamapps/common/GarrysMod/hl2.exe/gmad.exe",
+      ),
     ] {
       assert!(
         exe_names_path(path, name),
@@ -1916,15 +2085,14 @@ mod tick2_tests {
         "hl2.exe",
         "/C:/Steam/steamapps/common/GarrysMod/hl2.exe.evil",
       ),
-      // A multi-component name has to match whole, boundary included.
+      // A declared directory present as a substring suppresses the
+      // fallback: near-miss components like `xgarrysmod` stay refused.
       (
         "garrysmod/hl2.exe",
         "/C:/Steam/steamapps/common/GarrysMod/xgarrysmod/hl2.exe",
       ),
-      (
-        "bin/gmad.exe",
-        "/C:/Steam/steamapps/common/GarrysMod/hl2.exe/gmad.exe",
-      ),
+      ("garrysmod/hl2.exe", "/tmp/xgarrysmod/hl2.exe"),
+      ("bin/gmad.exe", "/tmp/binary/gmad.exe"),
       // A folder that ends the path is not the executable.
       ("hl2.exe", "/C:/Steam/steamapps/common/GarrysMod/hl2.exe/"),
       // The un-stripped original: the scan probes the stripped variant,
@@ -2067,6 +2235,7 @@ mod tick2_tests {
           arguments: None,
         }]),
         steam_ids: Box::new(["4000".into()]),
+        epic_ids: Box::new([]),
         aliases: Box::new([]),
       };
       assert!(
@@ -2089,6 +2258,7 @@ mod tick2_tests {
       name: "Source Game".into(),
       executables: Box::new([]),
       steam_ids: Box::new(["12345".into()]),
+      epic_ids: Box::new([]),
       aliases: Box::new([]),
     });
     let steam_map = SortedIndex::build(vec![("12345".into(), 0)]);
@@ -2109,6 +2279,163 @@ mod tick2_tests {
     assert_eq!(hit.source, DetectSource::SteamAppId);
   }
 
+  /// The widened corroboration is deliberate on the Steam tier too: a
+  /// short Heroic launch corroborates a full declared name via the
+  /// basename fallback, and a path naming nothing stays refused.
+  #[test]
+  fn steam_app_id_corroborates_a_short_heroic_launch() {
+    use crate::bundle::SortedIndex;
+    use crate::types::{DetectSource, OsName, ScannedExe};
+
+    let entry = Arc::new(ScannedEntry {
+      id: "3240220".into(),
+      name: "Grand Theft Auto V Enhanced".into(),
+      executables: Box::new([ScannedExe {
+        name: "grand theft auto v enhanced/gta5_enhanced.exe".into(),
+        os: OsName::Win32,
+        is_launcher: false,
+        arguments: None,
+      }]),
+      steam_ids: Box::new(["3240220".into()]),
+      epic_ids: Box::new([]),
+      aliases: Box::new([]),
+    });
+    let steam_map = SortedIndex::build(vec![("3240220".into(), 0)]);
+    let hit = match_steam_id(
+      u64::from(std::process::id()),
+      &mut String::new(),
+      &SteamIdLookup {
+        app_id: Some("3240220"),
+        process_path: "/s:/heroic/gtavenhanced/gta5_enhanced.exe",
+        source: DetectSource::SteamAppId,
+        steam_map: &steam_map,
+        entries: &[Arc::clone(&entry)],
+        custom: &[],
+      },
+    )
+    .expect("the short Heroic launch corroborates");
+    assert_eq!(hit.source, DetectSource::SteamAppId);
+    assert!(
+      match_steam_id(
+        u64::from(std::process::id()),
+        &mut String::new(),
+        &SteamIdLookup {
+          app_id: Some("3240220"),
+          process_path: "/s:/heroic/gtavenhanced/playgtav.exe",
+          source: DetectSource::SteamAppId,
+          steam_map: &steam_map,
+          entries: &[Arc::clone(&entry)],
+          custom: &[],
+        },
+      )
+      .is_none(),
+      "a path naming nothing declared must stay refused"
+    );
+  }
+
+  /// The Epic tier's parser: the token is found case-insensitively and
+  /// only at an argument boundary, the value lands verbatim, and empty
+  /// values or glued tokens are rejected.
+  #[test]
+  fn epic_id_from_args_finds_the_token() {
+    let id = "b0cd075465c44f87be3b505ac04a2e46";
+    // Lowercase and mixed-case token, uppercase value (returned verbatim;
+    // the caller lowercases for the map lookup).
+    assert_eq!(
+      epic_id_from_args(Some(&format!("game.exe -epicsandboxid={id}"))),
+      Some(id)
+    );
+    assert_eq!(
+      epic_id_from_args(Some("-EpicSandboxId=B0CD075465C44F87BE3B505AC04A2E46")),
+      Some("B0CD075465C44F87BE3B505AC04A2E46")
+    );
+    // Value terminated by a space.
+    assert_eq!(
+      epic_id_from_args(Some("-epicsandboxid=b0cd -quiet")),
+      Some("b0cd")
+    );
+    // No token at all, and no arguments.
+    assert_eq!(epic_id_from_args(Some("-args -here")), None);
+    assert_eq!(epic_id_from_args(None), None);
+    // Empty value: reject.
+    assert_eq!(epic_id_from_args(Some("-epicsandboxid= -verbose")), None);
+    // Glued to a preceding word: not a token start.
+    assert_eq!(epic_id_from_args(Some("launche-epicsandboxid=b0cd")), None);
+  }
+
+  /// Epic sandbox id hit: carries its provenance. (Inline: the fixture
+  /// needs `SortedIndex::build`, which is crate-private by design.)
+  #[test]
+  fn match_epic_id_hit_carries_its_source() {
+    use crate::bundle::SortedIndex;
+    use crate::types::DetectSource;
+    use crate::types::{OsName, ScannedExe};
+
+    let entry = Arc::new(ScannedEntry {
+      id: "1421192030440263791".into(),
+      name: "Grand Theft Auto V Enhanced".into(),
+      executables: Box::new([ScannedExe {
+        name: "grand theft auto v enhanced/gta5_enhanced.exe".into(),
+        os: OsName::Win32,
+        is_launcher: false,
+        arguments: None,
+      }]),
+      steam_ids: Box::new([]),
+      epic_ids: Box::new(["b0cd075465c44f87be3b505ac04a2e46".into()]),
+      aliases: Box::new([]),
+    });
+    let epic_map = SortedIndex::build(vec![("b0cd075465c44f87be3b505ac04a2e46".into(), 0)]);
+    let hit = match_epic_id(
+      u64::from(std::process::id()),
+      &mut String::new(),
+      "b0cd075465c44f87be3b505ac04a2e46",
+      // The real Heroic path, normalized: the declared directory is
+      // absent, so the bare-basename fallback corroborates.
+      "/s:/heroic/gtavenhanced/gta5_enhanced.exe",
+      &epic_map,
+      &[entry],
+      &[],
+    )
+    .expect("epic id hits");
+    assert_eq!(hit.source, DetectSource::EpicAppId);
+  }
+
+  /// Epic id without the executable it declares: rejected. Heroic hands the
+  /// id to the launcher chain too; corroboration tells the game from it.
+  #[test]
+  fn match_epic_id_rejects_a_path_that_names_nothing_declared() {
+    use crate::bundle::SortedIndex;
+    use crate::types::{OsName, ScannedExe};
+
+    let entry = Arc::new(ScannedEntry {
+      id: "1421192030440263791".into(),
+      name: "Grand Theft Auto V Enhanced".into(),
+      executables: Box::new([ScannedExe {
+        name: "grand theft auto v enhanced/gta5_enhanced.exe".into(),
+        os: OsName::Win32,
+        is_launcher: false,
+        arguments: None,
+      }]),
+      steam_ids: Box::new([]),
+      epic_ids: Box::new(["b0cd075465c44f87be3b505ac04a2e46".into()]),
+      aliases: Box::new([]),
+    });
+    let epic_map = SortedIndex::build(vec![("b0cd075465c44f87be3b505ac04a2e46".into(), 0)]);
+    assert!(
+      match_epic_id(
+        u64::from(std::process::id()),
+        &mut String::new(),
+        "b0cd075465c44f87be3b505ac04a2e46",
+        "/s:/heroic/gtavenhanced/playgtav.exe",
+        &epic_map,
+        &[entry],
+        &[],
+      )
+      .is_none(),
+      "a path that names none of the entry's executables must be refused"
+    );
+  }
+
   /// Exe-stem and folder heuristics report their own provenance.
   /// (Inline: the fixtures need `SortedIndex::build`, crate-private.)
   #[test]
@@ -2121,6 +2448,7 @@ mod tick2_tests {
       name: "Source Game".into(),
       executables: Box::new([]),
       steam_ids: Box::new([]),
+      epic_ids: Box::new([]),
       aliases: Box::new([]),
     });
     let name_map = SortedIndex::build(vec![("source game".into(), 0)]);
@@ -2167,6 +2495,7 @@ mod tick2_tests {
       name: "Custom Game".into(),
       executables: Box::new([]),
       steam_ids: Box::new(["999".into()]),
+      epic_ids: Box::new([]),
       aliases: Box::new([]),
     });
     let empty_map = SortedIndex::build(Vec::new());
@@ -2269,6 +2598,7 @@ mod first_sightings_tests {
         name: "Game".into(),
         executables: Box::new([]),
         steam_ids: Box::new([]),
+        epic_ids: Box::new([]),
         aliases: Box::new([]),
       }),
       pid: 1,

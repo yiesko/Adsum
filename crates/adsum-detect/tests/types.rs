@@ -9,6 +9,7 @@ fn detect_source_log_strings() {
   assert_eq!(DetectSource::CwdJoined.as_str(), "cwd-joined");
   assert_eq!(DetectSource::ProtonAutomaton.as_str(), "proton-automaton");
   assert_eq!(DetectSource::SteamAppId.as_str(), "steam-app-id");
+  assert_eq!(DetectSource::EpicAppId.as_str(), "epic-app-id");
   assert_eq!(DetectSource::SteamLibrary.as_str(), "steam-library");
   assert_eq!(DetectSource::ExeStem.as_str(), "exe-stem");
   assert_eq!(DetectSource::Folder.as_str(), "folder");
@@ -17,7 +18,8 @@ use adsum_detect::types::{ScannedEntry, ScannedExe};
 
 /// The immutable generation arrays are boxed: `Box<[T]>` is 16 B where
 /// `Vec<T>` is 24 B and holds no excess capacity. Three fields changed, so
-/// 24 B off every entry, on top of the heap slack a growing `Vec` carries.
+/// 24 B off every entry, and `epic_ids` joined as a fourth boxed slice
+/// (data model, another 16 B per entry); the struct grew by 16 B overall.
 /// Across ~24k entries that is a real, permanent saving worth pinning.
 #[test]
 fn scanned_entry_arrays_are_boxed_not_vec() {
@@ -31,14 +33,17 @@ fn scanned_entry_arrays_are_boxed_not_vec() {
       arguments: None,
     }]),
     steam_ids: Box::new(["42".into()]),
+    epic_ids: Box::new([]),
     aliases: Box::new(["Alt".into()]),
   };
-  // The exact layout: 3 x 16 B rather than 3 x 24 B.
+  // The exact layout: three converted slices are 16 B rather than 24 B;
+  // `epic_ids` is a new 16 B slice on top, so the struct grew by 16 B.
   assert_eq!(std::mem::size_of_val(&entry.executables), 16);
   assert_eq!(std::mem::size_of_val(&entry.steam_ids), 16);
+  assert_eq!(std::mem::size_of_val(&entry.epic_ids), 16);
   assert_eq!(std::mem::size_of_val(&entry.aliases), 16);
   assert!(
-    std::mem::size_of::<ScannedEntry>() <= 80,
+    std::mem::size_of::<ScannedEntry>() <= 96,
     "ScannedEntry grew to {} bytes",
     std::mem::size_of::<ScannedEntry>()
   );

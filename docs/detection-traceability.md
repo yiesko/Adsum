@@ -39,6 +39,7 @@ Sources (`via`), and what each one actually had to satisfy:
 | `cwd-joined` | Bare exe joined with the process working directory |
 | `proton-automaton` | `win32` (Proton/Wine) database entries |
 | `steam-app-id` | Store id (Steam environ, cmdline fallback, custom SKU), and the process runs a declared executable — or the entry declares none |
+| `epic-app-id` | Epic sandbox id from Heroic/Epic launch args, and the process runs a declared executable — or the entry declares none |
 | `steam-library` | Process runs under a known Steam install dir |
 | `exe-stem` | Executable stem equals a game name of at least two words |
 | `folder` | Install folder carries the title |
@@ -61,6 +62,7 @@ Then watch for the reason a candidate was dropped:
 |---|---|
 | `{path} does not name a declared executable of {entry}, skipping` | The automaton matched a declared name inside the path, but that name does not **end** it — `.../hl2.exe.txt` holding `hl2.exe`. Specific evidence the process is not that game |
 | `AppId {appid} does not belong to {argv0} ({entry}), skipping` | Steam handed this process the game's id, but it is not running one of the entry's declared executables. This is the update-time `reaper` |
+| `Epic sandbox id {id} does not belong to {path} ({entry}), skipping` | Heroic/Epic handed this process the game's sandbox id, but it is not running one of the entry's declared executables — the launcher chain inherits the id too |
 | `Argument mismatch for pid {pid}, skipping` | The entry declares a required command-line string the process did not carry |
 | `Steam helper process, skipping: {basename}` | Caught by the helper basename list — a cheap first line, not the corroboration rule |
 | `{path} refused a declared executable match, not answering from its name` | After a refusal, the name and folder heuristics were stood down rather than answering from the install location |

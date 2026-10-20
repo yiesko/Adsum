@@ -58,12 +58,21 @@ finally from the install folder via Steam's own `libraryfolders.vdf` and
 `appmanifest_*.acf` files. Ids in Steam's shortcut range (assigned by Steam
 itself to non-Steam shortcuts) match by name before location.
 
+**Epic sandbox ids.** When no executable matches and the Steam tier yields no
+hit, the scanner also reads the `-epicsandboxid=<id>` argument Heroic /
+Epic put on the command line. It maps to the database's `epic` distributor
+SKU (lowercased for the lookup). The sandbox hides the environment from the
+service, so that argument is the only distributor id those launches can
+show — and the id is corroborated by the process path, exactly like Steam's.
+
 **The id has to be corroborated too.** An id says which game was *launched*;
 it does not say which binary is *running*. Steam hands its own helpers the
 game's environment, and those helpers run during an update. So when the entry
-declares executables, the process must be running one of them — the same
-component-boundary rule as above. An entry with **no** declared executables
-is the exception and stands on the id alone, which is what that tier is for.
+declares executables, the process must be running one of them: the declared
+name must end the path, or — for a short Proton/Heroic launch — its bare
+basename must, when the declared directory is absent. An entry with **no**
+declared executables is the exception and stands on the id alone, which is
+what that tier is for.
 
 **Names.** When no automaton and no id resolve, the scanner falls back to the
 executable stem or install-folder name. This runs for **any** entry, not only

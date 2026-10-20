@@ -26,7 +26,7 @@ pub const MAX_ENTRIES: usize = 100_000;
 pub const MAX_EXECUTABLES_PER_ENTRY: usize = 256;
 /// Alternative titles one entry may carry (each is an aux-map key).
 pub const MAX_ALIASES_PER_ENTRY: usize = 64;
-/// Steam distributor SKUs one entry may carry (sorted-map entries).
+/// Third-party SKUs one entry may carry (sorted-map entries).
 pub const MAX_THIRD_PARTY_SKUS_PER_ENTRY: usize = 128;
 /// Characters in a game name (an aux-map key and a log line).
 pub const MAX_NAME_LEN: usize = 1_024;
@@ -91,6 +91,7 @@ pub fn entry_projection_hash(entry: &DetectableActivity, hasher: &mut impl std::
   hash_entry_identity(entry, hasher);
   hash_entry_exes(entry, hasher);
   hash_entry_steam(entry, hasher);
+  hash_entry_epic(entry, hasher);
   hash_entry_aliases(entry, hasher);
 }
 
@@ -125,8 +126,6 @@ pub fn hash_entry_exes(entry: &DetectableActivity, hasher: &mut impl std::hash::
 }
 
 /// Steam-SKU portion of the entry projection (`0x04` per steam id).
-/// Split out of [`entry_projection_hash`] verbatim: the only SKUs any
-/// matcher reads.
 pub fn hash_entry_steam(entry: &DetectableActivity, hasher: &mut impl std::hash::Hasher) {
   use std::hash::Hash;
   let mut steam = 0usize;
@@ -143,6 +142,27 @@ pub fn hash_entry_steam(entry: &DetectableActivity, hasher: &mut impl std::hash:
     }
   }
   steam.hash(hasher);
+}
+
+/// Epic-SKU portion of the entry projection (`0x06` per epic id).
+pub fn hash_entry_epic(entry: &DetectableActivity, hasher: &mut impl std::hash::Hasher) {
+  use std::hash::Hash;
+  // Hashes the DB's raw spelling: a case-only change rebuilds the bundle
+  // once, which is harmless — lowercasing here would allocate.
+  let mut epic = 0usize;
+  if let Some(skus) = entry.third_party_skus.as_ref() {
+    for sku in skus {
+      if sku.distributor == "epic"
+        && let Some(id) = sku.id.as_ref()
+        && !id.is_empty()
+      {
+        epic += 1;
+        0x06u8.hash(hasher);
+        id.hash(hasher);
+      }
+    }
+  }
+  epic.hash(hasher);
 }
 
 /// Aliases portion of the entry projection (`0x05` per alias).
@@ -207,7 +227,7 @@ pub fn enforce_structure(entries: &[DetectableActivity]) -> adsum_protocol::erro
     let skus = entry.third_party_skus.as_ref().map_or(0, Vec::len);
     if skus > MAX_THIRD_PARTY_SKUS_PER_ENTRY {
       return Err(AdsumError::DatabaseTooLarge(
-        "too many Steam SKUs in one entry",
+        "too many third-party SKUs in one entry",
       ));
     }
   }
@@ -818,7 +838,7 @@ mod trim_parse_tests {
         ),
       ),
       (
-        "too many Steam SKUs in one entry",
+        "too many third-party SKUs in one entry",
         format!(
           r#"[{{"id":"1","name":"G","hook":false,"third_party_skus":[{}]}}]"#,
           (0..MAX_THIRD_PARTY_SKUS_PER_ENTRY + 1)

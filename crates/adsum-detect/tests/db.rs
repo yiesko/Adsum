@@ -208,7 +208,7 @@ fn exclusions_tolerate_garbage() {
 
 use adsum_detect::db::entry_projection_hash;
 use adsum_detect::db::{
-  hash_entry_aliases, hash_entry_exes, hash_entry_identity, hash_entry_steam,
+  hash_entry_aliases, hash_entry_epic, hash_entry_exes, hash_entry_identity, hash_entry_steam,
 };
 
 /// Minimal entry fixture: only match-relevant fields set.
@@ -255,7 +255,28 @@ fn field_hashes_fold_into_entry_hash() {
     hash_entry_identity(entry, &mut folded);
     hash_entry_exes(entry, &mut folded);
     hash_entry_steam(entry, &mut folded);
+    hash_entry_epic(entry, &mut folded);
     hash_entry_aliases(entry, &mut folded);
     assert_eq!(whole.finish(), folded.finish());
   }
+}
+
+/// An Epic-SKU-only database change must move the canonical hash, or the
+/// refresh skips the bundle rebuild and the live `epic_map` stays stale.
+#[test]
+fn an_epic_sku_changes_the_canonical_hash() {
+  let mut with_epic = probe_entry("1", "win32");
+  with_epic.third_party_skus = Some(
+    serde_json::from_value(serde_json::json!([
+      {"distributor": "epic", "id": "B0CD075465C44F87BE3B505AC04A2E46"}
+    ]))
+    .expect("epic SKU parses"),
+  );
+  let base = vec![probe_entry("1", "win32")];
+  let changed = vec![with_epic];
+  assert_ne!(
+    adsum_detect::db::canonical_content_hash(&base),
+    adsum_detect::db::canonical_content_hash(&changed),
+    "an epic-only SKU change must not hash equal to its steam-only twin"
+  );
 }

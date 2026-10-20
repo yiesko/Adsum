@@ -148,8 +148,8 @@ impl OsName {
 /// so storing 24k of them pins ~13MB; the slim form keeps under a third
 /// of that. Converted once per generation at build time from the full
 /// public struct (which stays the API and transport shape) — only
-/// Steam-distributor SKUs survive the trip, since no matcher reads any
-/// other distributor.
+/// Steam and Epic distributor SKUs survive the trip, since only those
+/// matchers read them.
 #[derive(Clone, Debug)]
 pub struct ScannedEntry {
   pub id: Box<str>,
@@ -160,6 +160,9 @@ pub struct ScannedEntry {
   /// which matters across ~24k entries.
   pub executables: Box<[ScannedExe]>,
   pub steam_ids: Box<[Box<str>]>,
+  /// Epic sandbox ids (`epic` distributor SKUs), lowercased: the database
+  /// stores them uppercased, the command line carries them lowercased.
+  pub epic_ids: Box<[Box<str>]>,
   pub aliases: Box<[Box<str>]>,
 }
 
@@ -201,6 +204,20 @@ impl ScannedEntry {
             .into_boxed_slice()
         })
         .unwrap_or_default(),
+      epic_ids: activity
+        .third_party_skus
+        .as_ref()
+        .map(|skus| {
+          skus
+            .iter()
+            .filter(|sku| sku.distributor == "epic")
+            .filter_map(|sku| sku.id.as_deref())
+            .filter(|id| !id.is_empty())
+            .map(|id| id.to_ascii_lowercase().into_boxed_str())
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+        })
+        .unwrap_or_default(),
       aliases: activity
         .aliases
         .clone()
@@ -216,6 +233,22 @@ impl ScannedEntry {
   /// them, so batch conversions (hourly refresh, override appends) skip
   /// ~130k duplicate allocations. Same output as [`from_activity`](ScannedEntry::from_activity).
   pub fn from_owned(activity: DetectableActivity) -> Self {
+    // One sweep over the SKUs moves each id string exactly once: the
+    // steam field keeps its move, the epic ids lowercase theirs.
+    let mut steam: Vec<Box<str>> = Vec::new();
+    let mut epic: Vec<Box<str>> = Vec::new();
+    for sku in activity.third_party_skus.unwrap_or_default() {
+      let Some(id) = sku.id.filter(|id| !id.is_empty()) else {
+        continue;
+      };
+      match sku.distributor.as_str() {
+        "steam" => steam.push(id.into_boxed_str()),
+        // Lowercased here: the database stores `B0CD…`, the command line
+        // carries `b0cd…`.
+        "epic" => epic.push(id.to_ascii_lowercase().into_boxed_str()),
+        _ => {}
+      }
+    }
     Self {
       id: activity.id.into_boxed_str(),
       name: activity.name.into_boxed_str(),
@@ -231,16 +264,8 @@ impl ScannedEntry {
         })
         .collect::<Vec<_>>()
         .into_boxed_slice(),
-      steam_ids: activity
-        .third_party_skus
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|sku| sku.distributor == "steam")
-        .filter_map(|sku| sku.id)
-        .filter(|id| !id.is_empty())
-        .map(|id| id.into_boxed_str())
-        .collect::<Vec<_>>()
-        .into_boxed_slice(),
+      steam_ids: steam.into_boxed_slice(),
+      epic_ids: epic.into_boxed_slice(),
       aliases: activity
         .aliases
         .unwrap_or_default()
@@ -302,8 +327,9 @@ pub fn epoch_ms() -> u64 {
     .unwrap_or(0)
 }
 
-// 3 x Vec (24 B) became 3 x Box<[T]> (16 B): 24 B off per entry.
-const _: () = assert!(std::mem::size_of::<ScannedEntry>() <= 80);
+// 3 x Vec (24 B) became 3 x Box<[T]> (16 B): 24 B off per entry. `epic_ids`
+// joined later as a fourth boxed slice (data model, another 16 B per entry).
+const _: () = assert!(std::mem::size_of::<ScannedEntry>() <= 96);
 
 // `Option<String>` (24 B) became `Option<Box<str>>` (16 B).
 const _: () = assert!(std::mem::size_of::<ScannedExe>() <= 64);

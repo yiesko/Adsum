@@ -454,6 +454,7 @@ mod tests {
     for (source, expected) in [
       (DetectSource::Automaton, "automaton"),
       (DetectSource::SteamAppId, "steam-app-id"),
+      (DetectSource::EpicAppId, "epic-app-id"),
       (DetectSource::ProtonAutomaton, "proton-automaton"),
       (DetectSource::SteamLibrary, "steam-library"),
       (DetectSource::ExeStem, "exe-stem"),

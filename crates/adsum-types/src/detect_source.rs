@@ -21,6 +21,8 @@ pub enum DetectSource {
   ProtonAutomaton,
   /// Authoritative store id (Steam/Proton environ, or cmdline fallback).
   SteamAppId,
+  /// Epic sandbox id from the launch command line (Heroic/Epic).
+  EpicAppId,
   /// Install directory inherited from a known Steam library.
   SteamLibrary,
   /// Executable stem equal to a multi-word game name.
@@ -38,6 +40,7 @@ impl DetectSource {
       Self::CwdJoined => "cwd-joined",
       Self::ProtonAutomaton => "proton-automaton",
       Self::SteamAppId => "steam-app-id",
+      Self::EpicAppId => "epic-app-id",
       Self::SteamLibrary => "steam-library",
       Self::ExeStem => "exe-stem",
       Self::Folder => "folder",
@@ -62,11 +65,12 @@ mod tests {
   /// a rename must be deliberate, with a migration.
   #[test]
   fn wire_identifiers_are_stable() {
-    let expected: [(DetectSource, &str); 7] = [
+    let expected: [(DetectSource, &str); 8] = [
       (DetectSource::Automaton, "automaton"),
       (DetectSource::CwdJoined, "cwd-joined"),
       (DetectSource::ProtonAutomaton, "proton-automaton"),
       (DetectSource::SteamAppId, "steam-app-id"),
+      (DetectSource::EpicAppId, "epic-app-id"),
       (DetectSource::SteamLibrary, "steam-library"),
       (DetectSource::ExeStem, "exe-stem"),
       (DetectSource::Folder, "folder"),

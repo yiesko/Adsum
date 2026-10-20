@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Heroic/Epic sandbox-id detection: Proton games launched by Heroic carry
+  `-epicsandboxid=<id>` on the command line, and the service sandbox hides
+  the environ — so the cmdline is the only distributor id a service can
+  see. GTA V Enhanced is the motivating case.
+
 ## [0.38.1] - 2026-10-15
 
 ### Security

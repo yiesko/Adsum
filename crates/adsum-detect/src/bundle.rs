@@ -150,6 +150,9 @@ pub struct DetectablesBundle {
   /// Lets us detect store games whose DB entry ships empty `executables`.
   /// Sorted vec, not a map: lookups only happen on match misses.
   pub(crate) steam_map: SortedIndex,
+  /// Lowercased Epic sandbox id -> activity index, for Heroic/Epic launches
+  /// whose environ the service sandbox hides.
+  pub(crate) epic_map: SortedIndex,
   /// Normalized game name -> activity index, for the conservative exe-stem
   /// fallback (exact, multi-word names only, e.g. `how to fish`).
   /// Sorted vec, not a map: lookups only happen on match misses.
@@ -176,6 +179,7 @@ impl DetectablesBundle {
       proton_ac: None,
       proton_indexes: Vec::new(),
       steam_map: SortedIndex::default(),
+      epic_map: SortedIndex::default(),
       name_map: SortedIndex::default(),
       name_map_nodot: SortedIndex::default(),
       custom: Arc::from(Vec::new()),
@@ -201,12 +205,12 @@ pub fn name_map_bound(detectables: &[Arc<ScannedEntry>]) -> usize {
       .sum::<usize>()
 }
 
-/// Auxiliary lookup maps over the main DB:
-/// Steam store id -> activity index, normalized game name -> activity index.
-/// Alternative titles (`aliases`) join the name map under the same
-/// conservative gate — exact, multi-word only — so a generic alias can
-/// never collide; canonical names are inserted first and win ties.
-pub fn build_aux_maps(detectables: &[Arc<ScannedEntry>]) -> (SortedIndex, SortedIndex) {
+/// Auxiliary lookup maps: Steam/Epic store id -> activity index, and
+/// normalized game name -> activity index. Aliases join the name map
+/// under the same conservative gate; canonical names win ties.
+pub fn build_aux_maps(
+  detectables: &[Arc<ScannedEntry>],
+) -> (SortedIndex, SortedIndex, SortedIndex) {
   // Steam ids ≤ entries in practice.
   let mut steam: Vec<(Box<str>, usize)> = Vec::with_capacity(detectables.len());
   for (index, activity) in detectables.iter().enumerate() {
@@ -217,18 +221,31 @@ pub fn build_aux_maps(detectables: &[Arc<ScannedEntry>]) -> (SortedIndex, Sorted
     }
   }
 
+  // Epic sandbox ids: ~2.5k dwell in the real database (~1 entry in 8),
+  // so `len / 8` covers the table without over-buying build scratch.
+  let mut epic: Vec<(Box<str>, usize)> = Vec::with_capacity(detectables.len() / 8);
+  for (index, activity) in detectables.iter().enumerate() {
+    for id in &activity.epic_ids {
+      if !id.is_empty() {
+        epic.push((id.clone(), index));
+      }
+    }
+  }
+
   // Names reserve and fill in one place, so the bound cannot drift from
   // what the table can actually hold (see `collect_names`).
-  let (steam_map, name_map) = (
+  let (steam_map, epic_map, name_map) = (
     SortedIndex::build(steam),
+    SortedIndex::build(epic),
     SortedIndex::build(collect_names(detectables)),
   );
   tracing::info!(
-    "[Process Scanner] Aux maps: {} steam ids, {} matchable names",
+    "[Process Scanner] Aux maps: {} steam ids, {} epic ids, {} matchable names",
     steam_map.len(),
+    epic_map.len(),
     name_map.len()
   );
-  (steam_map, name_map)
+  (steam_map, epic_map, name_map)
 }
 
 /// Collect the name map's entries, reserving exactly what they can occupy.
@@ -463,7 +480,7 @@ pub(crate) fn build_bundle(
     ac.memory_usage(),
     proton_ac.as_ref().map(|ac| ac.memory_usage()).unwrap_or(0)
   );
-  let (steam_map, name_map) = build_aux_maps(&detectable);
+  let (steam_map, epic_map, name_map) = build_aux_maps(&detectable);
   let name_map_nodot = undotted_names(&name_map);
   let (custom_ac, custom_idx) = if custom.is_empty() {
     (None, Vec::new())
@@ -479,6 +496,7 @@ pub(crate) fn build_bundle(
     proton_ac,
     proton_indexes: proton_idx,
     steam_map,
+    epic_map,
     name_map,
     name_map_nodot,
     custom,
@@ -611,6 +629,7 @@ mod tests {
         })
         .collect(),
       steam_ids: Box::new([]),
+      epic_ids: Box::new([]),
       aliases: Box::new([]),
     })
   }
@@ -667,6 +686,7 @@ mod tests {
         arguments: None,
       }]),
       steam_ids: Box::new([]),
+      epic_ids: Box::new([]),
       aliases: Box::new([]),
     })
   }
@@ -793,6 +813,7 @@ mod tests {
       name: "how to fish".into(),
       executables: Box::new([]),
       steam_ids: Box::new([]),
+      epic_ids: Box::new([]),
       aliases: (0..aliases)
         .map(|i| format!("alias {i}").into_boxed_str())
         .collect(),
@@ -910,5 +931,60 @@ mod pattern_index_tests {
   #[should_panic(expected = "database too large")]
   fn overflow_pair_asserts_instead_of_truncating() {
     let _ = pattern_index(usize::MAX, usize::MAX);
+  }
+}
+
+/// End-to-end Epic-SKU invariant over the real data path. (Inline: the
+/// fixtures need `ScannedEntry::from_owned` plus `build_aux_maps`.)
+#[cfg(test)]
+mod epic_sku_tests {
+  use super::*;
+
+  /// The DB stores the Epic id uppercase, the cmdline carries it
+  /// lowercase: pinned so `from_owned` lowercases it and `epic_map`
+  /// wires the lowered id to the right activity index.
+  #[test]
+  fn an_epic_sku_lowercases_into_the_map() {
+    let activity: DetectableActivity = serde_json::from_value(serde_json::json!({
+      "id": "1421192030440263791",
+      "name": "Grand Theft Auto V Enhanced",
+      "hook": false,
+      "executables": [{
+        "name": "grand theft auto v enhanced\\gta5_enhanced.exe",
+        "os": "win32",
+        "is_launcher": false
+      }],
+      "third_party_skus": [
+        {"distributor": "epic", "id": "B0CD075465C44F87BE3B505AC04A2E46"}
+      ],
+      "aliases": []
+    }))
+    .expect("fixture parses");
+    let entry = Arc::new(ScannedEntry::from_owned(activity));
+    assert_eq!(entry.epic_ids.len(), 1);
+    assert_eq!(
+      entry.epic_ids[0].as_ref(),
+      "b0cd075465c44f87be3b505ac04a2e46"
+    );
+    let (_, epic, _) = build_aux_maps(&[entry]);
+    assert_eq!(epic.get("b0cd075465c44f87be3b505ac04a2e46"), Some(&0));
+  }
+
+  /// A Steam-only SKU contributes nothing to the epic map.
+  #[test]
+  fn a_steam_sku_leaves_the_epic_map_empty() {
+    let activity: DetectableActivity = serde_json::from_value(serde_json::json!({
+      "id": "1",
+      "name": "Steam Game",
+      "hook": false,
+      "executables": [{"name": "game.exe", "os": "win32", "is_launcher": false}],
+      "third_party_skus": [{"distributor": "steam", "id": "3240220"}],
+      "aliases": []
+    }))
+    .expect("fixture parses");
+    let entry = Arc::new(ScannedEntry::from_owned(activity));
+    assert!(entry.epic_ids.is_empty());
+    let (_, epic, _) = build_aux_maps(&[Arc::clone(&entry)]);
+    assert_eq!(epic.get("3240220"), None);
   }
 }
