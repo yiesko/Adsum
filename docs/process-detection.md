@@ -61,7 +61,9 @@ itself to non-Steam shortcuts) match by name before location.
 **Epic sandbox ids.** When no executable matches and the Steam tier yields no
 hit, the scanner also reads the `-epicsandboxid=<id>` argument Heroic /
 Epic put on the command line. It maps to the database's `epic` distributor
-SKU (lowercased for the lookup). The sandbox hides the environment from the
+SKU (lowercased for the lookup). The argument is Epic's documented launch
+contract, and Heroic/Legendary pass it in practice; see [Sources](#sources).
+The sandbox hides the environment from the
 service, so that argument is the only distributor id those launches can
 show — and the id is corroborated by the process path, exactly like Steam's.
 
@@ -216,6 +218,27 @@ The library exposes the same capability through
 `--list-detected` runs a single scan and exits. Staged overrides and the
 ignore-list both apply, so the output is exactly what the daemon would
 publish.
+
+## Sources
+
+- Epic's [Testing Guide](https://dev.epicgames.com/docs/epic-games-store/testing-guide)
+  documents the launch contract behind `-epicsandboxid`, and its [EOS Auth
+  reference](https://dev.epicgames.com/docs/epic-online-services/accounts-and-social/eos-epic-account-services/auth-interface/auth-reference)
+  covers the sandbox id.
+- Heroic passes it in practice: its [public
+  log](https://github.com/Heroic-Games-Launcher/HeroicGamesLauncher/issues/4273)
+  shows the argument with `HEROIC_APP_RUNNER=legendary`, and the Legendary
+  0.20.25 package
+  [changelog](https://community.chocolatey.org/packages/legendary/0.20.25)
+  records the parameter.
+- The database stores the ids as `third_party_skus` entries with
+  `distributor: "epic"`; the community-maintained [Userdoccers Application
+  SKU object](https://docs.discord.food/resources/game#application-sku-object)
+  defines that shape.
+- The ids are real, not fixtures: the GTA V Enhanced sandbox
+  [`b0cd075465c44f87be3b505ac04a2e46`](https://egdata.app/sandboxes/b0cd075465c44f87be3b505ac04a2e46)
+  is on egdata (a community mirror), and the Among Us Store URL carries
+  [`epic_gameId=33956bcb55d4452d8c47e16b94e294bd`](https://store.epicgames.com/p/among-us?epic_gameId=33956bcb55d4452d8c47e16b94e294bd).
 
 ## See also
 
