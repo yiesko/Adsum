@@ -5,7 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.39.0] - 2026-10-21
+
+### Breaking
+- Renamed the project from rsRPC to Adsum. The binary is now `adsum`, the
+  systemd service is `adsum.service`, environment variables use the
+  `ADSUM_*` prefix, and config/cache moved to `~/.config/adsum` and
+  `~/.cache/adsum`. Existing 0.38.1 installations need a one-time manual
+  migration: the old updater only looks for `rsrpc-cli-*` assets and
+  cannot update across the rename.
 
 ### Added
 - Heroic/Epic sandbox-id detection: Proton games launched by Heroic carry
@@ -17,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `store_cache/legendary_library.json` maps it to the same `epic`
   namespace the database stores; the sandbox id remains the first choice.
   The config root can be overridden exclusively with `ADSUM_HEROIC_ROOT`.
+
+### Fixed
+- IPC `SET_ACTIVITY` publications with a missing or zero PID are now
+  rejected before any state change, instead of leaving an orphan
+  presence downstream.
+- An absent `activity` field in an activity update is now rejected
+  instead of being treated as a clear; only an explicit null clears the
+  presence.
 
 ### Security
 - Bumped `rustls-webpki` to 0.103.16 and `webpki-roots` to 1.0.10 in all
@@ -856,7 +872,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Stuck presence after game close.
 
-[Unreleased]: https://github.com/yiesko/adsum/compare/v0.38.0...HEAD
+[Unreleased]: https://github.com/yiesko/adsum/compare/v0.39.0...HEAD
+[0.39.0]: https://github.com/yiesko/adsum/releases/tag/v0.39.0
+[0.38.1]: https://github.com/yiesko/adsum/releases/tag/v0.38.1
 [0.38.0]: https://github.com/yiesko/adsum/releases/tag/v0.38.0
 [0.36.1]: https://github.com/yiesko/adsum/releases/tag/v0.36.1
 [0.36.0]: https://github.com/yiesko/adsum/releases/tag/v0.36.0

@@ -14,7 +14,7 @@ Adsum implements Discord-compatible local RPC endpoints for supported alternativ
 
 ## Features
 
-- **Automatic game detection** — detects native games, Proton/Wine games, and non-Steam shortcuts using executable paths, Steam AppIDs, and fallback matching.
+- **Automatic game detection** — detects native games, Proton/Wine games, Steam titles, Epic/Heroic titles, and non-Steam shortcuts using executable paths, Steam AppIDs, Epic sandbox IDs, and fallback matching.
 - **Fewer misleading detections** — when an entry declares executables, the detected process must match a declared game executable; a Steam AppID alone is not enough for those entries.
 - **Discord-compatible transports** — accepts game RPC over local IPC and WebSocket endpoints.
 - **Local bridge** — publishes activity to WebSocket clients as JSON on port `1337` and MessagePack on port `1338` by default.
@@ -109,7 +109,7 @@ Logs go to stderr. `RUST_LOG` overrides the log level; when investigating detect
 
 ```toml
 [dependencies]
-adsum-core = { git = "https://github.com/yiesko/adsum", tag = "v0.38.1" }
+adsum-core = { git = "https://github.com/yiesko/adsum", tag = "v0.39.0" }
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal"] }
 ```
 
@@ -153,7 +153,7 @@ cargo run --manifest-path tools/updater/Cargo.toml
 ## Documentation
 
 - [CLI options](docs/cli-options.md) — flags and environment variables
-- [Process detection](docs/process-detection.md) — executable matching, Steam IDs, Proton/Wine and overrides
+- [Process detection](docs/process-detection.md) — executable matching, Steam and Epic IDs, Proton/Wine and overrides
 - [Detection traceability](docs/detection-traceability.md) — detection sources, latency and clear reasons
 - [Protocol](docs/protocol.md) — IPC/WebSocket messages and error codes
 - [Web clients](docs/web-client.md) — browser, Vencord and Node clients

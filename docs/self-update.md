@@ -15,7 +15,7 @@ disk; the swap happens the next time the binary starts.
 
 ```bash
 ./adsum --check-update
-# [adsum] update available: v0.38.1 (release v0.38.1); run with --update to stage it
+# [adsum] update available: v0.39.0 (release v0.39.0); run with --update to stage it
 # (exit code 2; exit code 0 means you are current)
 
 ./adsum --update --yes     # stage now, apply on next start
