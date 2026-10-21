@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   namespace the database stores; the sandbox id remains the first choice.
   The config root can be overridden exclusively with `ADSUM_HEROIC_ROOT`.
 
+### Security
+- Bumped `rustls-webpki` to 0.103.16 and `webpki-roots` to 1.0.10 in all
+  three lockfiles; RUSTSEC-2026-0382 (distrusted intermediates accepted)
+  and RUSTSEC-2026-0381 (distrusted emSign roots bundled) are fixed in
+  those versions. Both crates are reached only through `ureq`/`rustls`,
+  the HTTPS client.
+
 ## [0.38.1] - 2026-10-15
 
 ### Security
