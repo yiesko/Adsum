@@ -58,14 +58,25 @@ finally from the install folder via Steam's own `libraryfolders.vdf` and
 `appmanifest_*.acf` files. Ids in Steam's shortcut range (assigned by Steam
 itself to non-Steam shortcuts) match by name before location.
 
-**Epic sandbox ids.** When no executable matches and the Steam tier yields no
-hit, the scanner also reads the `-epicsandboxid=<id>` argument Heroic /
-Epic put on the command line. It maps to the database's `epic` distributor
-SKU (lowercased for the lookup). The argument is Epic's documented launch
-contract, and Heroic/Legendary pass it in practice; see [Sources](#sources).
-The sandbox hides the environment from the
-service, so that argument is the only distributor id those launches can
-show — and the id is corroborated by the process path, exactly like Steam's.
+**Epic sandbox ids and app names.** When no executable matches and the
+Steam tier yields no hit, the scanner also reads the `-epicsandboxid=<id>`
+argument Heroic / Epic put on the command line. It maps to the database's
+`epic` distributor SKU (lowercased for the lookup). The argument is Epic's
+documented launch contract, and Heroic/Legendary pass it in practice; see
+[Sources](#sources).
+The sandbox hides the environment from the service, so the command line is
+the distributor evidence those launches can show.
+
+Older Legendary releases (before 0.20.25) omit `-epicsandboxid` and pass
+only `-epicapp=<app name>`. The scanner resolves that name to the same
+`epic` SKU through Heroic's cached `store_cache/legendary_library.json`
+(`library[].app_name` → `library[].namespace`). On Linux, the file is read
+from `$ADSUM_HEROIC_ROOT` when set (exclusive), otherwise from
+`$XDG_CONFIG_HOME/heroic`, `$HOME/.config/heroic`, or the Flatpak
+`$HOME/.var/app/com.heroicgameslauncher.hgl/config/heroic`; it is re-read
+only when its mtime or size moves. The sandbox id stays the first choice:
+the app-name lookup runs only when it yields no hit. Either way the id is
+corroborated by the process path, exactly like Steam's.
 
 **The id has to be corroborated too.** An id says which game was *launched*;
 it does not say which binary is *running*. Steam hands its own helpers the
@@ -235,6 +246,12 @@ publish.
   `distributor: "epic"`; the community-maintained [Userdoccers Application
   SKU object](https://docs.discord.food/resources/game#application-sku-object)
   defines that shape.
+- Heroic keeps its per-store caches under its config root; community
+  launchers parse the Legendary cache at
+  `store_cache/legendary_library.json` — see Ludusavi's
+  [Heroic/Legendary loader](https://github.com/mtkennerly/ludusavi/blob/master/src/scan/launchers/heroic/legendary.rs).
+  The Flatpak build is
+  [com.heroicgameslauncher.hgl](https://flathub.org/apps/com.heroicgameslauncher.hgl).
 - The ids are real, not fixtures: the GTA V Enhanced sandbox
   [`b0cd075465c44f87be3b505ac04a2e46`](https://egdata.app/sandboxes/b0cd075465c44f87be3b505ac04a2e46)
   is on egdata (a community mirror), and the Among Us Store URL carries

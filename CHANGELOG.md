@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `-epicsandboxid=<id>` on the command line, and the service sandbox hides
   the environ — so the cmdline is the only distributor id a service can
   see. GTA V Enhanced is the motivating case.
+- Epic `-epicapp` fallback: older Legendary releases (before 0.20.25) omit
+  the sandbox id and pass only the app name. Heroic's cached
+  `store_cache/legendary_library.json` maps it to the same `epic`
+  namespace the database stores; the sandbox id remains the first choice.
+  The config root can be overridden exclusively with `ADSUM_HEROIC_ROOT`.
 
 ## [0.38.1] - 2026-10-15
 

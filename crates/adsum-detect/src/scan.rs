@@ -1,8 +1,8 @@
 //! Classification: one process in, an optional hit out.
 //!
 //! Cheapest source first (native AC, cwd-joined bare exe, authoritative
-//! Steam AppId, Epic sandbox id, Proton AC, install-dir prefix,
-//! stem/folder heuristics).
+//! Steam AppId, Epic sandbox id or its `-epicapp` fallback, Proton AC,
+//! install-dir prefix, stem/folder heuristics).
 //! Lazy `/proc` reads happen only on misses/hits — never for the table.
 
 use std::collections::HashSet;
@@ -314,37 +314,74 @@ pub fn app_id_from_args(arguments: Option<&str>) -> Option<&str> {
   None
 }
 
-/// Epic sandbox id (`-epicsandboxid=…`) from a process command line, the
-/// distributor evidence Heroic/Epic leaves when the sandbox hides environ.
-pub fn epic_id_from_args(arguments: Option<&str>) -> Option<&str> {
-  const NEEDLE: &[u8] = b"-epicsandboxid=";
-  let args = arguments?;
+/// Both Epic launch tokens found in one pass over the command line.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct EpicArgs<'a> {
+  sandbox_id: Option<&'a str>,
+  app_name: Option<&'a str>,
+}
+
+/// Find `-epicsandboxid=` and `-epicapp=` in one pass: each flag must start
+/// an argument (line start or after whitespace) and its value runs to the
+/// next whitespace; empty values are ignored.
+fn epic_launch_args(arguments: Option<&str>) -> EpicArgs<'_> {
+  const SANDBOX: &[u8] = b"-epicsandboxid=";
+  const APP: &[u8] = b"-epicapp=";
+  let Some(args) = arguments else {
+    return EpicArgs::default();
+  };
   let bytes = args.as_bytes();
-  // Whole-string needle search, matched ASCII-case-insensitively in place:
-  // folding (and so allocating) the entire command line would pay for
-  // every scanned process just to find a token that is almost never there.
-  for (at, window) in bytes.windows(NEEDLE.len()).enumerate() {
-    if window[0] != b'-' || !window[1..].eq_ignore_ascii_case(&NEEDLE[1..]) {
+  let mut found = EpicArgs::default();
+  let mut at = 0;
+  while at < bytes.len() {
+    // Token boundary: the `-` has to start an argument (`x-epicapp=` is
+    // the tail of some other flag, not this one).
+    if bytes[at] != b'-' || (at != 0 && !bytes[at - 1].is_ascii_whitespace()) {
+      at += 1;
       continue;
     }
-    // Token boundary: the `-` has to start an argument (`x-epicsandboxid=`
-    // is the tail of some other flag, not this one).
-    if at != 0 && !bytes[at - 1].is_ascii_whitespace() {
-      continue;
-    }
+    let rest = &bytes[at..];
+    let (needle, is_sandbox) =
+      if rest.len() >= SANDBOX.len() && rest[..SANDBOX.len()].eq_ignore_ascii_case(SANDBOX) {
+        (SANDBOX, true)
+      } else if rest.len() >= APP.len() && rest[..APP.len()].eq_ignore_ascii_case(APP) {
+        (APP, false)
+      } else {
+        at += 1;
+        continue;
+      };
     // Borrow the value run instead of collecting it: the members are
     // single-byte ASCII, so the byte count is always a char boundary.
-    let value_at = at + NEEDLE.len();
-    let tail = &bytes[value_at..];
-    let len = tail
+    let value_at = at + needle.len();
+    let len = bytes[value_at..]
       .iter()
       .take_while(|byte| !byte.is_ascii_whitespace())
       .count();
-    if len > 0 {
-      return Some(&args[value_at..value_at + len]);
+    if len == 0 {
+      at = value_at;
+      continue;
     }
+    let value = &args[value_at..value_at + len];
+    if is_sandbox {
+      found.sandbox_id.get_or_insert(value);
+    } else {
+      found.app_name.get_or_insert(value);
+    }
+    at = value_at + len;
   }
-  None
+  found
+}
+
+/// Epic sandbox id (`-epicsandboxid=…`) from a process command line, the
+/// distributor evidence Heroic/Epic leaves when the sandbox hides environ.
+pub fn epic_id_from_args(arguments: Option<&str>) -> Option<&str> {
+  epic_launch_args(arguments).sandbox_id
+}
+
+/// Epic app name (`-epicapp=…`) from a process command line: older
+/// Legendary releases pass it without a sandbox id.
+pub fn epic_app_from_args(arguments: Option<&str>) -> Option<&str> {
+  epic_launch_args(arguments).app_name
 }
 
 /// Whether a process is currently suspended (`T` state: SIGSTOP'd, e.g. a
@@ -1018,8 +1055,9 @@ pub fn match_steam_id(
   None
 }
 
-/// Resolve an Epic sandbox id to an entry, corroborated by the process
-/// path; mirrors [`match_steam_id`] and runs before the fuzzy heuristics.
+/// Resolve an Epic namespace (sandbox id or Heroic app-name mapping) to an
+/// entry, corroborated by the process path; mirrors [`match_steam_id`] and
+/// runs before the fuzzy heuristics.
 pub fn match_epic_id(
   pid: u64,
   stat: &mut String,
@@ -1036,16 +1074,13 @@ pub fn match_epic_id(
       // it declares: named in the log, because a rejected hit is
       // otherwise indistinguishable from a miss.
       tracing::debug!(
-        "[Process Scanner] Epic sandbox id {epic_id} does not belong to {path} ({name}), skipping",
+        "[Process Scanner] Epic id {epic_id} does not belong to {path} ({name}), skipping",
         path = process_path,
         name = obj.name,
       );
       return None;
     }
-    tracing::debug!(
-      "[Process Scanner] Epic match: {} (sandbox {epic_id})",
-      obj.name
-    );
+    tracing::debug!("[Process Scanner] Epic match: {} (id {epic_id})", obj.name);
     return live_or_none(obj, pid, DetectSource::EpicAppId, stat);
   }
   // Custom override carrying a bare epic SKU: searched linearly
@@ -1054,14 +1089,14 @@ pub fn match_epic_id(
     if obj.epic_ids.iter().any(|id| id.as_ref() == epic_id) {
       if !argv_names_an_executable(process_path, obj) {
         tracing::debug!(
-          "[Process Scanner] Epic sandbox id {epic_id} does not belong to {path} ({name}, custom), skipping",
+          "[Process Scanner] Epic id {epic_id} does not belong to {path} ({name}, custom), skipping",
           path = process_path,
           name = obj.name,
         );
         continue;
       }
       tracing::debug!(
-        "[Process Scanner] Epic match (custom): {} (sandbox {epic_id})",
+        "[Process Scanner] Epic match (custom): {} (id {epic_id})",
         obj.name
       );
       return live_or_none(obj, pid, DetectSource::EpicAppId, stat);
@@ -1319,14 +1354,14 @@ impl ProcessServer {
   }
 
   /// Classify one enumerated process, cheapest source first:
-  /// native AC, bare-exe+cwd, authoritative Steam AppId, Epic sandbox id,
-  /// Proton (`win32`)
-  /// AC, Steam install-dir, then the stem/folder heuristics — except when
-  /// the launcher supplied a shortcut-range AppId (Steam-assigned
-  /// non-Steam id): then stem/folder run before the install-dir. Lazy `/proc` reads (cwd,
-  /// environ, stat) happen only on misses/hits respectively — never for
-  /// the whole table. Extracted from the scan loop for reuse and testing;
-  /// the loop itself just maps over it.
+  /// native AC, bare-exe+cwd, authoritative Steam AppId, Epic sandbox id
+  /// (or its `-epicapp` fallback), Proton (`win32`) AC, Steam install-dir,
+  /// then the stem/folder heuristics — except when the launcher supplied a
+  /// shortcut-range AppId (Steam-assigned non-Steam id): then stem/folder
+  /// run before the install-dir. Lazy `/proc` reads (cwd, environ, stat)
+  /// happen only on misses/hits respectively — never for the whole table.
+  /// Extracted from the scan loop for reuse and testing; the loop itself
+  /// just maps over it.
   #[hotpath::measure]
   pub fn match_process(
     &self,
@@ -1491,24 +1526,47 @@ impl ProcessServer {
         ) {
           return Some(hit);
         }
-        // Epic sandbox id: Heroic/Epic puts it on the cmdline, and the
-        // service sandbox hides environ, so it is the only store id those
-        // games can show. Usually already lowercase: borrow it, fold on demand.
-        if let Some(id) = epic_id_from_args(process.arguments.as_deref()) {
-          let lowered_id = if id.bytes().any(|b| b.is_ascii_uppercase()) {
+        // Epic launch tokens in one pass: the sandbox id is the first
+        // choice; older Legendary (<0.20.25) passes only `-epicapp`, which
+        // Heroic's cached library maps to the same namespace the database
+        // stores. Usually already lowercase: borrow it, fold on demand.
+        let epic = epic_launch_args(process.arguments.as_deref());
+        let sandbox_id: Option<std::borrow::Cow<'_, str>> = epic.sandbox_id.map(|id| {
+          if id.bytes().any(|b| b.is_ascii_uppercase()) {
             std::borrow::Cow::Owned(id.to_ascii_lowercase())
           } else {
             std::borrow::Cow::Borrowed(id)
-          };
-          if let Some(hit) = match_epic_id(
+          }
+        });
+        if let Some(id) = sandbox_id.as_deref()
+          && let Some(hit) = match_epic_id(
             process.pid,
             &mut scratch.match_scratch.stat,
-            lowered_id.as_ref(),
+            id,
             lowered,
             &bundle.epic_map,
             &bundle.list,
             &bundle.custom,
-          ) {
+          )
+        {
+          return Some(hit);
+        }
+        // App-name fallback: the read lock is held only across the lookup
+        // and the match it feeds, never across the rest of the scan.
+        if let Some(app_name) = epic.app_name {
+          let heroic = self.heroic_apps.read().unwrap_or_else(|e| e.into_inner());
+          if let Some(namespace) = heroic.namespace_for(app_name)
+            && sandbox_id.as_deref() != Some(namespace)
+            && let Some(hit) = match_epic_id(
+              process.pid,
+              &mut scratch.match_scratch.stat,
+              namespace,
+              lowered,
+              &bundle.epic_map,
+              &bundle.list,
+              &bundle.custom,
+            )
+          {
             return Some(hit);
           }
         }
@@ -2361,6 +2419,47 @@ mod tick2_tests {
     assert_eq!(epic_id_from_args(Some("-epicsandboxid= -verbose")), None);
     // Glued to a preceding word: not a token start.
     assert_eq!(epic_id_from_args(Some("launche-epicsandboxid=b0cd")), None);
+  }
+
+  /// One pass finds both Epic tokens; the public wrappers still expose each.
+  #[test]
+  fn epic_launch_args_reads_both_tokens_in_one_pass() {
+    let args = epic_launch_args(Some("game.exe -epicsandboxid=B0CD -epicapp=APP -quiet"));
+    assert_eq!(args.sandbox_id, Some("B0CD"));
+    assert_eq!(args.app_name, Some("APP"));
+    // Order on the command line does not matter.
+    let reversed = epic_launch_args(Some("-EpicApp=APP -EpicSandboxId=B0CD"));
+    assert_eq!(reversed.sandbox_id, Some("B0CD"));
+    assert_eq!(reversed.app_name, Some("APP"));
+    assert_eq!(epic_launch_args(None), EpicArgs::default());
+  }
+
+  /// The Epic app-name parser: same token rules as the sandbox id, its own
+  /// `-epicapp=` token, empty values and glued tokens rejected.
+  #[test]
+  fn epic_app_from_args_finds_the_token() {
+    let app = "8769e24080ea413b8ebca3f1b8c50951";
+    assert_eq!(
+      epic_app_from_args(Some(&format!("game.exe -epicapp={app}"))),
+      Some(app)
+    );
+    // Token matched case-insensitively; the value lands verbatim.
+    assert_eq!(
+      epic_app_from_args(Some("-EpicApp=8769E24080EA413B8EBCA3F1B8C50951")),
+      Some("8769E24080EA413B8EBCA3F1B8C50951")
+    );
+    // Value terminated by a space.
+    assert_eq!(
+      epic_app_from_args(Some("-epicapp=8769e240 -quiet")),
+      Some("8769e240")
+    );
+    // No token at all, and no arguments.
+    assert_eq!(epic_app_from_args(Some("-epicsandboxid=b0cd")), None);
+    assert_eq!(epic_app_from_args(None), None);
+    // Empty value: reject.
+    assert_eq!(epic_app_from_args(Some("-epicapp= -verbose")), None);
+    // Glued to a preceding word: not a token start.
+    assert_eq!(epic_app_from_args(Some("x-epicapp=8769e240")), None);
   }
 
   /// Epic sandbox id hit: carries its provenance. (Inline: the fixture

@@ -21,7 +21,8 @@ pub enum DetectSource {
   ProtonAutomaton,
   /// Authoritative store id (Steam/Proton environ, or cmdline fallback).
   SteamAppId,
-  /// Epic sandbox id from the launch command line (Heroic/Epic).
+  /// Epic sandbox id from the launch command line, or an `-epicapp` name
+  /// resolved through Heroic's library to the same namespace (Heroic/Epic).
   EpicAppId,
   /// Install directory inherited from a known Steam library.
   SteamLibrary,

@@ -135,6 +135,7 @@ These have no command-line flag:
 | `ADSUM_OTA_DIR` | Where updates are staged (default `~/.cache/adsum/ota/`). |
 | `ADSUM_OTA_APPLIED` | **Internal.** Set by Adsum on the re-executed process so a staged update applies at most once per boot chain. Setting it yourself makes the next start skip the pending update and turns `--rollback` into a no-op — leave it alone. |
 | `ADSUM_STEAM_ROOT` | Point at a specific Steam install directory. |
+| `ADSUM_HEROIC_ROOT` | Point at a specific Heroic config directory for `-epicapp` resolution. **Exclusive**: when set, the XDG/HOME/Flatpak roots are not consulted. |
 | `ADSUM_STEAM_LIBRARIES` | Point at specific Steam library folders (`:`-separated). |
 | `RUST_LOG` | Full `tracing` filter; overrides the `--debug`/`ADSUM_DEBUG` choice (see below). |
 

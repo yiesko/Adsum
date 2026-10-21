@@ -10,6 +10,7 @@ pub mod bundle;
 pub mod cache;
 mod database;
 pub mod db;
+mod heroic;
 pub mod proc_start;
 pub mod refresh;
 pub mod runtime;

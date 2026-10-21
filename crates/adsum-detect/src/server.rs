@@ -18,6 +18,7 @@ use sysinfo::System;
 use crate::bundle::{DetectablesBundle, initial_bundle};
 use crate::cache::AppIdMemo;
 use crate::db::{DetectableActivity, Exclusions};
+use crate::heroic::HeroicApps;
 use crate::refresh::RefreshConfig;
 use crate::types::{ProcessDetectedEvent, ProcessEventListeners};
 
@@ -102,6 +103,10 @@ pub struct ProcessServer {
   /// Steam install-dir -> AppId (VDF provider): refreshed once per scan
   /// tick when a `libraryfolders.vdf` changed, consulted on path misses.
   pub(crate) steam_libraries: Arc<RwLock<SteamLibraries>>,
+  /// Heroic app name -> Epic namespace (Library provider): refreshed once
+  /// per scan tick when the cached Legendary library changed, consulted
+  /// when the sandbox id does not resolve.
+  pub(crate) heroic_apps: Arc<RwLock<HeroicApps>>,
   /// Application IDs never published by the scan thread (coexistence with
   /// a richer publisher elsewhere). Filtered right after the scan, so an
   /// ignored-only result behaves exactly like no game: null event, clear.
@@ -211,6 +216,7 @@ impl Clone for ProcessServer {
       last_scan: Arc::clone(&self.last_scan),
       exclusions: Arc::clone(&self.exclusions),
       steam_libraries: Arc::clone(&self.steam_libraries),
+      heroic_apps: Arc::clone(&self.heroic_apps),
       ignored_ids: self.ignored_ids.clone(),
       enable_proc_events: self.enable_proc_events,
       watcher_live: Arc::clone(&self.watcher_live),
@@ -273,6 +279,7 @@ impl ProcessServer {
       watch_gauge: Arc::new(Mutex::new(None)),
       exclusions: Arc::new(RwLock::new(Exclusions::default())),
       steam_libraries: Arc::new(RwLock::new(SteamLibraries::discover())),
+      heroic_apps: Arc::new(RwLock::new(HeroicApps::discover())),
       detected_pids: Arc::new(Mutex::new(FxHashSet::default())),
       appid_cache: Arc::new(Mutex::new(FxHashMap::default())),
       scan_wake: Arc::new(Mutex::new(None)),

@@ -222,6 +222,10 @@ impl ProcessServer {
     // Steam generation marker: one stat per watched libraryfolders.vdf;
     // the parse itself runs only when something actually changed.
     self.refresh_steam_libraries();
+    // Heroic's cached Legendary library: same shape; one stat per tick once
+    // the path is known (cheap discovery probes while absent), parsed only
+    // when it changes (feeds the `-epicapp` fallback).
+    self.refresh_heroic_apps();
 
     // Drop memoized AppIds of dead pids (pid reuse must never serve a
     // stale id): one set build + retain per tick, replacing hundreds of
