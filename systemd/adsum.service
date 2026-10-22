@@ -34,10 +34,11 @@ RestartSec=5s
 TimeoutStopSec=15s
 KillMode=mixed
 NoNewPrivileges=yes
-# The IPC aliases symlink discord-ipc-{n} into host /tmp (games probing
-# the last official dir): ProtectSystem=strict mounts /tmp read-only, so
-# the host path is bound back in writable. The daemon writes nothing else
-# there (cache -> ~/.cache, sockets -> %t).
+# Host /tmp receives the IPC alias symlinks discord-ipc-{n} (games probing
+# the last official dir), their ownership markers, and the private fallback
+# socket under /tmp/.adsum-ipc-<euid> when the runtime candidates are
+# unusable. ProtectSystem=strict mounts /tmp read-only, so the host path is
+# bound back in writable; the cache still goes to ~/.cache.
 BindPaths=/tmp
 ProtectSystem=strict
 ProtectHome=read-only

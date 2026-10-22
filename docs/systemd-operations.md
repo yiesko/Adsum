@@ -84,15 +84,16 @@ systemctl --user restart adsum.service # service picks up the restored binary
 
 ## 4. Known gotchas
 
-- **Restart with a busy IPC socket**: normal. Adsum probes each index
-  with a bounded connect, not with a protocol exchange: `Active` (a
-  listener accepted, even a silent one) and `Unknown` (the probe could not
-  reach a safe verdict) keep the path, and Adsum binds the next index. Only
-  `Stale` (the socket refuses connections) may be reclaimed, and only after
-  the entry is rechecked as the same socket device/inode immediately before
-  unlink. There is no startup sweep, so a live foreign socket survives a
-  service restart; regular files, directories, symlinks, and foreign
-  sockets are preserved too.
+- **Restart with a busy IPC socket**: normal. Before binding each index,
+  Adsum probes it with `lstat` and a bounded connect, not with a protocol
+  exchange: `Active` (a listener accepted, even a silent one), `Unknown`
+  (inconclusive), and `NotSocket` (file, directory, or symlink) entries are
+  preserved, and Adsum binds the next index. Only `Stale` (the socket
+  refuses connections) may be reclaimed, and only after the entry is
+  rechecked as the same socket device/inode immediately before unlink.
+  There is no unconditional sweep of all `discord-ipc-*` names; a `Stale`
+  socket may be reclaimed by this per-index check even if another service
+  left it.
 - **Graceful stop**: `systemctl --user stop` sends `SIGTERM`, which now
   runs the same graceful teardown as Ctrl+C. It removes only the bound
   socket, the aliases Adsum owns (validated by their markers), and those

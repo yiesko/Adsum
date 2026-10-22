@@ -64,10 +64,11 @@ RestartSec=5s
 TimeoutStopSec=15s
 KillMode=mixed
 NoNewPrivileges=yes
-# The IPC aliases symlink discord-ipc-{n} into host /tmp (games probing
-# the last official dir): ProtectSystem=strict mounts /tmp read-only, so
-# the host path is bound back in writable. The daemon writes nothing else
-# there (cache -> ~/.cache, sockets -> %t).
+# Host /tmp receives the IPC alias symlinks discord-ipc-{n} (games probing
+# the last official dir), their ownership markers, and the private fallback
+# socket under /tmp/.adsum-ipc-<euid> when the runtime candidates are
+# unusable. ProtectSystem=strict mounts /tmp read-only, so the host path is
+# bound back in writable; the cache still goes to ~/.cache.
 BindPaths=/tmp
 ProtectSystem=strict
 ProtectHome=read-only
@@ -127,12 +128,13 @@ What matters:
   username.
 - **`default.target`**: the service starts at login (add linger below to
   start at boot without a graphical login).
-- **Socket cleanup**: stale sockets are probed and reclaimed by the IPC
-  transport; foreign or unknown entries are preserved; valid orphan markers
-  are recovered before bind. `SIGTERM` and Ctrl+C run the same graceful
-  shutdown, which removes only the bound socket, the aliases Adsum owns, and
-  their markers. `TimeoutStopSec=15s` covers the 2s accept wait, the 5s
-  connection drain, and teardown/cleanup.
+- **Socket cleanup**: the IPC transport probes each index before binding;
+  `Active`, `Unknown`, and `NotSocket` entries are preserved, while a
+  `Stale` socket may be reclaimed after the identity check. Valid orphan
+  markers are recovered before bind. `SIGTERM` and Ctrl+C run the same
+  graceful shutdown, which removes only the bound socket, the aliases Adsum
+  owns, and their markers. `TimeoutStopSec=15s` covers the 2s accept wait,
+  the 5s connection drain, and teardown/cleanup.
 - **Sandboxing**: `ProtectHome=read-only` plus the writable exceptions:
   `CacheDirectory=` creates the cache directory (XDG default
   `~/.cache/adsum`) before the sandbox mounts; `ReadWritePaths` adds the

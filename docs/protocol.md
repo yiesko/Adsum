@@ -57,21 +57,24 @@ Shared temp roots (`/tmp`, `/var/tmp`) are filtered out of the bind list,
 so a candidate that resolves to either is skipped. `<approved-temp>` is
 `/tmp`, then `/var/tmp`, and the first root where the fallback can be
 created or validated wins; the fallback directory is created with mode
-`0700`. The preferred Flatpak directory is tried first and is created only
-when `$XDG_RUNTIME_DIR` is a valid private directory: the runtime base,
-`app/`, and `app/com.discordapp.Discord/` are created as real directories
-without following symlinks. If it cannot be used, the next candidate is
-tried. If no bind directory validates, startup fails with `IpcBind`; a
-directory is never deleted or repaired to make it usable.
+`0700`. The preferred Flatpak directory is tried first. `$XDG_RUNTIME_DIR`
+must already exist as a private real directory; only `app/` and
+`app/com.discordapp.Discord/` are created as real directories without
+following symlinks. A missing or invalid runtime base skips the preferred
+bind, and the next candidate is tried. If no bind directory validates,
+startup fails with `IpcBind`; a directory is never deleted or repaired to
+make it usable.
 
-On `AddrInUse`, Adsum probes the entry with `lstat` (never following
-symlinks) and a connect bounded to one second. A successful connect is
-`Active` — a listener that never replies still counts as active —
-`ECONNREFUSED` is `Stale`, and any other error or timeout is `Unknown`. A
-symlink, regular file, directory, or other non-socket is `NotSocket`.
+Before binding each index, Adsum probes the entry with `lstat` (never
+following symlinks) and a connect bounded to one second. A successful
+connect is `Active` — a listener that never replies still counts as active
+— `ECONNREFUSED` is `Stale`, and any other error or timeout is `Unknown`.
+A symlink, regular file, directory, or other non-socket is `NotSocket`.
 Only `Stale` may be reclaimed: the entry must still be a socket with the
 same `(dev, ino)` immediately before unlink. `Active`, `Unknown`, and
-`NotSocket` keep the path, and Adsum tries the next index.
+`NotSocket` keep the path, and Adsum tries the next index. A `Missing`
+path that becomes `AddrInUse` between probe and bind is retried once,
+without another probe.
 
 ### Directory policies
 
@@ -153,9 +156,9 @@ The marker is a `0600` regular file owned by the effective UID, at most
 published. A marker is valid only when it is a regular file (not a
 symlink), is owned by the effective UID, has mode `0600`, is at most 4096
 bytes, parses as the version 1 schema, has `owner_uid` equal to the
-effective UID, names the expected alias, has an absolute target ending in
-`discord-ipc-<index>`, and keeps the same `(dev, ino)` throughout
-validation.
+effective UID, names the expected alias, and has an absolute target ending
+in `discord-ipc-<index>`; the opened marker's `(dev, ino)` is recorded and
+rechecked against the path after the content is read.
 
 Markers are published atomically and never replace an existing entry: a
 uniquely named temporary file (`.adsum-ipc-owner-<euid>-<index>.tmp-<pid>-<counter>`)
@@ -189,8 +192,10 @@ are left untouched. Removing an orphan alias requires the symlink's
 `readlink`, and a re-probe before unlink must still report the target as
 missing, stale, or not a socket. Recovery runs before bind so a freshly
 bound socket cannot be mistaken for the target recorded in an old marker.
-This marker-driven recovery is the only automatic startup cleanup; there is
-no unconditional sweep of `/tmp` or `$XDG_RUNTIME_DIR`.
+This marker-driven recovery is the only automatic alias/marker cleanup at
+startup; it is separate from the per-index stale-socket reclamation that
+happens during binding. Neither is an unconditional sweep of `/tmp` or
+`$XDG_RUNTIME_DIR`.
 
 On graceful shutdown (Ctrl+C or `SIGTERM`) and on `Drop`, Adsum removes
 only aliases recorded as owned by that transport: it revalidates the
