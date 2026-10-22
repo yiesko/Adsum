@@ -2,7 +2,7 @@
 //!
 //! Cheapest source first (native AC, cwd-joined bare exe, authoritative
 //! Steam AppId, Epic sandbox id or its `-epicapp` fallback, Proton AC,
-//! install-dir prefix, stem/folder heuristics).
+//! install-dir tail, stem/folder heuristics).
 //! Lazy `/proc` reads happen only on misses/hits — never for the table.
 
 use std::collections::HashSet;
@@ -463,9 +463,10 @@ const FORBIDDEN_NAME_CHARS: [char; 9] = ['<', '>', ':', '"', '/', '\\', '|', '?'
 pub struct MatchScratch {
   pub lowered: String,
   pub norm_out: String,
-  /// Canonical Steam path for the prefix check (lowercase, `/`
+  /// Canonical Steam path for the install-dir evidence (lowercase, `/`
   /// separators, leading `/`): reused across processes so a miss costs
-  /// no allocation. Only touched on the Steam-library tail.
+  /// no allocation. Touched only on the AppId corroboration and the
+  /// Steam-library tier, never on the hot path.
   pub steam_path: String,
   /// `/proc/<pid>/stat` body for the suspended check: tiny, but read for
   /// every aux hit (0-3 per tick), so it pays to reuse the buffer rather
@@ -726,6 +727,61 @@ fn argv_names_an_executable(process_path: &str, obj: &ScannedEntry) -> bool {
     .any(|exe| exe_names_path(process_path, &exe.name))
 }
 
+/// Whether `process_path` names an executable the entry flags as a launcher.
+/// The install-dir evidence must never promote one to the game.
+fn argv_names_a_launcher(process_path: &str, obj: &ScannedEntry) -> bool {
+  obj
+    .executables
+    .iter()
+    .filter(|exe| exe.is_launcher)
+    .any(|exe| exe_names_path(process_path, &exe.name))
+}
+
+/// Prerequisite shelves Steam runs with the game's AppId but that are not
+/// the game: checked below the install dir, with a file component after.
+const INSTALLER_SHELVES: [&str; 4] = ["_commonredist", "_redist", "redist", "directx"];
+
+/// Whether any component below `steamapps/common/<installdir>/` is a
+/// prerequisite shelf; paths without that layout are unaffected.
+fn names_an_installer_shelf(process_path: &str) -> bool {
+  let mut components = process_path
+    .split(['/', '\\'])
+    .filter(|component| !component.is_empty())
+    .peekable();
+  while let Some(component) = components.next() {
+    if component.eq_ignore_ascii_case("steamapps")
+      && components
+        .next()
+        .is_some_and(|next| next.eq_ignore_ascii_case("common"))
+    {
+      components.next(); // the install dir itself
+      // Any shelf below counts, but it needs a file component after it:
+      // an executable named `directx` is not a shelf.
+      while let Some(component) = components.next() {
+        if components.peek().is_some()
+          && INSTALLER_SHELVES
+            .iter()
+            .any(|known| component.eq_ignore_ascii_case(known))
+        {
+          return true;
+        }
+      }
+      return false;
+    }
+  }
+  false
+}
+
+/// Whether the tier's evidence names `obj`: a declared executable, or the
+/// install dir when the path is not a declared launcher or a prerequisite
+/// installer shelf (Steam runs those with the game's AppId).
+fn steam_id_corroborates(process_path: &str, obj: &ScannedEntry, install_dir: bool) -> bool {
+  argv_names_an_executable(process_path, obj)
+    || (install_dir
+      && !argv_names_a_launcher(process_path, obj)
+      && !names_an_installer_shelf(process_path))
+}
+
 /// Whether `name` is the tail of `path` on a component boundary,
 /// case-insensitive and with Windows separators folded.
 fn names_tail(path: &str, name: &str) -> bool {
@@ -975,6 +1031,9 @@ pub struct SteamIdLookup<'a> {
   pub entries: &'a [Arc<ScannedEntry>],
   /// User overrides, searched linearly (user-sized, not DB-sized).
   pub custom: &'a [Arc<ScannedEntry>],
+  /// The caller proved the path sits under this AppId's
+  /// `steamapps/common/<installdir>/`; the id alone never sets it.
+  pub install_dir_corroborated: bool,
 }
 
 /// Authoritative aux lookup: `SteamAppId` (store games with empty
@@ -985,13 +1044,17 @@ pub struct SteamIdLookup<'a> {
 /// only indexes the main list. Canonical map hits always win.
 ///
 /// A hit is corroborated by the process path: the entry has to declare the
-/// executable the process is running, matched on a component boundary. The
-/// id says which game was launched, and Steam launches things on a game's
-/// behalf with that game's id — its update script phase, the Proton prefix
-/// setup, the shader pre-cache — so an id alone is evidence of work on the
-/// game rather than of play. An entry declaring no executables is the case
-/// this tier exists for and wins on the id alone: there is nothing to
-/// corroborate against.
+/// executable the process is running, matched on a component boundary, or —
+/// when the caller proved the path sits under this AppId's
+/// `steamapps/common/<installdir>/` — the path must not name a declared
+/// launcher or sit on a prerequisite-installer shelf. That proof must come
+/// from independent id evidence: a path-derived AppId cannot corroborate
+/// itself. The id says which game was launched, and Steam launches things
+/// on a game's behalf with that game's id — its update script phase, the
+/// Proton prefix setup, the shader pre-cache — so an id alone is evidence of
+/// work on the game rather than of play. An entry declaring no executables
+/// is the case this tier exists for and wins on the id alone: there is
+/// nothing to corroborate against.
 ///
 /// # Breaking change
 ///
@@ -1009,7 +1072,7 @@ pub fn match_steam_id(
   let appid = lookup.app_id?;
   if let Some(&idx) = lookup.steam_map.get(appid) {
     let obj = lookup.entries.get(idx)?;
-    if !argv_names_an_executable(lookup.process_path, obj) {
+    if !steam_id_corroborates(lookup.process_path, obj, lookup.install_dir_corroborated) {
       // The id is the game's, but this process is not the game: Steam's
       // own script/prefix/pre-cache work carries it. Named in the log,
       // because a rejected hit is otherwise indistinguishable from a miss.
@@ -1036,7 +1099,7 @@ pub fn match_steam_id(
       sid == appid
     });
     if sku_match {
-      if !argv_names_an_executable(lookup.process_path, obj) {
+      if !steam_id_corroborates(lookup.process_path, obj, lookup.install_dir_corroborated) {
         tracing::debug!(
           "[Process Scanner] AppId {appid} does not belong to {argv0} ({name}, custom), skipping",
           argv0 = lookup.process_path,
@@ -1510,6 +1573,16 @@ impl ProcessServer {
             process.pid
           );
         }
+        // Independent install-dir evidence: the path sits under the AppId's
+        // own `steamapps/common/<installdir>/`. Skipped without an AppId,
+        // and the comparison stays under the lock, so nothing is cloned.
+        let install_dir_corroborated = app_id.as_deref().is_some_and(|id| {
+          self.steam_install_tail_matches_app_id_into(
+            lowered,
+            id,
+            &mut scratch.match_scratch.steam_path,
+          )
+        });
         // Authoritative Steam AppId first: a store id beats every fuzzy
         // path heuristic below.
         if let Some(hit) = match_steam_id(
@@ -1522,6 +1595,7 @@ impl ProcessServer {
             steam_map: &bundle.steam_map,
             entries: &bundle.list,
             custom: &bundle.custom,
+            install_dir_corroborated,
           },
         ) {
           return Some(hit);
@@ -1639,9 +1713,12 @@ impl ProcessServer {
         }
         // Steam's own word: the process runs under a known install dir,
         // so it inherits that entry's AppId. Beats name guessing below,
-        // loses to a DB-declared path above.
+        // loses to a DB-declared path above. Tail matching (not the host
+        // prefix) is what reaches Proton paths like `S:/steamapps/...`;
+        // looked up lazily here because the AppId tier above already
+        // covered every process whose store id corroborates the path.
         if let Some(library_appid) =
-          self.steam_prefix_app_id_into(lowered, &mut scratch.match_scratch.steam_path)
+          self.steam_install_tail_app_id_into(lowered, &mut scratch.match_scratch.steam_path)
           && let Some(hit) = match_steam_id(
             process.pid,
             &mut scratch.match_scratch.stat,
@@ -1652,6 +1729,9 @@ impl ProcessServer {
               steam_map: &bundle.steam_map,
               entries: &bundle.list,
               custom: &bundle.custom,
+              // The id came from this same path, so it cannot corroborate
+              // itself: keep requiring a declared executable (or none).
+              install_dir_corroborated: false,
             },
           )
         {
@@ -2331,6 +2411,7 @@ mod tick2_tests {
         steam_map: &steam_map,
         entries: &[entry],
         custom: &[],
+        install_dir_corroborated: false,
       },
     )
     .expect("appid hits");
@@ -2369,6 +2450,7 @@ mod tick2_tests {
         steam_map: &steam_map,
         entries: &[Arc::clone(&entry)],
         custom: &[],
+        install_dir_corroborated: false,
       },
     )
     .expect("the short Heroic launch corroborates");
@@ -2384,11 +2466,227 @@ mod tick2_tests {
           steam_map: &steam_map,
           entries: &[Arc::clone(&entry)],
           custom: &[],
+          install_dir_corroborated: false,
         },
       )
       .is_none(),
       "a path naming nothing declared must stay refused"
     );
+  }
+
+  /// The install-dir evidence corroborates a path that names no declared
+  /// executable, so a demo binary absent from the database still matches.
+  #[test]
+  fn install_dir_corroboration_accepts_an_undeclared_executable() {
+    use crate::bundle::SortedIndex;
+    use crate::types::{DetectSource, OsName, ScannedExe};
+
+    let entry = Arc::new(ScannedEntry {
+      id: "2082470".into(),
+      name: "VEIN".into(),
+      executables: Box::new([ScannedExe {
+        name: "win64/vein.exe".into(),
+        os: OsName::Win32,
+        is_launcher: false,
+        arguments: None,
+      }]),
+      steam_ids: Box::new(["2082470".into()]),
+      epic_ids: Box::new([]),
+      aliases: Box::new([]),
+    });
+    let steam_map = SortedIndex::build(vec![("2082470".into(), 0)]);
+    let hit = match_steam_id(
+      u64::from(std::process::id()),
+      &mut String::new(),
+      &SteamIdLookup {
+        app_id: Some("2082470"),
+        process_path: "/s:/steamapps/common/veindemo/vein/binaries/win64/veindemo-win64-test.exe",
+        source: DetectSource::SteamAppId,
+        steam_map: &steam_map,
+        entries: &[entry],
+        custom: &[],
+        install_dir_corroborated: true,
+      },
+    )
+    .expect("the install dir corroborates the undeclared demo executable");
+    assert_eq!(hit.entry.name, "VEIN".into());
+  }
+
+  /// Prerequisite installers sit under the game's install dir but Steam
+  /// runs them with its AppId: the install-dir route must refuse them.
+  #[test]
+  fn install_dir_corroboration_refuses_prerequisite_installers() {
+    use crate::bundle::SortedIndex;
+    use crate::types::{DetectSource, OsName, ScannedExe};
+
+    let entry = Arc::new(ScannedEntry {
+      id: "2082470".into(),
+      name: "VEIN".into(),
+      executables: Box::new([ScannedExe {
+        name: "win64/vein.exe".into(),
+        os: OsName::Win32,
+        is_launcher: false,
+        arguments: None,
+      }]),
+      steam_ids: Box::new(["2082470".into()]),
+      epic_ids: Box::new([]),
+      aliases: Box::new([]),
+    });
+    let steam_map = SortedIndex::build(vec![("2082470".into(), 0)]);
+    let lookup = |process_path| SteamIdLookup {
+      app_id: Some("2082470"),
+      process_path,
+      source: DetectSource::SteamAppId,
+      steam_map: &steam_map,
+      entries: std::slice::from_ref(&entry),
+      custom: &[],
+      install_dir_corroborated: true,
+    };
+    for path in [
+      "/s:/steamapps/common/veindemo/_CommonRedist/vcredist_x64.exe",
+      "/s:/steamapps/common/VeinDemo/DirectX/dxsetup.exe",
+      "/s:/steamapps/common/VeinDemo/Engine/Extras/Redist/en-us/UEPrereqSetup_x64.exe",
+    ] {
+      assert!(
+        match_steam_id(
+          u64::from(std::process::id()),
+          &mut String::new(),
+          &lookup(path)
+        )
+        .is_none(),
+        "{path} is a prerequisite installer, not the game"
+      );
+    }
+    // Shelf names only count below the install dir and with a file
+    // component after them: a game folder called `Redist` and an
+    // executable literally named `directx` are not prerequisites.
+    for path in [
+      "/s:/steamapps/common/redist/game.exe",
+      "/s:/steamapps/common/veindemo/bin/directx",
+    ] {
+      let hit = match_steam_id(
+        u64::from(std::process::id()),
+        &mut String::new(),
+        &lookup(path),
+      )
+      .unwrap_or_else(|| panic!("{path} must not be read as a prerequisite"));
+      assert_eq!(hit.entry.name, "VEIN".into());
+    }
+  }
+
+  /// Without that evidence the same path stays refused: the id alone is
+  /// not a hit.
+  #[test]
+  fn install_dir_corroboration_false_still_refuses() {
+    use crate::bundle::SortedIndex;
+    use crate::types::{DetectSource, OsName, ScannedExe};
+
+    let entry = Arc::new(ScannedEntry {
+      id: "2082470".into(),
+      name: "VEIN".into(),
+      executables: Box::new([ScannedExe {
+        name: "win64/vein.exe".into(),
+        os: OsName::Win32,
+        is_launcher: false,
+        arguments: None,
+      }]),
+      steam_ids: Box::new(["2082470".into()]),
+      epic_ids: Box::new([]),
+      aliases: Box::new([]),
+    });
+    let steam_map = SortedIndex::build(vec![("2082470".into(), 0)]);
+    assert!(
+      match_steam_id(
+        u64::from(std::process::id()),
+        &mut String::new(),
+        &SteamIdLookup {
+          app_id: Some("2082470"),
+          process_path: "/s:/steamapps/common/veindemo/vein/binaries/win64/veindemo-win64-test.exe",
+          source: DetectSource::SteamAppId,
+          steam_map: &steam_map,
+          entries: &[entry],
+          custom: &[],
+          install_dir_corroborated: false,
+        },
+      )
+      .is_none(),
+      "an uncorroborated AppId must not answer"
+    );
+  }
+
+  /// The install-dir evidence never turns a declared launcher into the
+  /// game: Steam launches it with the game's id.
+  #[test]
+  fn install_dir_corroboration_refuses_a_declared_launcher() {
+    use crate::bundle::SortedIndex;
+    use crate::types::{DetectSource, OsName, ScannedExe};
+
+    let entry = Arc::new(ScannedEntry {
+      id: "2082470".into(),
+      name: "VEIN".into(),
+      executables: Box::new([ScannedExe {
+        name: "VeinDemo.exe".into(),
+        os: OsName::Win32,
+        is_launcher: true,
+        arguments: None,
+      }]),
+      steam_ids: Box::new(["2082470".into()]),
+      epic_ids: Box::new([]),
+      aliases: Box::new([]),
+    });
+    let steam_map = SortedIndex::build(vec![("2082470".into(), 0)]);
+    assert!(
+      match_steam_id(
+        u64::from(std::process::id()),
+        &mut String::new(),
+        &SteamIdLookup {
+          app_id: Some("2082470"),
+          process_path: "/s:/steamapps/common/veindemo/veindemo.exe",
+          source: DetectSource::SteamAppId,
+          steam_map: &steam_map,
+          entries: &[entry],
+          custom: &[],
+          install_dir_corroborated: true,
+        },
+      )
+      .is_none(),
+      "a declared launcher must stay refused however the id was corroborated"
+    );
+  }
+
+  /// An entry with no executables still stands on the id alone, with or
+  /// without install-dir evidence.
+  #[test]
+  fn install_dir_corroboration_keeps_id_only_entries_working() {
+    use crate::bundle::SortedIndex;
+    use crate::types::DetectSource;
+
+    let entry = Arc::new(ScannedEntry {
+      id: "2082470".into(),
+      name: "VEIN".into(),
+      executables: Box::new([]),
+      steam_ids: Box::new(["2082470".into()]),
+      epic_ids: Box::new([]),
+      aliases: Box::new([]),
+    });
+    let steam_map = SortedIndex::build(vec![("2082470".into(), 0)]);
+    for corroborated in [false, true] {
+      let hit = match_steam_id(
+        u64::from(std::process::id()),
+        &mut String::new(),
+        &SteamIdLookup {
+          app_id: Some("2082470"),
+          process_path: "/opt/whatever",
+          source: DetectSource::SteamAppId,
+          steam_map: &steam_map,
+          entries: &[Arc::clone(&entry)],
+          custom: &[],
+          install_dir_corroborated: corroborated,
+        },
+      )
+      .unwrap_or_else(|| panic!("id-only entry must hit (corroborated={corroborated})"));
+      assert_eq!(hit.entry.name, "VEIN".into());
+    }
   }
 
   /// The Epic tier's parser: the token is found case-insensitively and
@@ -2609,6 +2907,7 @@ mod tick2_tests {
         steam_map: &empty_map,
         entries: &[],
         custom: &[entry],
+        install_dir_corroborated: false,
       },
     )
     .expect("custom sku hits");

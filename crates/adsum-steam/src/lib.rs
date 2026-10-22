@@ -25,6 +25,7 @@
 //! ticks revalidate with stats only and reparse solely what changed.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -38,6 +39,11 @@ const STEAM_ROOT_ENV: &str = "ADSUM_STEAM_ROOT";
 const STEAM_LIBRARIES_ENV: &str = "ADSUM_STEAM_LIBRARIES";
 /// Cache filename under `$XDG_CACHE_HOME` (else `~/.cache`).
 const CACHE_FILE: &str = "adsum/steam-libraries.json";
+/// Install-dir marker shared by cached keys and process paths.
+const STEAM_COMMON: &str = "/steamapps/common/";
+/// Sentinel owner for a prefix claimed by conflicting manifests: the
+/// prefix answers nobody (empty ids are filtered out of every match).
+const CONFLICTING_APPID: &str = "";
 /// Cache schema version: bumped to 2 when prefix keys became canonical
 /// (`/`-separated), so v1 caches holding Windows backslash keys are
 /// ignored once and rescanned instead of reused empty.
@@ -620,7 +626,8 @@ impl SteamLibraries {
 
   /// Same match, canonicalizing into a caller-owned buffer so the hot
   /// path (every process that misses the automaton) allocates nothing.
-  /// The returned id borrows from `self`, not from `scratch`.
+  /// The returned id borrows from `self`, not from `scratch`. A prefix
+  /// claimed by conflicting manifests never answers.
   #[inline]
   pub fn match_prefix_into(&self, path: &str, scratch: &mut String) -> Option<&str> {
     canonical_steam_path_into(path, scratch);
@@ -632,7 +639,63 @@ impl SteamLibraries {
         best_len = prefix.len();
       }
     }
-    best
+    best.filter(|appid| !appid.is_empty())
+  }
+
+  /// AppId whose `steamapps/common/<installdir>/` tail prefixes `path`.
+  /// Proton rewrites the library root, so only the tail is comparable.
+  #[inline]
+  pub fn match_install_tail(&self, path: &str) -> Option<&str> {
+    let mut normalized = String::with_capacity(path.len() + 1);
+    self.match_install_tail_into(path, &mut normalized)
+  }
+
+  /// Same match, canonicalizing into a caller-owned buffer; the id
+  /// borrows from `self`. The longest tail wins, and a tail claimed by
+  /// two different AppIds is refused as ambiguous (or as a conflict).
+  #[inline]
+  pub fn match_install_tail_into(&self, path: &str, scratch: &mut String) -> Option<&str> {
+    canonical_steam_path_into(path, scratch);
+    // Textual matches must never traverse: `foo/../steamapps/...` or
+    // `common/Game/../Other` would otherwise corroborate the wrong dir.
+    if has_dotdot_component(scratch) {
+      return None;
+    }
+    // A Proton prefix's virtual drive can contain its own
+    // `steamapps/common`; that copy is runtime state, not an install.
+    if scratch.contains("/steamapps/compatdata/") {
+      return None;
+    }
+    let (_, path_tail) = scratch.split_once(STEAM_COMMON)?;
+    let mut best: Option<&str> = None;
+    let mut best_len = 0;
+    let mut ambiguous = false;
+    for (prefix, appid) in &self.dirs {
+      // Only real installs corroborate; Proton prefixes (`compatdata/`)
+      // are runtime state, not the game's install directory.
+      let Some((_, tail)) = prefix.split_once(STEAM_COMMON) else {
+        continue;
+      };
+      let tail = tail.strip_suffix('/').unwrap_or(tail);
+      if tail.is_empty() || has_dotdot_component(tail) {
+        continue;
+      }
+      if !install_tail_names(path_tail, tail) {
+        continue;
+      }
+      if tail.len() > best_len {
+        best = Some(appid.as_str());
+        best_len = tail.len();
+        ambiguous = false;
+      } else if tail.len() == best_len && best != Some(appid.as_str()) {
+        ambiguous = true;
+      }
+    }
+    if ambiguous {
+      None
+    } else {
+      best.filter(|appid| !appid.is_empty())
+    }
   }
 
   /// Parse one library's manifests into the map. Unconditional: callers
@@ -686,9 +749,11 @@ impl SteamLibraries {
       if let Ok(body) = read_limited(&entry.path(), MAX_MANIFEST_BYTES)
         && let Some((appid, installdir)) = manifest_ids(&parse_vdf_str(&body))
       {
-        dirs
-          .entry(common_prefix(&library.to_string_lossy(), &installdir))
-          .or_insert(appid);
+        record_install_dir(
+          dirs,
+          common_prefix(&library.to_string_lossy(), &installdir),
+          appid,
+        );
         manifests += 1;
       }
     }
@@ -716,6 +781,34 @@ fn library_prefix(library: &Path) -> String {
   }
   lib.push_str("steamapps/");
   lib
+}
+
+/// Whether `path` carries a `..` component: textual matches must not traverse.
+fn has_dotdot_component(path: &str) -> bool {
+  path.split('/').any(|component| component == "..")
+}
+
+/// Whether `path_tail` is `install_tail` or sits below it on a boundary.
+fn install_tail_names(path_tail: &str, install_tail: &str) -> bool {
+  path_tail == install_tail
+    || path_tail
+      .strip_prefix(install_tail)
+      .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Record one install dir. Conflicting owners poison the prefix so stale
+/// duplicate manifests cannot answer for either AppId.
+fn record_install_dir(dirs: &mut HashMap<String, String>, prefix: String, appid: String) {
+  match dirs.entry(prefix) {
+    Entry::Vacant(slot) => {
+      slot.insert(appid);
+    }
+    Entry::Occupied(mut slot) => {
+      if slot.get() != &appid {
+        slot.insert(CONFLICTING_APPID.to_string());
+      }
+    }
+  }
 }
 
 /// One root's libraries: itself plus every path its `libraryfolders.vdf`
@@ -1097,13 +1190,15 @@ fn load_cache_from(path: &Path) -> HashMap<String, CachedLibrary> {
       // Re-validate ownership on load: `save_cache` only writes
       // well-formed prefixes, but a hand-edited cache could inject e.g.
       // `"/"` and match every process until the fingerprint moves
-      // (a dirs-only poison never triggers a rescan by itself).
+      // (a dirs-only poison never triggers a rescan by itself). The
+      // empty conflict sentinel is kept so a duplicate tail stays
+      // ambiguous; the match filters blank ids before returning one.
       let library = Path::new(lib_path.as_str());
       let dirs = dirs
         .iter()
         .filter_map(|(prefix, appid)| {
           let appid = appid.as_str()?;
-          if appid.is_empty() || !library_owns_prefix(library, prefix) {
+          if !library_owns_prefix(library, prefix) {
             return None;
           }
           Some((prefix.clone(), appid.to_string()))
@@ -1142,6 +1237,8 @@ fn save_cache(libraries: &SteamLibraries) {
   }
   let lib_paths: Vec<String> = by_library.keys().cloned().collect();
   for (prefix, appid) in &libraries.dirs {
+    // Persist the empty conflict sentinel too: on reload it must keep
+    // poisoning the prefix; only the match filters blank ids.
     for lib_path in &lib_paths {
       if library_owns_prefix(Path::new(lib_path), prefix) {
         if let Some(entry) = by_library.get_mut(lib_path) {
@@ -1241,6 +1338,61 @@ mod tests {
       cached["/lib"].dirs.get("/lib/steamapps/common/game/"),
       Some(&"1".to_string())
     );
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// The conflict sentinel must survive the cache: dropping it would let
+  /// a same-tail prefix in another library answer after a restart, while
+  /// a fresh scan refuses both.
+  #[test]
+  fn conflicting_install_dir_sentinel_survives_the_cache() {
+    let dir = std::env::temp_dir().join(format!(
+      "adsum-steam-test-cache-sentinel-{}",
+      std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("cache dir");
+    let file = dir.join("cache.json");
+
+    let fingerprint = Fingerprint {
+      dir_mtime_ms: 1,
+      manifests: 2,
+      newest_manifest_ms: 1,
+      compat_mtime_ms: 0,
+    };
+    let mut libraries = SteamLibraries::default();
+    libraries.set_cache_file(file.clone());
+    libraries
+      .fingerprints
+      .insert("/lib-a".into(), fingerprint.clone());
+    libraries.fingerprints.insert("/lib-b".into(), fingerprint);
+    libraries.dirs.insert(
+      "/lib-a/steamapps/common/game/".into(),
+      CONFLICTING_APPID.into(),
+    );
+    libraries
+      .dirs
+      .insert("/lib-b/steamapps/common/game/".into(), "222".into());
+
+    save_cache(&libraries);
+    let cached = load_cache_from(&file);
+    assert_eq!(
+      cached["/lib-a"].dirs.get("/lib-a/steamapps/common/game/"),
+      Some(&CONFLICTING_APPID.to_string()),
+      "the empty sentinel must round-trip"
+    );
+
+    let mut reloaded = SteamLibraries::default();
+    for entry in cached.values() {
+      reloaded.dirs.extend(entry.dirs.clone());
+    }
+    assert!(
+      reloaded
+        .match_install_tail("/x/steamapps/common/Game/game.exe")
+        .is_none(),
+      "the reloaded sentinel must keep the shared tail ambiguous"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
   }
 }

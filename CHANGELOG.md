@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Steam demos whose executable is not in the database (VEIN Demo is the
+  motivating case) are now detected when the process runs under the AppId's
+  own install dir (`steamapps/common/<installdir>/`). The install dir is
+  independent evidence, not an AppId-only match: declared launchers,
+  prerequisite installers, Steam helpers and the exclusion list keep their
+  current veto.
+
 ## [0.39.0] - 2026-10-21
 
 ### Breaking

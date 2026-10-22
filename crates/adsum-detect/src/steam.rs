@@ -19,14 +19,15 @@ impl ProcessServer {
       .unwrap_or_else(|e| e.into_inner()) = libraries;
   }
 
-  /// AppId whose Steam install dir prefixes the process path.
-  /// Canonicalization (lowercase, `/` separators) happens inside
-  /// [`SteamLibraries::match_prefix`]; callers pass native paths.
+  /// AppId whose Steam install dir prefixes the process path, by host
+  /// prefix. Host-prefix form: kept for tests and tooling that reason
+  /// about a concrete library root; the scan loop uses the Proton-safe
+  /// [`steam_install_tail_app_id_into`](Self::steam_install_tail_app_id_into).
   /// Cloned out of the lock; tiny strings.
   ///
   /// Allocates for the canonical form: prefer
-  /// [`steam_prefix_app_id_into`](Self::steam_prefix_app_id_into) on the
-  /// scan loop, which passes a reusable buffer.
+  /// [`steam_prefix_app_id_into`](Self::steam_prefix_app_id_into) when
+  /// reusing a buffer.
   pub fn steam_prefix_app_id(&self, normalized_path: &str) -> Option<String> {
     self
       .steam_libraries
@@ -36,8 +37,9 @@ impl ProcessServer {
       .map(str::to_string)
   }
 
-  /// Same, canonicalizing into a caller-owned buffer: the scan loop passes
-  /// a scratch it reuses across processes, so a miss costs no allocation.
+  /// Same host-prefix match, canonicalizing into a caller-owned buffer.
+  /// Tests/tooling only: the scan loop uses the tail variant, which also
+  /// reaches Proton paths whose library root was rewritten.
   pub fn steam_prefix_app_id_into(
     &self,
     normalized_path: &str,
@@ -49,6 +51,37 @@ impl ProcessServer {
       .unwrap_or_else(|e| e.into_inner())
       .match_prefix_into(normalized_path, scratch)
       .map(str::to_string)
+  }
+
+  /// AppId whose `steamapps/common/<installdir>/` tail prefixes the path:
+  /// the Proton-safe install-dir evidence, without the host prefix.
+  pub fn steam_install_tail_app_id_into(
+    &self,
+    normalized_path: &str,
+    scratch: &mut String,
+  ) -> Option<String> {
+    self
+      .steam_libraries
+      .read()
+      .unwrap_or_else(|e| e.into_inner())
+      .match_install_tail_into(normalized_path, scratch)
+      .map(str::to_string)
+  }
+
+  /// Whether the path sits under `app_id`'s own install dir. Compares the
+  /// matched id under the lock, so the common path clones nothing.
+  pub fn steam_install_tail_matches_app_id_into(
+    &self,
+    normalized_path: &str,
+    app_id: &str,
+    scratch: &mut String,
+  ) -> bool {
+    self
+      .steam_libraries
+      .read()
+      .unwrap_or_else(|e| e.into_inner())
+      .match_install_tail_into(normalized_path, scratch)
+      .is_some_and(|library_appid| library_appid == app_id)
   }
 
   /// Revalidate the Steam libraries (stats only unless something changed).
