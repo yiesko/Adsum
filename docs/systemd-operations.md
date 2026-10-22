@@ -99,10 +99,12 @@ systemctl --user restart adsum.service # service picks up the restored binary
   SDK takes over → generic resumes on clear). Details:
   [process-detection.md](process-detection.md). The flag stays as a
   full-silence opt-in.
-- **Home read-only**: writes go only to `%t` (sockets), `~/.cache/adsum`
-  (OTA), `~/.config/adsum` (overrides) and `~/.local/bin` (the update
-  swap). Anything else you add to the unit needs its own
-  `ReadWritePaths` entry.
+- **Home read-only**: the cache directory (XDG default `~/.cache/adsum`)
+  is created by systemd through `CacheDirectory=` and stays writable; the
+  config directory (`~/.config/adsum` by default) is read-only, which is
+  all the service needs. `%t` (sockets) and `~/.local/bin` (the update
+  swap) are the other writable paths. Anything else you add to the unit
+  needs its own directory directive or `ReadWritePaths` entry.
 
 ## See also
 

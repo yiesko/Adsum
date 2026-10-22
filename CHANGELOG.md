@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   independent evidence, not an AppId-only match: declared launchers,
   prerequisite installers, Steam helpers and the exclusion list keep their
   current veto.
+- A clean install no longer fails with `226/NAMESPACE` when the cache
+  directory is missing: the unit creates it before the sandbox mounts
+  (`CacheDirectory=`) instead of listing it in `ReadWritePaths=`. The
+  installer creates the legacy default directories only when the
+  installed unit still lists them there.
 
 ## [0.39.0] - 2026-10-21
 

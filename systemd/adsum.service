@@ -10,6 +10,9 @@ StartLimitBurst=3
 [Service]
 Type=exec
 Environment=XDG_RUNTIME_DIR=%t
+# CacheDirectory= creates the cache dir before the sandbox mounts; a
+# missing path in ReadWritePaths= fails with 226/NAMESPACE on fresh installs.
+CacheDirectory=adsum
 # Port/cadence parametrization (clap reads ADSUM_* env). Defaults match
 # the CLI; uncomment to pin alternatives for testing.
 Environment=ADSUM_BRIDGE_PORT=1337
@@ -18,9 +21,8 @@ Environment=ADSUM_WS_PORT_START=6463
 Environment=ADSUM_WS_PORT_END=6472
 Environment=ADSUM_SCAN_INTERVAL=5
 # Custom game mappings (missing file = no overrides, never fatal).
-# Resolution: --overrides-file > $ADSUM_OVERRIDES_FILE >
-# $XDG_CONFIG_HOME/adsum/overrides.json > ~/.config/adsum/overrides.json
-Environment=ADSUM_OVERRIDES_FILE=%h/.config/adsum/overrides.json
+# The CLI resolves $XDG_CONFIG_HOME/adsum/overrides.json (default
+# ~/.config/adsum).
 # Drop stale IPC sockets from crashed runs (the "-" ignores failure).
 ExecStartPre=-/bin/sh -c 'rm -f %t/discord-ipc-*; rm -f "${TMPDIR:-/tmp}/discord-ipc-*"'
 # Official detectable list with trim, hourly refresh while running,
@@ -40,10 +42,12 @@ NoNewPrivileges=yes
 BindPaths=/tmp
 ProtectSystem=strict
 ProtectHome=read-only
-# Steam provider + OTA caches (~/.cache/adsum) stay writable under the
-# read-only home; %t keeps the IPC sockets writable; %h/.local/bin lets
-# the sandboxed service swap in staged self-updates at boot.
-ReadWritePaths=%h/.config/adsum %t %h/.cache/adsum %h/.local/bin
+# CacheDirectory= creates the cache dir (XDG default ~/.cache/adsum) and
+# keeps it writable under the read-only home; the config dir is only read,
+# so the read-only home already covers it. %t keeps the IPC sockets
+# writable; %h/.local/bin lets the sandboxed service swap in staged
+# self-updates.
+ReadWritePaths=%t %h/.local/bin
 # cn_proc watcher needs AF_NETLINK; without it the scanner silently stays
 # on polling (diagnose via the missing "watcher live" boot line).
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
