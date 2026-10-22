@@ -85,6 +85,7 @@ dependencies = [
  "adsum-protocol",
  "adsum-types",
  "interprocess",
+ "libc",
  "serde",
  "serde_json",
  "tokio",
