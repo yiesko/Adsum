@@ -20,13 +20,9 @@ struct Scratch(PathBuf);
 impl Scratch {
   /// Create a unique `0700` scratch directory for this test process.
   fn new() -> Self {
-    // macOS caps `sun_path` at 104 bytes; `/tmp` keeps the preferred
-    // Flatpak socket path short enough there.
-    let root = if cfg!(target_os = "macos") {
-      PathBuf::from("/tmp")
-    } else {
-      std::env::temp_dir()
-    };
+    // `/tmp` keeps the preferred Flatpak socket path short enough for
+    // macOS's 104-byte `sun_path` and ignores long inherited `TMPDIR`s.
+    let root = PathBuf::from("/tmp");
     // Canonicalize so platform symlinks (macOS `/var`) keep the chain real.
     let root = fs::canonicalize(&root).unwrap_or(root);
     let pid = std::process::id();
@@ -79,6 +75,15 @@ impl Drop for ChildGuard {
   }
 }
 
+/// Paths that do not exist yet, for timeout and early-exit diagnostics.
+fn missing_paths(paths: &[&Path]) -> Vec<String> {
+  paths
+    .iter()
+    .filter(|path| fs::symlink_metadata(path).is_err())
+    .map(|path| path.display().to_string())
+    .collect()
+}
+
 /// Wait until every path exists; a child exit ends the wait with its status.
 fn wait_for_paths(paths: &[&Path], child: &mut Child) -> Result<(), ExitStatus> {
   let deadline = Instant::now() + WAIT;
@@ -90,12 +95,10 @@ fn wait_for_paths(paths: &[&Path], child: &mut Child) -> Result<(), ExitStatus> 
       return Err(status);
     }
     if Instant::now() >= deadline {
-      let missing: Vec<_> = paths
-        .iter()
-        .filter(|path| fs::symlink_metadata(path).is_err())
-        .map(|path| path.display().to_string())
-        .collect();
-      panic!("timed out after {WAIT:?} waiting for {missing:?}");
+      panic!(
+        "timed out after {WAIT:?} waiting for {:?}",
+        missing_paths(paths)
+      );
     }
     thread::sleep(POLL);
   }
@@ -158,12 +161,25 @@ fn sigterm_removes_owned_socket_alias_and_marker() {
     .stdin(Stdio::null());
 
   let mut guard = ChildGuard::new(command.spawn().expect("spawn adsum binary"));
-  wait_for_paths(&[&preferred, &alias, &marker], guard.child())
-    .unwrap_or_else(|status| panic!("daemon exited with {status} before publishing its socket"));
+  let paths: [&Path; 3] = [&preferred, &alias, &marker];
+  wait_for_paths(&paths, guard.child()).unwrap_or_else(|status| {
+    panic!(
+      "daemon exited with {status} before publishing {:?}",
+      missing_paths(&paths)
+    );
+  });
 
+  assert!(
+    guard
+      .child()
+      .try_wait()
+      .expect("query child status")
+      .is_none(),
+    "child exited before SIGTERM"
+  );
   let pid = libc::pid_t::try_from(guard.child().id()).expect("child pid fits in pid_t");
-  // SAFETY: the child is still running (the wait above returned Ok), and
-  // the kernel cannot recycle an unreaped PID.
+  // SAFETY: unreaped means still ours: the kernel cannot recycle a PID
+  // until the child is waited on, so this signal cannot hit another process.
   let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
   assert_eq!(
     rc,
