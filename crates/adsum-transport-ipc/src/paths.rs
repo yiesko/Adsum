@@ -30,14 +30,36 @@ const ALIAS_LAYOUTS: [&str; 14] = [
 ];
 
 /// Conventional IPC base dirs in official resolution order
-/// (`XDG_RUNTIME_DIR` → `TMPDIR` → `TMP` → `TEMP` → `/tmp`).
+/// (`XDG_RUNTIME_DIR` → `TMPDIR` → `TMP` → `TEMP` → `/tmp`). Existing bases
+/// are canonicalized once so validation and use see the same real path.
 pub fn socket_dir_candidates() -> Vec<PathBuf> {
-  candidate_dirs_from([
+  canonicalize_candidate_bases(candidate_dirs_from([
     ("XDG_RUNTIME_DIR", std::env::var("XDG_RUNTIME_DIR").ok()),
     ("TMPDIR", std::env::var("TMPDIR").ok()),
     ("TMP", std::env::var("TMP").ok()),
     ("TEMP", std::env::var("TEMP").ok()),
-  ])
+  ]))
+}
+
+/// Resolve existing absolute bases once, preserving order and deduplicating
+/// again; relative or `..` paths stay raw for validation to reject.
+fn canonicalize_candidate_bases(bases: Vec<PathBuf>) -> Vec<PathBuf> {
+  let mut resolved = Vec::with_capacity(bases.len());
+  for path in bases {
+    let path = if path.is_absolute()
+      && !path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+      std::fs::canonicalize(&path).unwrap_or(path)
+    } else {
+      path
+    };
+    if !resolved.contains(&path) {
+      resolved.push(path);
+    }
+  }
+  resolved
 }
 
 /// Pure core of [`socket_dir_candidates`]: first-seen order, blanks and
@@ -553,6 +575,34 @@ mod tests {
       ("TEMP", None),
     ]);
     assert_eq!(fallback, vec![PathBuf::from("/tmp")]);
+  }
+
+  /// Existing bases resolve to their real path once; unsafe shapes stay raw.
+  #[test]
+  fn candidate_bases_are_canonicalized_and_unsafe_paths_are_untouched() {
+    let real = scratch("canonical-base-real");
+    let link_parent = scratch("canonical-base-link");
+    let link = link_parent.join("runtime");
+    std::os::unix::fs::symlink(&real, &link).expect("base symlink");
+
+    let dirs = canonicalize_candidate_bases(vec![
+      link,
+      real.clone(),
+      PathBuf::from("relative/runtime"),
+      PathBuf::from("/tmp/../runtime"),
+    ]);
+
+    assert_eq!(
+      dirs,
+      vec![
+        real.clone(),
+        PathBuf::from("relative/runtime"),
+        PathBuf::from("/tmp/../runtime"),
+      ]
+    );
+
+    let _ = std::fs::remove_dir_all(&real);
+    let _ = std::fs::remove_dir_all(&link_parent);
   }
 
   /// The Flatpak socket dir is derived only from a usable runtime base.
