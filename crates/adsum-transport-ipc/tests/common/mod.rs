@@ -11,6 +11,7 @@
 #![allow(dead_code)]
 
 use std::io::{Read, Write};
+use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -34,6 +35,9 @@ impl Scratch {
     } else {
       std::env::temp_dir()
     };
+    // Canonicalize so platform symlinks (macOS `/var`) do not fail the
+    // private-directory gate for tests.
+    let root = std::fs::canonicalize(&root).unwrap_or(root);
     let path = root.join(format!(
       "adsum-ipc-test-{}-{}-{}",
       std::process::id(),
@@ -42,14 +46,21 @@ impl Scratch {
     ));
     // Remove leftovers from a crashed run first.
     let _ = std::fs::remove_dir_all(&path);
-    std::fs::create_dir_all(&path).expect("scratch dir");
+    std::fs::DirBuilder::new()
+      .mode(0o700)
+      .create(&path)
+      .expect("scratch dir");
     Self { path }
   }
 
   /// Created subdirectory inside the scratch root.
   pub fn sub(&self, name: &str) -> PathBuf {
     let dir = self.path.join(name);
-    std::fs::create_dir_all(&dir).expect("scratch subdir");
+    std::fs::DirBuilder::new()
+      .recursive(true)
+      .mode(0o700)
+      .create(&dir)
+      .expect("scratch subdir");
     dir
   }
 

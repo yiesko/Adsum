@@ -6,6 +6,7 @@
 //! with a deadline, then aborts stragglers.
 
 use std::io::ErrorKind;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{
   Arc, Mutex,
@@ -27,9 +28,9 @@ use crate::frame::{IpcFacilitator, handle_stream};
 use crate::paths::{
   bind_dirs_in_order, current_euid, fanout_socket_link, preferred_socket_dir_from,
   prepare_fallback_dir, prepare_socket_dir, remove_socket_links, socket_alias_dirs,
-  socket_dir_candidates, socket_file_name,
+  socket_dir_candidates, socket_file_name, validate_private_dir,
 };
-use crate::probe::socket_holder_alive;
+use crate::probe::{FileId, SocketState, probe_socket, unlink_socket_if_unchanged};
 use crate::sink::{DEFAULT_IPC_QUEUE, EventSink};
 
 /// Upper bound for graceful connection drain in [`IpcTransport::shutdown`].
@@ -147,6 +148,8 @@ pub struct IpcTransport {
   /// drain deadline (`abort_all` cannot interrupt a running closure).
   live: Arc<Mutex<Vec<(u64, std::os::unix::net::UnixStream)>>>,
   bound_path: String,
+  /// `(dev, ino)` of the bound socket, rechecked before removal.
+  bound_id: FileId,
   dirs: Vec<PathBuf>,
   sink: EventSink,
 }
@@ -235,11 +238,10 @@ impl IpcTransport {
     // Blocking syscalls (bind, probe with its 1s budget, symlink fan-out)
     // run off the async workers; this executes once per (re)bind.
     let aliases_for_bind = alias_dirs.clone();
-    let (std_listener, bound_path) = tokio::task::spawn_blocking(move || {
+    let (std_listener, bound_path, bound_id) = tokio::task::spawn_blocking(move || {
       let mut last_err = None;
       for (index, dir) in bind_dirs.iter().enumerate() {
-        let base = format!("{}/discord-ipc", dir.display());
-        match create_socket(&base, &aliases_for_bind) {
+        match create_socket(dir, &aliases_for_bind) {
           Ok(bound) => return Ok(bound),
           Err(err) => {
             tracing::warn!("[ipc] Candidate dir {index} unusable, trying next: {err}");
@@ -291,6 +293,7 @@ impl IpcTransport {
         conns,
         live,
         bound_path,
+        bound_id,
         dirs: alias_dirs,
         sink,
       },
@@ -405,55 +408,126 @@ impl Drop for IpcTransport {
     }
     tracing::info!("[ipc] Cleaning up socket: {}", self.bound_path);
     remove_socket_links(&self.dirs, &self.bound_path);
-    let _ = std::fs::remove_file(&self.bound_path);
+    if !unlink_socket_if_unchanged(Path::new(&self.bound_path), self.bound_id) {
+      tracing::debug!("[ipc] Bound socket {} changed; leaving it", self.bound_path);
+    }
   }
 }
 
-/// Bind `base-0..=9` with stale reclaim, then fan out links into
-/// `alias_dirs`.
+/// Bind `discord-ipc-0..=9` in the private `dir`, probing every index
+/// before touching it, then fan out links into `alias_dirs`.
 fn create_socket(
-  base: &str,
+  dir: &Path,
   alias_dirs: &[PathBuf],
-) -> Result<(std::os::unix::net::UnixListener, String)> {
+) -> Result<(std::os::unix::net::UnixListener, String, FileId)> {
+  validate_private_dir(dir).map_err(|source| AdsumError::IpcBind {
+    attempts: 10,
+    source,
+  })?;
   let mut last_err = None;
-  for tries in 0..=9_u8 {
-    let socket_path = format!("{base}-{tries}");
-    tracing::info!("[ipc] Creating socket: {socket_path}");
-    match std::os::unix::net::UnixListener::bind(&socket_path) {
-      Ok(socket) => {
-        tracing::info!("[ipc] Created IPC socket: {socket_path}");
-        fanout_socket_link(alias_dirs, &socket_path, &socket_file_name(&socket_path));
-        return Ok((socket, socket_path));
-      }
-      Err(err) => {
-        if err.kind() == ErrorKind::AddrInUse {
-          tracing::info!("[ipc] Socket {socket_path} already in use, checking if stale...");
-          if socket_holder_alive(&socket_path) {
-            tracing::warn!("[ipc] Socket {socket_path} is in use by another process");
-          } else {
-            tracing::warn!("[ipc] Socket {socket_path} is stale, removing and retrying...");
-            let _ = std::fs::remove_file(&socket_path);
-            match std::os::unix::net::UnixListener::bind(&socket_path) {
-              Ok(socket) => {
-                tracing::info!("[ipc] Created IPC socket after cleaning stale: {socket_path}");
-                fanout_socket_link(alias_dirs, &socket_path, &socket_file_name(&socket_path));
-                return Ok((socket, socket_path));
-              }
-              Err(retry_err) => {
-                tracing::warn!("[ipc] Rebind after stale-clean failed: {retry_err}");
-              }
+  for index in 0..=9_u8 {
+    let path = dir.join(format!("discord-ipc-{index}"));
+    let probe = probe_socket(&path);
+    let listener = match probe.state {
+      SocketState::Missing => match bind_index(&path) {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == ErrorKind::AddrInUse => {
+          // The entry appeared between probe and bind: retry exactly once.
+          match bind_index(&path) {
+            Ok(listener) => listener,
+            Err(err) => {
+              last_err = Some(err);
+              continue;
             }
           }
-        } else {
-          tracing::warn!("[ipc] Failed to create IPC socket, trying next: {err}");
         }
-        last_err = Some(err);
+        Err(err) => {
+          last_err = Some(err);
+          continue;
+        }
+      },
+      SocketState::Stale => {
+        let Some(identity) = probe.identity else {
+          continue;
+        };
+        if !unlink_socket_if_unchanged(&path, identity) {
+          tracing::warn!(
+            "[ipc] Stale socket {} changed before unlink; leaving it",
+            path.display()
+          );
+          continue;
+        }
+        tracing::warn!("[ipc] Reclaiming stale socket: {}", path.display());
+        match bind_index(&path) {
+          Ok(listener) => listener,
+          Err(err) => {
+            last_err = Some(err);
+            continue;
+          }
+        }
       }
+      SocketState::Active | SocketState::Unknown | SocketState::NotSocket => {
+        tracing::info!(
+          "[ipc] Socket {} is {:?}; trying next index",
+          path.display(),
+          probe.state
+        );
+        continue;
+      }
+    };
+    if let Some(bound) = finish_bind(listener, &path, alias_dirs) {
+      return Ok(bound);
     }
+    tracing::warn!(
+      "[ipc] Could not secure socket {}; trying next index",
+      path.display()
+    );
   }
   Err(AdsumError::IpcBind {
     attempts: 10,
     source: last_err.unwrap_or_else(|| std::io::Error::other("no socket bound")),
+  })
+}
+
+/// One bind attempt on a path the probe declared safe.
+fn bind_index(path: &Path) -> std::io::Result<std::os::unix::net::UnixListener> {
+  tracing::info!("[ipc] Creating socket: {}", path.display());
+  std::os::unix::net::UnixListener::bind(path)
+}
+
+/// Finalize a fresh bind: mode `0600`, identity recheck, then fan-out.
+fn finish_bind(
+  listener: std::os::unix::net::UnixListener,
+  path: &Path,
+  alias_dirs: &[PathBuf],
+) -> Option<(std::os::unix::net::UnixListener, String, FileId)> {
+  let identity = socket_identity(path)?;
+  if std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).is_err() {
+    let _ = unlink_socket_if_unchanged(path, identity);
+    return None;
+  }
+  let secured = std::fs::symlink_metadata(path).is_ok_and(|meta| {
+    meta.file_type().is_socket()
+      && meta.mode() & 0o777 == 0o600
+      && meta.dev() == identity.dev
+      && meta.ino() == identity.ino
+  });
+  if !secured {
+    let _ = unlink_socket_if_unchanged(path, identity);
+    return None;
+  }
+  let socket_path = path.to_string_lossy().into_owned();
+  tracing::info!("[ipc] Created IPC socket: {socket_path}");
+  fanout_socket_link(alias_dirs, &socket_path, &socket_file_name(&socket_path));
+  Some((listener, socket_path, identity))
+}
+
+/// Identity of `path` when it is a socket, without following symlinks.
+fn socket_identity(path: &Path) -> Option<FileId> {
+  let meta = std::fs::symlink_metadata(path).ok()?;
+  meta.file_type().is_socket().then(|| FileId {
+    dev: meta.dev(),
+    ino: meta.ino(),
   })
 }
 

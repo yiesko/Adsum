@@ -300,8 +300,15 @@ pub(crate) fn bind_dirs_in_order(
   dirs
 }
 
-/// Normalize an absolute non-root path, refusing empty/relative/root input.
+/// Normalize an absolute non-root path, refusing empty/relative/root input
+/// and lexical `..` (the validated path must be the path actually used).
 fn normalize_dir(path: &Path) -> io::Result<PathBuf> {
+  if path
+    .components()
+    .any(|component| component == Component::ParentDir)
+  {
+    return Err(invalid_path(path, "contains a parent-directory component"));
+  }
   normalize_absolute(path)
     .filter(|normalized| normalized != Path::new("/"))
     .ok_or_else(|| invalid_path(path, "not an absolute non-root directory"))
@@ -1054,6 +1061,23 @@ mod tests {
       "regular file must fail"
     );
     let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// A lexical `..` after a symlink is refused: the validated path must be
+  /// the path actually used.
+  #[test]
+  fn validate_private_dir_rejects_parent_dir_after_symlink() {
+    let base = scratch("parent-dir");
+    let outside = scratch("parent-dir-outside");
+    let link = base.join("link");
+    std::os::unix::fs::symlink(&outside, &link).expect("symlink");
+    let tricky = link.join("..");
+
+    let err = validate_private_dir(&tricky).expect_err("parent-dir component must fail");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&outside);
   }
 
   /// Private dirs are created 0700; a symlinked parent is never followed.

@@ -6,14 +6,14 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use std::io::{Read, Write};
-use std::os::unix::fs::FileTypeExt;
+use std::io::Read;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use adsum_transport_ipc::IpcTransport;
-use adsum_transport_ipc::frame::{PacketType, encode};
+use adsum_transport_ipc::frame::PacketType;
 use adsum_types::user::RpcUser;
 use common::{Scratch, read_frame, recv_cmd, write_frame};
 
@@ -273,44 +273,46 @@ async fn drop_without_shutdown_still_clears_presence() {
   );
 }
 
-/// Regular files squatting an index are reclaimed for the socket.
+/// A foreign regular file keeps its index; bind moves to the next one.
 #[tokio::test]
-async fn stale_regular_file_is_reclaimed() {
-  let scratch = Scratch::new("stale");
+async fn foreign_regular_file_is_preserved_and_next_index_bound() {
+  let scratch = Scratch::new("foreign-file");
   let dir = scratch.sub("a");
-  // A regular file squatting the first index is stale by definition.
-  std::fs::write(dir.join("discord-ipc-0"), b"squat").expect("squat file");
+  let squat = dir.join("discord-ipc-0");
+  std::fs::write(&squat, b"squat").expect("squat file");
 
-  let (transport, _rx) = IpcTransport::bind_with_dirs(user(), vec![dir.clone()])
+  let (transport, _rx) = IpcTransport::bind_with_dirs(user(), vec![dir])
     .await
     .unwrap();
-  assert!(transport.socket_path().ends_with("discord-ipc-0"));
   assert!(
-    std::fs::symlink_metadata(transport.socket_path())
-      .expect("socket exists")
+    transport.socket_path().ends_with("discord-ipc-1"),
+    "foreign file must keep index 0, got {}",
+    transport.socket_path()
+  );
+  assert_eq!(std::fs::read(&squat).expect("foreign file kept"), b"squat");
+  assert!(
+    std::fs::symlink_metadata(&squat)
+      .expect("squat metadata")
       .file_type()
-      .is_socket()
+      .is_file()
   );
   transport.shutdown().await;
+  assert_eq!(
+    std::fs::read(&squat).expect("foreign file survives shutdown"),
+    b"squat"
+  );
 }
 
-/// Live sockets are never stolen: bind moves to the next index.
+/// A silent listener holds its index; bind moves to the next one.
 #[tokio::test]
 async fn live_holder_blocks_rebind_to_next_index() {
   let scratch = Scratch::new("live");
   let dir = scratch.sub("a");
-  // Occupy index 0 with a real listener that answers PONG like a holder.
+  // Bound but never accepting: a successful connect is enough to prove
+  // the index is held, with no PING/PONG exchange.
   let holder = UnixListener::bind(dir.join("discord-ipc-0")).expect("holder socket");
-  std::thread::spawn(move || {
-    let (mut stream, _) = holder.accept().expect("probe accept");
-    let mut ping = vec![0_u8; 8 + "adsum-probe".len()];
-    use std::io::Read;
-    stream.read_exact(&mut ping).expect("read ping");
-    let pong = encode(PacketType::Pong, "adsum-probe");
-    stream.write_all(&pong).expect("write pong");
-  });
 
-  let (transport, _rx) = IpcTransport::bind_with_dirs(user(), vec![dir])
+  let (transport, _rx) = IpcTransport::bind_with_dirs(user(), vec![dir.clone()])
     .await
     .unwrap();
   assert!(
@@ -318,6 +320,82 @@ async fn live_holder_blocks_rebind_to_next_index() {
     "live index 0 must be skipped, got {}",
     transport.socket_path()
   );
+  transport.shutdown().await;
+  assert!(
+    std::fs::symlink_metadata(dir.join("discord-ipc-0"))
+      .expect("holder socket kept")
+      .file_type()
+      .is_socket(),
+    "the live holder's path must never be removed"
+  );
+  drop(holder);
+}
+
+/// A dead listener's socket file is reclaimed for index 0.
+#[tokio::test]
+async fn stale_socket_is_reclaimed() {
+  let scratch = Scratch::new("stale-reclaim");
+  let dir = scratch.sub("a");
+  let stale = dir.join("discord-ipc-0");
+  let listener = UnixListener::bind(&stale).expect("stale socket");
+  drop(listener);
+
+  let (transport, _rx) = IpcTransport::bind_with_dirs(user(), vec![dir])
+    .await
+    .unwrap();
+  assert!(
+    transport.socket_path().ends_with("discord-ipc-0"),
+    "stale socket must be reclaimed, got {}",
+    transport.socket_path()
+  );
+  assert!(
+    std::fs::symlink_metadata(&stale)
+      .expect("reclaimed socket")
+      .file_type()
+      .is_socket()
+  );
+  transport.shutdown().await;
+  assert!(std::fs::symlink_metadata(&stale).is_err());
+}
+
+/// Ten held indexes fail the bind and none of them is deleted.
+#[tokio::test]
+async fn all_busy_indexes_return_error_without_deleting() {
+  let scratch = Scratch::new("all-busy");
+  let dir = scratch.sub("a");
+  let mut holders = Vec::with_capacity(10);
+  for index in 0..10 {
+    let path = dir.join(format!("discord-ipc-{index}"));
+    holders.push(UnixListener::bind(path).expect("holder socket"));
+  }
+
+  let result = IpcTransport::bind_with_dirs(user(), vec![dir.clone()]).await;
+  assert!(result.is_err(), "every index is held: bind must fail");
+  for index in 0..10 {
+    let path = dir.join(format!("discord-ipc-{index}"));
+    assert!(
+      std::fs::symlink_metadata(&path)
+        .expect("holder path kept")
+        .file_type()
+        .is_socket(),
+      "index {index} must stay a socket"
+    );
+  }
+  drop(holders);
+}
+
+/// The bound socket is published with mode 0600.
+#[tokio::test]
+async fn bound_socket_is_0600() {
+  let scratch = Scratch::new("mode");
+  let dir = scratch.sub("a");
+
+  let (transport, _rx) = IpcTransport::bind_with_dirs(user(), vec![dir])
+    .await
+    .unwrap();
+  let meta = std::fs::symlink_metadata(transport.socket_path()).expect("socket metadata");
+  assert!(meta.file_type().is_socket());
+  assert_eq!(meta.mode() & 0o777, 0o600);
   transport.shutdown().await;
 }
 
