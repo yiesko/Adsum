@@ -11,7 +11,7 @@
 #![allow(dead_code)]
 
 use std::io::{Read, Write};
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -75,6 +75,45 @@ impl Drop for Scratch {
   fn drop(&mut self) {
     let _ = std::fs::remove_dir_all(&self.path);
   }
+}
+
+/// Effective uid of the test process.
+pub fn euid() -> u32 {
+  // SAFETY: geteuid has no preconditions and always succeeds.
+  unsafe { libc::geteuid() }
+}
+
+/// `(dev, ino)` of an existing entry, without following symlinks.
+pub fn file_id(path: &Path) -> (u64, u64) {
+  let meta = std::fs::symlink_metadata(path).expect("entry metadata");
+  (meta.dev(), meta.ino())
+}
+
+/// Marker path for `index` inside `alias_dir`.
+pub fn marker_path(alias_dir: &Path, index: u8) -> PathBuf {
+  alias_dir.join(format!(".adsum-ipc-owner-{}-{index}", euid()))
+}
+
+/// Write a valid v1 marker for `alias -> target` with mode exactly `0600`.
+pub fn write_marker(marker: &Path, alias: &Path, target: &Path) {
+  let (target_dev, target_ino) = file_id(target);
+  let data = serde_json::json!({
+    "version": 1,
+    "owner_uid": euid(),
+    "alias": alias.to_str().expect("alias utf8"),
+    "target": target.to_str().expect("target utf8"),
+    "target_dev": target_dev,
+    "target_ino": target_ino,
+  });
+  std::fs::write(marker, serde_json::to_vec(&data).expect("serialize marker"))
+    .expect("write marker");
+  std::fs::set_permissions(marker, std::fs::Permissions::from_mode(0o600)).expect("chmod marker");
+}
+
+/// Parsed JSON content of a marker file.
+pub fn read_marker(marker: &Path) -> serde_json::Value {
+  let raw = std::fs::read(marker).expect("read marker");
+  serde_json::from_slice(&raw).expect("marker json")
 }
 
 /// Write one IPC frame.

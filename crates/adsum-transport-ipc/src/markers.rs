@@ -2,7 +2,6 @@
 //!
 //! A marker is never overwritten and never authorizes removing an alias
 //! unless its recorded `(dev, ino)` still matches the on-disk file.
-#![cfg_attr(not(test), allow(dead_code))] // Staging for Task 5, which wires the transport.
 
 use std::ffi::OsStr;
 use std::fs::{File, Metadata, OpenOptions, Permissions};

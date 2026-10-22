@@ -12,17 +12,20 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use adsum_protocol::error::AdsumError;
 use adsum_transport_ipc::IpcTransport;
 use adsum_transport_ipc::frame::PacketType;
 use adsum_types::user::RpcUser;
-use common::{Scratch, read_frame, recv_cmd, write_frame};
+use common::{
+  Scratch, euid, file_id, marker_path, read_frame, read_marker, recv_cmd, write_frame, write_marker,
+};
 
 /// Default-identity fixture shared by the bind tests.
 fn user() -> std::sync::Arc<std::sync::Mutex<RpcUser>> {
   std::sync::Arc::new(std::sync::Mutex::new(RpcUser::default()))
 }
 
-/// Bind creates the socket plus fan-out links; shutdown removes both.
+/// Bind creates the socket plus a marked alias; shutdown removes both.
 #[tokio::test]
 async fn bind_creates_socket_and_fans_out_links() {
   let scratch = Scratch::new("bind");
@@ -40,16 +43,227 @@ async fn bind_creates_socket_and_fans_out_links() {
       .file_type()
       .is_socket()
   );
-  // Fan-out link in the second dir points at the live socket.
+  // Alias in the second dir points at the live socket and is marked ours.
+  let alias = b.join("discord-ipc-0");
   assert_eq!(
-    std::fs::read_link(b.join("discord-ipc-0")).expect("fan-out link"),
-    std::path::PathBuf::from(&bound)
+    std::fs::read_link(&alias).expect("fan-out link"),
+    PathBuf::from(&bound)
+  );
+  let marker = marker_path(&b, 0);
+  let marker_meta = std::fs::symlink_metadata(&marker).expect("alias marker");
+  assert!(marker_meta.file_type().is_file(), "marker must be a file");
+  assert_eq!(marker_meta.mode() & 0o777, 0o600);
+  assert_eq!(marker_meta.uid(), euid());
+  let json = read_marker(&marker);
+  assert_eq!(json["version"].as_u64(), Some(1));
+  assert_eq!(json["owner_uid"].as_u64(), Some(u64::from(euid())));
+  assert_eq!(json["alias"].as_str(), alias.to_str());
+  assert_eq!(json["target"].as_str(), Some(bound.as_str()));
+  assert_eq!(
+    (json["target_dev"].as_u64(), json["target_ino"].as_u64()),
+    (
+      Some(file_id(Path::new(&bound)).0),
+      Some(file_id(Path::new(&bound)).1)
+    )
   );
 
   transport.shutdown().await;
-  // Shutdown cleans the socket file and our links.
-  assert!(!std::path::Path::new(&bound).exists());
-  assert!(std::fs::read_link(b.join("discord-ipc-0")).is_err());
+  // Shutdown cleans the socket file, our alias, and its marker.
+  assert!(!Path::new(&bound).exists());
+  assert!(std::fs::symlink_metadata(&alias).is_err());
+  assert!(std::fs::symlink_metadata(&marker).is_err());
+}
+
+/// A foreign symlink that happens to point at the bound socket is never adopted.
+#[tokio::test]
+async fn foreign_symlink_pointing_at_bound_socket_is_preserved() {
+  let scratch = Scratch::new("foreign-bound-link");
+  let (a, b) = (scratch.sub("a"), scratch.sub("b"));
+  let target = a.join("discord-ipc-0");
+  let alias = b.join("discord-ipc-0");
+  std::os::unix::fs::symlink(&target, &alias).expect("foreign link");
+
+  let (transport, _rx) = IpcTransport::bind_with_dirs(user(), vec![a, b.clone()])
+    .await
+    .unwrap();
+  assert_eq!(Path::new(transport.socket_path()), target.as_path());
+  assert_eq!(
+    std::fs::read_link(&alias).expect("foreign link kept"),
+    target
+  );
+  assert!(
+    std::fs::symlink_metadata(marker_path(&b, 0)).is_err(),
+    "a foreign link must not gain a marker"
+  );
+
+  transport.shutdown().await;
+  assert_eq!(
+    std::fs::read_link(&alias).expect("foreign link survives shutdown"),
+    target
+  );
+  assert!(!target.exists(), "the owned socket itself is removed");
+}
+
+/// A live foreign alias and its marker survive bind and shutdown untouched.
+#[tokio::test]
+async fn shutdown_preserves_foreign_alias_and_marker() {
+  let scratch = Scratch::new("foreign-live-alias");
+  let (a, b, foreign) = (scratch.sub("a"), scratch.sub("b"), scratch.sub("foreign"));
+  let target = foreign.join("discord-ipc-0");
+  let listener = UnixListener::bind(&target).expect("foreign listener");
+  let alias = b.join("discord-ipc-0");
+  std::os::unix::fs::symlink(&target, &alias).expect("foreign alias");
+  let marker = marker_path(&b, 0);
+  write_marker(&marker, &alias, &target);
+  let expected = a.join("discord-ipc-0");
+
+  let (transport, _rx) = IpcTransport::bind_with_dirs(user(), vec![a, b.clone()])
+    .await
+    .unwrap();
+  assert_eq!(Path::new(transport.socket_path()), expected.as_path());
+  transport.shutdown().await;
+
+  assert_eq!(
+    std::fs::read_link(&alias).expect("foreign alias kept"),
+    target
+  );
+  let json = read_marker(&marker);
+  assert_eq!(json["target"].as_str(), target.to_str());
+  assert_eq!(
+    (json["target_dev"].as_u64(), json["target_ino"].as_u64()),
+    (Some(file_id(&target).0), Some(file_id(&target).1))
+  );
+  drop(listener);
+}
+
+/// Recovery runs before the bind, so a dead leftover alias is replaced by one
+/// that this transport owns and removes on shutdown.
+#[tokio::test]
+async fn abrupt_leftover_alias_is_recovered_before_bind() {
+  let scratch = Scratch::new("abrupt-leftover");
+  let (a, b) = (scratch.sub("a"), scratch.sub("b"));
+  let stale = a.join("discord-ipc-0");
+  drop(UnixListener::bind(&stale).expect("stale socket"));
+  let alias = b.join("discord-ipc-0");
+  std::os::unix::fs::symlink(&stale, &alias).expect("leftover alias");
+  let marker = marker_path(&b, 0);
+  write_marker(&marker, &alias, &stale);
+
+  let (transport, _rx) = IpcTransport::bind_with_dirs(user(), vec![a, b.clone()])
+    .await
+    .unwrap();
+  let bound = PathBuf::from(transport.socket_path());
+  assert_eq!(bound, stale);
+  assert_eq!(
+    std::fs::read_link(&alias).expect("replacement alias"),
+    bound
+  );
+  let json = read_marker(&marker);
+  assert_eq!(json["target"].as_str(), bound.to_str());
+  assert_eq!(
+    (json["target_dev"].as_u64(), json["target_ino"].as_u64()),
+    (Some(file_id(&bound).0), Some(file_id(&bound).1))
+  );
+
+  transport.shutdown().await;
+  assert!(
+    std::fs::symlink_metadata(&alias).is_err(),
+    "the replacement alias is owned and removed"
+  );
+  assert!(
+    std::fs::symlink_metadata(&marker).is_err(),
+    "the replacement marker is owned and removed"
+  );
+}
+
+/// A marker whose target still accepts connections is a live owner: preserve it.
+#[tokio::test]
+async fn live_orphan_alias_is_preserved() {
+  let scratch = Scratch::new("live-orphan");
+  let (a, b, c) = (scratch.sub("a"), scratch.sub("b"), scratch.sub("c"));
+  let target = a.join("discord-ipc-0");
+  let listener = UnixListener::bind(&target).expect("live target");
+  let alias = b.join("discord-ipc-0");
+  std::os::unix::fs::symlink(&target, &alias).expect("orphan alias");
+  let marker = marker_path(&b, 0);
+  write_marker(&marker, &alias, &target);
+  let expected = c.join("discord-ipc-0");
+
+  let (transport, _rx) = IpcTransport::bind_with_dirs(user(), vec![c, b.clone()])
+    .await
+    .unwrap();
+  assert_eq!(Path::new(transport.socket_path()), expected.as_path());
+  assert_eq!(std::fs::read_link(&alias).expect("live alias kept"), target);
+  let json = read_marker(&marker);
+  assert_eq!(json["target"].as_str(), target.to_str());
+
+  transport.shutdown().await;
+  assert_eq!(
+    std::fs::read_link(&alias).expect("live alias survives shutdown"),
+    target
+  );
+  assert!(
+    std::fs::symlink_metadata(&marker).is_ok(),
+    "the live owner's marker must survive"
+  );
+  drop(listener);
+}
+
+/// A second start skips a live owner's alias and neither shutdown touches it.
+#[tokio::test]
+async fn concurrent_starts_do_not_replace_each_others_alias() {
+  let scratch = Scratch::new("concurrent-starts");
+  let (a, b, shared) = (scratch.sub("a"), scratch.sub("b"), scratch.sub("shared"));
+  let first = a.join("discord-ipc-0");
+  let (t1, _rx1) = IpcTransport::bind_with_dirs(user(), vec![a, shared.clone()])
+    .await
+    .unwrap();
+  assert_eq!(Path::new(t1.socket_path()), first.as_path());
+  let alias = shared.join("discord-ipc-0");
+  let marker = marker_path(&shared, 0);
+  assert_eq!(std::fs::read_link(&alias).expect("first alias"), first);
+  assert!(std::fs::symlink_metadata(&marker).is_ok());
+
+  let second = b.join("discord-ipc-0");
+  let (t2, _rx2) = IpcTransport::bind_with_dirs(user(), vec![b, shared.clone()])
+    .await
+    .unwrap();
+  assert_eq!(Path::new(t2.socket_path()), second.as_path());
+  assert_eq!(
+    std::fs::read_link(&alias).expect("alias kept"),
+    first,
+    "t2 must not replace t1's alias"
+  );
+  assert!(std::fs::symlink_metadata(&marker).is_ok());
+
+  t2.shutdown().await;
+  assert_eq!(
+    std::fs::read_link(&alias).expect("alias survives t2"),
+    first,
+    "t2 must not remove t1's alias"
+  );
+  assert!(
+    std::fs::symlink_metadata(&marker).is_ok(),
+    "t2 must not remove t1's marker"
+  );
+
+  t1.shutdown().await;
+  assert!(std::fs::symlink_metadata(&alias).is_err());
+  assert!(std::fs::symlink_metadata(&marker).is_err());
+}
+
+/// An empty bind-dir list is invalid input, never a silent `/tmp` bind.
+#[tokio::test]
+async fn empty_bind_dirs_return_error() {
+  let err = IpcTransport::bind_with_dirs(user(), Vec::new())
+    .await
+    .expect_err("empty bind dirs must fail");
+  match err {
+    AdsumError::IpcBind { source, .. } => {
+      assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
+    }
+    other => panic!("expected IpcBind, got {other:?}"),
+  }
 }
 
 /// The Flatpak Discord dir is bound first and every existing alias layout
@@ -58,8 +272,7 @@ async fn bind_creates_socket_and_fans_out_links() {
 async fn preferred_dir_binds_socket_with_connectable_aliases() {
   let scratch = Scratch::new("preferred");
   let runtime = scratch.sub("runtime");
-  let preferred = runtime.join("app/com.discordapp.Discord");
-  std::fs::create_dir_all(&preferred).expect("preferred dir");
+  let preferred = scratch.sub("runtime/app/com.discordapp.Discord");
   let alias_layouts = [
     ".flatpak/com.discordapp.Discord/xdg-run",
     ".flatpak/com.discordapp.DiscordCanary/xdg-run",
@@ -75,7 +288,7 @@ async fn preferred_dir_binds_socket_with_connectable_aliases() {
     "snap.discord-ptb",
   ];
   for layout in alias_layouts {
-    std::fs::create_dir_all(runtime.join(layout)).expect("alias dir");
+    scratch.sub(&format!("runtime/{layout}"));
   }
 
   let (transport, _rx) =
@@ -107,6 +320,17 @@ async fn preferred_dir_binds_socket_with_connectable_aliases() {
     std::fs::read_link(runtime.join("discord-ipc-0")).expect("direct alias"),
     PathBuf::from(&bound)
   );
+  for layout in alias_layouts {
+    let marker = marker_path(&runtime.join(layout), 0);
+    assert!(
+      std::fs::symlink_metadata(&marker).is_ok(),
+      "marker for {layout} must exist"
+    );
+  }
+  assert!(
+    std::fs::symlink_metadata(marker_path(&runtime, 0)).is_ok(),
+    "marker for the direct alias must exist"
+  );
 
   // A client probing the legacy Flatpak path reaches the real server.
   let mut client =
@@ -129,12 +353,18 @@ async fn preferred_dir_binds_socket_with_connectable_aliases() {
   assert!(!Path::new(&bound).exists());
   assert!(preferred.is_dir(), "socket dir must remain after shutdown");
   for layout in alias_layouts {
+    let dir = runtime.join(layout);
     assert!(
-      std::fs::read_link(runtime.join(layout).join("discord-ipc-0")).is_err(),
+      std::fs::read_link(dir.join("discord-ipc-0")).is_err(),
       "alias {layout} must be removed on shutdown"
+    );
+    assert!(
+      std::fs::symlink_metadata(marker_path(&dir, 0)).is_err(),
+      "marker {layout} must be removed on shutdown"
     );
   }
   assert!(std::fs::read_link(runtime.join("discord-ipc-0")).is_err());
+  assert!(std::fs::symlink_metadata(marker_path(&runtime, 0)).is_err());
 }
 
 /// Existing alias dirs are used; missing client dirs are never created.
@@ -159,8 +389,8 @@ async fn symlinked_alias_dir_is_not_used() {
   let scratch = Scratch::new("alias-symlink");
   let runtime = scratch.sub("runtime");
   let outside = scratch.sub("outside");
-  std::fs::create_dir_all(outside.join("com.discordapp.Discord")).expect("outside official");
-  std::fs::create_dir_all(runtime.join("app")).expect("app dir");
+  scratch.sub("outside/com.discordapp.Discord");
+  scratch.sub("runtime/app");
   std::os::unix::fs::symlink(
     outside.join("com.discordapp.Discord"),
     runtime.join("app/com.discordapp.Discord"),
@@ -184,8 +414,7 @@ async fn symlinked_alias_dir_is_not_used() {
 async fn unusable_preferred_dir_falls_back_to_runtime_base() {
   let scratch = Scratch::new("preferred-unusable");
   let runtime = scratch.sub("runtime");
-  let preferred = runtime.join("app/com.discordapp.Discord");
-  std::fs::create_dir_all(preferred.parent().expect("app parent")).expect("app dir");
+  let preferred = scratch.sub("runtime/app").join("com.discordapp.Discord");
   std::fs::write(&preferred, b"squat").expect("squat preferred");
 
   let (transport, _rx) = IpcTransport::bind_with_dirs(user(), vec![preferred, runtime.clone()])
