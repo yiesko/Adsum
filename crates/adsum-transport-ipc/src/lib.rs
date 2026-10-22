@@ -17,6 +17,8 @@ pub mod frame;
 pub mod sink;
 
 #[cfg(unix)]
+mod markers;
+#[cfg(unix)]
 pub mod paths;
 #[cfg(unix)]
 mod probe;
