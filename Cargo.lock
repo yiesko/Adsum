@@ -34,6 +34,7 @@ dependencies = [
  "adsum-detect",
  "clap",
  "hex",
+ "libc",
  "minisign-verify",
  "semver",
  "serde",

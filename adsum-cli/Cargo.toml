@@ -18,6 +18,10 @@ workspace = true
 name = "adsum"
 path = "src/main.rs"
 
+[target.'cfg(unix)'.dev-dependencies]
+# The SIGTERM integration test signals the spawned daemon directly.
+libc = "0.2"
+
 [dependencies]
 adsum-core = { path = "../crates/adsum-core" }
 adsum-detect = { path = "../crates/adsum-detect" }
