@@ -332,7 +332,7 @@ async fn empty_bind_dirs_return_error() {
 /// reaches the same socket, then shutdown removes the socket and links.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn preferred_dir_binds_socket_with_connectable_aliases() {
-  let scratch = Scratch::new("preferred");
+  let scratch = Scratch::new("pref");
   let runtime = scratch.sub("runtime");
   let preferred = scratch.sub("runtime/app/com.discordapp.Discord");
   let alias_layouts = [

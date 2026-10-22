@@ -38,8 +38,10 @@ impl Scratch {
     // Canonicalize so platform symlinks (macOS `/var`) do not fail the
     // private-directory gate for tests.
     let root = std::fs::canonicalize(&root).unwrap_or(root);
+    // Keep this prefix short: macOS caps `sun_path` at 104 bytes, and the
+    // Flatpak alias socket path appended by tests leaves little slack.
     let path = root.join(format!(
-      "adsum-ipc-test-{}-{}-{}",
+      "adsum-{}-{}-{}",
       std::process::id(),
       tag,
       COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),

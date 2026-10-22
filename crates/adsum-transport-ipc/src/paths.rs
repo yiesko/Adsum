@@ -899,22 +899,21 @@ mod tests {
     let _ = std::fs::remove_dir_all(&scratch_dir);
   }
 
-  /// The fallback dir under `/tmp` is created 0700 and owned by us.
+  /// The fallback dir under canonical `/tmp` is created 0700 and owned by us.
   #[test]
   fn prepare_fallback_dir_creates_private_dir_under_tmp() {
-    let tmp = Path::new("/tmp");
-    if !tmp.is_dir() {
+    // macOS `/tmp` is a symlink and production rejects symlinked chains, so
+    // canonicalize once and reuse that root for every assertion below.
+    let Ok(root) = std::fs::canonicalize("/tmp") else {
       return;
-    }
+    };
     let euid = current_euid();
-    let fallback = std::fs::canonicalize(tmp)
-      .map(|root| root.join(fallback_dir_name(euid)))
-      .unwrap_or_else(|_| tmp.join(fallback_dir_name(euid)));
+    let fallback = root.join(fallback_dir_name(euid));
     let _guard = FALLBACK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     if !fallback.exists() {
-      let dir =
-        prepare_fallback_dir(&[tmp.to_path_buf()], euid).expect("prepare fallback dir under /tmp");
+      let dir = prepare_fallback_dir(std::slice::from_ref(&root), euid)
+        .expect("prepare fallback dir under /tmp");
       assert_eq!(dir, fallback);
       let meta = std::fs::symlink_metadata(&dir).expect("fallback metadata");
       assert_eq!(meta.mode() & 0o777, 0o700);
@@ -922,7 +921,7 @@ mod tests {
       let _ = std::fs::remove_dir(&dir);
     }
 
-    let unique = tmp.join(format!(".adsum-ipc-test-{}", std::process::id()));
+    let unique = root.join(format!(".adsum-ipc-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&unique);
     prepare_private_dir(&unique).expect("create unique private dir");
     let meta = std::fs::symlink_metadata(&unique).expect("unique metadata");

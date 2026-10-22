@@ -732,9 +732,11 @@ mod tests {
 
   use super::*;
 
-  /// Isolated 0700 temp dir per test (tag-suffixed, hermetic).
+  /// Isolated 0700 temp dir per test, under canonical `/tmp` when available:
+  /// macOS `$TMPDIR` is long and `sun_path` caps socket paths at 104 bytes.
   fn scratch(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("adsum-unix-test-{}-{tag}", std::process::id()));
+    let base = std::fs::canonicalize("/tmp").unwrap_or_else(|_| std::env::temp_dir());
+    let dir = base.join(format!("adsum-unix-test-{}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::DirBuilder::new()
       .mode(0o700)
@@ -748,8 +750,7 @@ mod tests {
   fn finish_bind_rejects_replaced_socket_path() {
     let dir = scratch("finish-bind-replaced");
     let path = dir.join("discord-ipc-0");
-    let temp = dir.join("discord-ipc-temp");
-    let listener = UnixListener::bind(&temp).expect("temp listener");
+    let (listener, temp) = bind_temp(&dir, 0).expect("temp listener");
     let foreign = UnixListener::bind(&path).expect("foreign listener");
     let foreign_mode = std::fs::symlink_metadata(&path)
       .expect("foreign metadata")
