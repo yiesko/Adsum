@@ -461,7 +461,7 @@ fn cmd_list_database(daemon: &Daemon) -> Result<(), Box<dyn std::error::Error>> 
 }
 
 /// CLI entry: parse args, handle one-shot modes, otherwise run the daemon
-/// until Ctrl+C.
+/// until Ctrl+C (or SIGTERM on Unix).
 async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
   install_panic_hook();
 
@@ -506,10 +506,30 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
   // --auto-update is set (opt-in). Never restarts anything by itself.
   update::spawn_watcher(args.auto_update);
 
+  // Register SIGTERM before the daemon starts: without the handler systemd
+  // would kill the process without running the transport cleanup.
+  #[cfg(unix)]
+  let mut sigterm = {
+    use tokio::signal::unix::{SignalKind, signal};
+    signal(SignalKind::terminate())?
+  };
+
+  #[cfg(unix)]
+  println!("Press Ctrl+C or send SIGTERM to exit");
+  #[cfg(not(unix))]
   println!("Press Ctrl+C to exit");
+
   daemon
-    .run_until(async {
-      let _ = tokio::signal::ctrl_c().await;
+    .run_until(async move {
+      #[cfg(unix)]
+      tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = sigterm.recv() => {}
+      }
+      #[cfg(not(unix))]
+      {
+        let _ = tokio::signal::ctrl_c().await;
+      }
     })
     .await?;
 

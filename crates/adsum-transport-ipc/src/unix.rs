@@ -6,7 +6,8 @@
 //! with a deadline, then aborts stragglers.
 
 use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::sync::{
   Arc, Mutex,
   atomic::{AtomicU64, Ordering},
@@ -24,14 +25,26 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::frame::{IpcFacilitator, handle_stream};
-use crate::paths::{
-  fanout_socket_link, remove_socket_links, socket_dir_candidates, socket_file_name,
+use crate::markers::{
+  OwnedAlias, PublishOutcome, publish_alias, recover_orphan_aliases, remove_owned_aliases,
 };
-use crate::probe::socket_holder_alive;
+use crate::paths::{
+  bind_dirs_in_order, current_euid, preferred_socket_dir_from, prepare_fallback_dir,
+  prepare_socket_dir, socket_alias_dirs, socket_dir_candidates, validate_private_dir,
+};
+use crate::probe::{FileId, SocketState, probe_socket, unlink_socket_if_unchanged};
 use crate::sink::{DEFAULT_IPC_QUEUE, EventSink};
 
 /// Upper bound for graceful connection drain in [`IpcTransport::shutdown`].
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Exact warning when the socket is not inside the Flatpak-preferred dir.
+const FLATPAK_UNAVAILABLE_WARNING: &str = "[ipc] Flatpak-compatible socket path unavailable; compatibility aliases may not be reachable from sandboxed clients";
+
+/// Whether the bound socket sits inside the prepared Flatpak-preferred dir.
+fn flatpak_compatibility_available(preferred: Option<&Path>, bound: &Path) -> bool {
+  preferred.is_some_and(|dir| bound.starts_with(dir))
+}
 
 /// Backoff after a listener accept error: transient per-connection
 /// failures retry at once, persistent ones (fd exhaustion) pause briefly
@@ -145,7 +158,10 @@ pub struct IpcTransport {
   /// drain deadline (`abort_all` cannot interrupt a running closure).
   live: Arc<Mutex<Vec<(u64, std::os::unix::net::UnixStream)>>>,
   bound_path: String,
-  dirs: Vec<PathBuf>,
+  /// `(dev, ino)` of the bound socket, rechecked before removal.
+  bound_id: FileId,
+  /// Aliases with valid markers created by this transport, removed on drop.
+  owned_aliases: Vec<OwnedAlias>,
   sink: EventSink,
 }
 
@@ -159,72 +175,128 @@ impl std::fmt::Debug for IpcTransport {
 }
 
 impl IpcTransport {
-  /// Bind `discord-ipc-0..=9` in the official candidate dirs.
+  /// Bind `discord-ipc-0..=9`, preferring the official Flatpak Discord dir
+  /// and falling back to the conventional candidate bases.
   ///
   /// # Errors
   ///
   /// [`AdsumError::IpcBind`] when every index is held by a live holder.
   pub async fn bind(user: Arc<Mutex<RpcUser>>) -> Result<(Self, mpsc::Receiver<ActivityCmd>)> {
-    Self::bind_with_dirs(user, socket_dir_candidates()).await
-  }
-
-  /// Bind within explicit `dirs`, trying each in order (first = primary;
-  /// tests point here at a scratch dir instead of the real runtime dirs).
-  /// Fan-out links still cover every dir once any of them binds.
-  ///
-  /// # Errors
-  ///
-  /// [`AdsumError::IpcBind`] when no candidate dir binds (every index held
-  /// by a live holder, or every dir unusable).
-  pub async fn bind_with_dirs(
-    user: Arc<Mutex<RpcUser>>,
-    dirs: Vec<PathBuf>,
-  ) -> Result<(Self, mpsc::Receiver<ActivityCmd>)> {
-    // Blocking syscalls (bind, probe with its 1s budget, symlink fan-out)
-    // run off the async workers; this executes once per (re)bind.
-    let dirs_for_bind = dirs.clone();
-    let (std_listener, bound_path) = tokio::task::spawn_blocking(move || {
-      // One base per candidate: an unusable primary (permissions, regular
-      // file) falls through instead of failing the whole bind. Empty input
-      // keeps the legacy `/tmp` base.
-      let bases: Vec<String> = if dirs_for_bind.is_empty() {
-        vec!["/tmp/discord-ipc".to_string()]
-      } else {
-        dirs_for_bind
-          .iter()
-          .map(|dir| format!("{}/discord-ipc", dir.display()))
-          .collect()
-      };
-      let mut last_err = None;
-      for (index, base) in bases.iter().enumerate() {
-        match create_socket(base, &dirs_for_bind) {
-          Ok(bound) => return Ok(bound),
-          Err(err) => {
-            tracing::warn!("[ipc] Candidate dir {index} unusable, trying next: {err}");
-            last_err = Some(err);
-          }
-        }
-      }
-      Err(last_err.unwrap_or(AdsumError::IpcBind {
-        attempts: 10,
-        source: std::io::Error::other("no candidate dirs"),
-      }))
+    let (preferred, bind_dirs, aliases) = tokio::task::spawn_blocking(|| {
+      let bases = socket_dir_candidates();
+      let preferred = prepare_preferred_dir();
+      let fallback = prepare_fallback_dir(
+        &[PathBuf::from("/tmp"), PathBuf::from("/var/tmp")],
+        current_euid(),
+      );
+      let aliases = socket_alias_dirs(&bases);
+      let bind_dirs = bind_dirs_in_order(bases, preferred.as_deref(), fallback);
+      (preferred, bind_dirs, aliases)
     })
     .await
     .map_err(|_| AdsumError::IpcBind {
       attempts: 10,
-      source: std::io::Error::other("bind task panicked"),
-    })??;
-    std_listener
-      .set_nonblocking(true)
-      .map_err(|source| AdsumError::IpcBind {
+      source: std::io::Error::other("socket path preparation panicked"),
+    })?;
+    let (transport, rx) = Self::bind_with_paths(user, bind_dirs, aliases).await?;
+    let bound = Path::new(transport.socket_path());
+    if !flatpak_compatibility_available(preferred.as_deref(), bound) {
+      tracing::warn!("{FLATPAK_UNAVAILABLE_WARNING}");
+    }
+    Ok((transport, rx))
+  }
+
+  /// Bind within explicit `dirs`, trying each in order (first = primary;
+  /// tests point here at scratch dirs instead of the real runtime dirs).
+  /// Marked aliases are published into every existing alias layout.
+  ///
+  /// # Errors
+  ///
+  /// [`AdsumError::IpcBind`] when `dirs` is empty, or when no candidate dir
+  /// binds (every index held by a live holder, or every dir unusable).
+  pub async fn bind_with_dirs(
+    user: Arc<Mutex<RpcUser>>,
+    dirs: Vec<PathBuf>,
+  ) -> Result<(Self, mpsc::Receiver<ActivityCmd>)> {
+    if dirs.is_empty() {
+      return Err(AdsumError::IpcBind {
+        attempts: 10,
+        source: std::io::Error::new(
+          std::io::ErrorKind::InvalidInput,
+          "no bind directories were provided",
+        ),
+      });
+    }
+    let aliases = tokio::task::spawn_blocking({
+      let dirs = dirs.clone();
+      move || socket_alias_dirs(&dirs)
+    })
+    .await
+    .map_err(|_| AdsumError::IpcBind {
+      attempts: 10,
+      source: std::io::Error::other("socket alias discovery panicked"),
+    })?;
+    Self::bind_with_paths(user, dirs, aliases).await
+  }
+
+  /// Bind in `bind_dirs` (first = primary) and publish marked aliases into
+  /// `alias_dirs`; keeping the lists separate stops production binding in
+  /// alias dirs.
+  async fn bind_with_paths(
+    user: Arc<Mutex<RpcUser>>,
+    bind_dirs: Vec<PathBuf>,
+    alias_dirs: Vec<PathBuf>,
+  ) -> Result<(Self, mpsc::Receiver<ActivityCmd>)> {
+    // Blocking syscalls (recovery, bind, probe with its 1s budget, alias
+    // publication) run off the async workers; this executes once per bind.
+    let (std_listener, bound_path, bound_id, mut owned_aliases) =
+      tokio::task::spawn_blocking(move || {
+        let euid = current_euid();
+        // Recover dead leftovers before binding: a freshly bound socket must
+        // never be mistaken for the target recorded in an old marker.
+        recover_orphan_aliases(&alias_dirs, euid);
+        let mut last_err = None;
+        for (index, dir) in bind_dirs.iter().enumerate() {
+          match create_socket(dir) {
+            Ok((listener, bound_path, bound_id)) => {
+              let owned_aliases = publish_aliases(&alias_dirs, &bound_path, bound_id, euid);
+              return Ok((listener, bound_path, bound_id, owned_aliases));
+            }
+            Err(err) => {
+              tracing::warn!("[ipc] Candidate dir {index} unusable, trying next: {err}");
+              last_err = Some(err);
+            }
+          }
+        }
+        Err(last_err.unwrap_or(AdsumError::IpcBind {
+          attempts: 10,
+          source: std::io::Error::other("no candidate dirs"),
+        }))
+      })
+      .await
+      .map_err(|_| AdsumError::IpcBind {
+        attempts: 10,
+        source: std::io::Error::other("bind task panicked"),
+      })??;
+    // The listener stays alive until its filesystem entries are cleaned so
+    // the identity recheck cannot race a replacement by dropping our fd.
+    if let Err(source) = std_listener.set_nonblocking(true) {
+      cleanup_failed_bind(&mut owned_aliases, &bound_path, bound_id);
+      return Err(AdsumError::IpcBind {
         attempts: 10,
         source,
-      })?;
-    let listener = UnixListener::from_std(std_listener).map_err(|source| AdsumError::IpcBind {
-      attempts: 10,
-      source,
-    })?;
+      });
+    }
+    let listener = match UnixListener::from_std(std_listener) {
+      Ok(listener) => listener,
+      Err(source) => {
+        cleanup_failed_bind(&mut owned_aliases, &bound_path, bound_id);
+        return Err(AdsumError::IpcBind {
+          attempts: 10,
+          source,
+        });
+      }
+    };
 
     let (sink, rx) = EventSink::bounded(DEFAULT_IPC_QUEUE);
     let token = CancellationToken::new();
@@ -249,7 +321,8 @@ impl IpcTransport {
         conns,
         live,
         bound_path,
-        dirs,
+        bound_id,
+        owned_aliases,
         sink,
       },
       rx,
@@ -276,7 +349,7 @@ impl IpcTransport {
 
   /// Graceful shutdown: stop accepting, unblock connection pumps,
   /// drain connections with a deadline, then remove the socket file and
-  /// fan-out links (via [`Drop`]).
+  /// owned aliases (via [`Drop`]).
   pub async fn shutdown(mut self) {
     self.token.cancel();
     if let Some(task) = self.accept_task.take() {
@@ -312,14 +385,43 @@ impl IpcTransport {
   }
 }
 
+/// Prepare the official Flatpak Discord dir, warning and falling back when
+/// the runtime base is missing, shared-temp, or symlinked.
+fn prepare_preferred_dir() -> Option<PathBuf> {
+  let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") else {
+    tracing::debug!("[ipc] XDG_RUNTIME_DIR is unset; skipping Flatpak socket dir");
+    return None;
+  };
+  let Some(dir) = xdg
+    .to_str()
+    .and_then(|xdg| preferred_socket_dir_from(Some(xdg)))
+  else {
+    tracing::warn!(
+      "[ipc] XDG_RUNTIME_DIR is not usable for the Flatpak Discord socket dir; Flatpak compatibility may be unavailable"
+    );
+    return None;
+  };
+  match prepare_socket_dir(&dir) {
+    Ok(()) => Some(dir),
+    Err(err) => {
+      tracing::warn!(
+        "[ipc] Cannot use Flatpak Discord socket dir {}: {err}; falling back",
+        dir.display()
+      );
+      None
+    }
+  }
+}
+
 impl Drop for IpcTransport {
   /// Best-effort shutdown without awaiting: cancel first so token-aware
   /// loops observe it, close every live socket (unblocking pumps parked in
   /// blocking reads, which then emit their disconnect clears), abort the
-  /// accept task, and clean our socket files. Connection tasks are *not*
+  /// accept task, then remove our marked aliases and the bound socket.
+  /// Every removal revalidates the recorded identity, so foreign or
+  /// replaced entries are never touched. Connection tasks are *not*
   /// aborted here — closing their sockets ends them on their own, with
-  /// clears intact. Best-effort filesystem cleanup (mirrors the legacy
-  /// Drop): never touch foreign files (same shape check inside).
+  /// clears intact.
   fn drop(&mut self) {
     self.token.cancel();
     if let Some(task) = &self.accept_task {
@@ -334,55 +436,185 @@ impl Drop for IpcTransport {
       let _ = stream.shutdown(std::net::Shutdown::Both);
     }
     tracing::info!("[ipc] Cleaning up socket: {}", self.bound_path);
-    remove_socket_links(&self.dirs, &self.bound_path);
-    let _ = std::fs::remove_file(&self.bound_path);
+    remove_owned_aliases(&mut self.owned_aliases, current_euid());
+    if !unlink_socket_if_unchanged(Path::new(&self.bound_path), self.bound_id) {
+      tracing::debug!("[ipc] Bound socket {} changed; leaving it", self.bound_path);
+    }
   }
 }
 
-/// Bind `base-0..=9` with stale reclaim, then fan out links.
-fn create_socket(
-  base: &str,
-  dirs: &[PathBuf],
-) -> Result<(std::os::unix::net::UnixListener, String)> {
+/// Remove the aliases and socket of a bind that could not be handed to Tokio.
+fn cleanup_failed_bind(owned: &mut Vec<OwnedAlias>, bound_path: &str, bound_id: FileId) {
+  remove_owned_aliases(owned, current_euid());
+  if !unlink_socket_if_unchanged(Path::new(bound_path), bound_id) {
+    tracing::debug!("[ipc] Bound socket {bound_path} changed; leaving it");
+  }
+}
+
+/// Publish a marked alias for every alias dir, never for the bound path.
+fn publish_aliases(
+  alias_dirs: &[PathBuf],
+  bound_path: &str,
+  bound_id: FileId,
+  euid: u32,
+) -> Vec<OwnedAlias> {
+  let bound = Path::new(bound_path);
+  let Some(index) = alias_index(bound) else {
+    tracing::warn!("[ipc] Cannot derive a socket index from {bound_path}; skipping aliases");
+    return Vec::new();
+  };
+  let mut owned = Vec::with_capacity(alias_dirs.len());
+  for dir in alias_dirs {
+    let alias = dir.join(format!("discord-ipc-{index}"));
+    if alias.as_path() == bound {
+      continue;
+    }
+    match publish_alias(dir, index, bound, bound_id, euid) {
+      PublishOutcome::Created(created) => owned.push(created),
+      PublishOutcome::Skipped => {}
+    }
+  }
+  owned
+}
+
+/// `discord-ipc-<index>` index encoded in a bound socket path.
+fn alias_index(bound: &Path) -> Option<u8> {
+  bound
+    .file_name()?
+    .to_str()?
+    .strip_prefix("discord-ipc-")?
+    .parse::<u8>()
+    .ok()
+}
+
+/// Bind `discord-ipc-0..=9` in the private `dir`, probing every index
+/// before touching it; aliases are published by the caller afterwards.
+fn create_socket(dir: &Path) -> Result<(std::os::unix::net::UnixListener, String, FileId)> {
+  validate_private_dir(dir).map_err(|source| AdsumError::IpcBind {
+    attempts: 10,
+    source,
+  })?;
   let mut last_err = None;
-  for tries in 0..=9_u8 {
-    let socket_path = format!("{base}-{tries}");
-    tracing::info!("[ipc] Creating socket: {socket_path}");
-    match std::os::unix::net::UnixListener::bind(&socket_path) {
-      Ok(socket) => {
-        tracing::info!("[ipc] Created IPC socket: {socket_path}");
-        fanout_socket_link(dirs, &socket_path, &socket_file_name(&socket_path));
-        return Ok((socket, socket_path));
-      }
-      Err(err) => {
-        if err.kind() == ErrorKind::AddrInUse {
-          tracing::info!("[ipc] Socket {socket_path} already in use, checking if stale...");
-          if socket_holder_alive(&socket_path) {
-            tracing::warn!("[ipc] Socket {socket_path} is in use by another process");
-          } else {
-            tracing::warn!("[ipc] Socket {socket_path} is stale, removing and retrying...");
-            let _ = std::fs::remove_file(&socket_path);
-            match std::os::unix::net::UnixListener::bind(&socket_path) {
-              Ok(socket) => {
-                tracing::info!("[ipc] Created IPC socket after cleaning stale: {socket_path}");
-                fanout_socket_link(dirs, &socket_path, &socket_file_name(&socket_path));
-                return Ok((socket, socket_path));
-              }
-              Err(retry_err) => {
-                tracing::warn!("[ipc] Rebind after stale-clean failed: {retry_err}");
-              }
-            }
-          }
-        } else {
-          tracing::warn!("[ipc] Failed to create IPC socket, trying next: {err}");
+  for index in 0..=9_u8 {
+    let path = dir.join(format!("discord-ipc-{index}"));
+    let probe = probe_socket(&path);
+    match probe.state {
+      SocketState::Missing => {}
+      SocketState::Stale => {
+        let Some(identity) = probe.identity else {
+          continue;
+        };
+        if !unlink_socket_if_unchanged(&path, identity) {
+          tracing::warn!(
+            "[ipc] Stale socket {} changed before unlink; leaving it",
+            path.display()
+          );
+          continue;
         }
-        last_err = Some(err);
+        tracing::warn!("[ipc] Reclaiming stale socket: {}", path.display());
+      }
+      SocketState::Active | SocketState::Unknown | SocketState::NotSocket => {
+        tracing::info!(
+          "[ipc] Socket {} is {:?}; trying next index",
+          path.display(),
+          probe.state
+        );
+        continue;
       }
     }
+    let (listener, temp) = match bind_temp(dir, index) {
+      Ok(pair) => pair,
+      Err(err) => {
+        last_err = Some(err);
+        continue;
+      }
+    };
+    if let Some(bound) = finish_bind(listener, &temp, &path) {
+      return Ok(bound);
+    }
+    tracing::warn!(
+      "[ipc] Could not secure socket {}; trying next index",
+      path.display()
+    );
   }
   Err(AdsumError::IpcBind {
     attempts: 10,
     source: last_err.unwrap_or_else(|| std::io::Error::other("no socket bound")),
+  })
+}
+
+/// Bind a listener under a short private temp name in `dir`; the caller
+/// installs it at the final path with a no-replace hard link.
+fn bind_temp(
+  dir: &Path,
+  index: u8,
+) -> std::io::Result<(std::os::unix::net::UnixListener, PathBuf)> {
+  static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+  for _ in 0..8 {
+    let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    // Keep the temp name shorter than `discord-ipc-N`: a full `sun_path`
+    // must not start failing only because publication uses a temp name.
+    let temp = dir.join(format!(".b{index:x}{:x}{counter:x}", std::process::id()));
+    tracing::info!("[ipc] Creating socket: {}", temp.display());
+    match std::os::unix::net::UnixListener::bind(&temp) {
+      Ok(listener) => return Ok((listener, temp)),
+      Err(err) if err.kind() == ErrorKind::AddrInUse => continue,
+      Err(err) => return Err(err),
+    }
+  }
+  Err(std::io::Error::new(
+    ErrorKind::AddrInUse,
+    "temporary IPC socket name exhausted",
+  ))
+}
+
+/// Install a temp-bound listener at `path` as mode `0600` via no-replace hard
+/// link, so a foreign final entry is never replaced or chmodded. Linux `fstat`
+/// reports the sockfs inode, so identity is taken from the temp path.
+fn finish_bind(
+  listener: std::os::unix::net::UnixListener,
+  temp: &Path,
+  path: &Path,
+) -> Option<(std::os::unix::net::UnixListener, String, FileId)> {
+  // The directory protects this temp name from other UIDs, not from a
+  // same-euid process. This identity is therefore whatever currently sits
+  // there; the no-replace link protects `path`, not this temp-path race.
+  let identity = socket_identity(temp)?;
+  if std::fs::set_permissions(temp, std::fs::Permissions::from_mode(0o600)).is_err() {
+    let _ = unlink_socket_if_unchanged(temp, identity);
+    return None;
+  }
+  if socket_identity(temp) != Some(identity) {
+    let _ = unlink_socket_if_unchanged(temp, identity);
+    return None;
+  }
+  // `link` fails when anything already occupies `path`, so an entry that
+  // appeared after the probe is preserved instead of adopted.
+  if std::fs::hard_link(temp, path).is_err() {
+    let _ = unlink_socket_if_unchanged(temp, identity);
+    return None;
+  }
+  // Drop the temp name only after proving the final name carries our inode.
+  let installed = socket_identity(path) == Some(identity);
+  let _ = unlink_socket_if_unchanged(temp, identity);
+  if !installed {
+    tracing::warn!(
+      "[ipc] Socket {} changed during installation; leaving it",
+      path.display()
+    );
+    return None;
+  }
+  let socket_path = path.to_string_lossy().into_owned();
+  tracing::info!("[ipc] Created IPC socket: {socket_path}");
+  Some((listener, socket_path, identity))
+}
+
+/// Identity of `path` when it is a socket, without following symlinks.
+fn socket_identity(path: &Path) -> Option<FileId> {
+  let meta = std::fs::symlink_metadata(path).ok()?;
+  meta.file_type().is_socket().then(|| FileId {
+    dev: meta.dev(),
+    ino: meta.ino(),
   })
 }
 
@@ -495,7 +727,135 @@ async fn accept_loop(
 
 #[cfg(test)]
 mod tests {
+  use std::os::unix::fs::DirBuilderExt;
+  use std::os::unix::net::{UnixListener, UnixStream};
+
   use super::*;
+
+  /// Isolated 0700 temp dir per test (tag-suffixed, hermetic).
+  fn scratch(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("adsum-unix-test-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::DirBuilder::new()
+      .mode(0o700)
+      .create(&dir)
+      .expect("scratch dir");
+    dir
+  }
+
+  /// A final path already occupied at install time is rejected and preserved.
+  #[test]
+  fn finish_bind_rejects_replaced_socket_path() {
+    let dir = scratch("finish-bind-replaced");
+    let path = dir.join("discord-ipc-0");
+    let temp = dir.join("discord-ipc-temp");
+    let listener = UnixListener::bind(&temp).expect("temp listener");
+    let foreign = UnixListener::bind(&path).expect("foreign listener");
+    let foreign_mode = std::fs::symlink_metadata(&path)
+      .expect("foreign metadata")
+      .mode()
+      & 0o777;
+
+    assert!(
+      finish_bind(listener, &temp, &path).is_none(),
+      "a path already naming another socket must be rejected"
+    );
+    assert!(
+      std::fs::symlink_metadata(&path)
+        .expect("foreign socket kept")
+        .file_type()
+        .is_socket(),
+      "the foreign socket must stay at the path"
+    );
+    assert_eq!(
+      std::fs::symlink_metadata(&path)
+        .expect("foreign metadata")
+        .mode()
+        & 0o777,
+      foreign_mode,
+      "finish_bind must not chmod a foreign socket"
+    );
+    UnixStream::connect(&path).expect("foreign socket still accepts connections");
+    assert!(
+      std::fs::symlink_metadata(&temp).is_err(),
+      "the private temp name must be cleaned up"
+    );
+
+    drop(foreign);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// The temp name must be shorter than `discord-ipc-N`, preserving long paths.
+  #[test]
+  fn bind_temp_name_stays_shorter_than_final() {
+    let dir = scratch("temp-name-length");
+    let (listener, temp) = bind_temp(&dir, 0).expect("temp listener");
+    let temp_name = temp.file_name().expect("temp name").to_string_lossy();
+    assert!(
+      temp_name.len() < "discord-ipc-0".len(),
+      "temp name {temp_name} must leave room for a full sun_path"
+    );
+
+    drop(listener);
+    let _ = std::fs::remove_file(&temp);
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// The prepared Flatpak dir is tried before conventional bases, with
+  /// shared temp roots filtered out.
+  #[test]
+  fn bind_dirs_put_preferred_first() {
+    let bases = vec![PathBuf::from("/run/user/1000"), PathBuf::from("/tmp")];
+    let preferred = PathBuf::from("/run/user/1000/app/com.discordapp.Discord");
+    let dirs = bind_dirs_in_order(bases, Some(&preferred), None);
+    assert_eq!(
+      dirs,
+      vec![
+        PathBuf::from("/run/user/1000/app/com.discordapp.Discord"),
+        PathBuf::from("/run/user/1000"),
+      ]
+    );
+  }
+
+  /// Without a prepared Flatpak dir, the conventional order is unchanged.
+  #[test]
+  fn bind_dirs_without_preferred_keep_bases() {
+    let bases = vec![PathBuf::from("/run/user/1000")];
+    assert_eq!(bind_dirs_in_order(bases.clone(), None, None), bases);
+  }
+
+  /// The Flatpak diagnostic is the exact operator-facing contract.
+  #[test]
+  fn flatpak_diagnostic_is_exact() {
+    assert_eq!(
+      FLATPAK_UNAVAILABLE_WARNING,
+      "[ipc] Flatpak-compatible socket path unavailable; compatibility aliases may not be reachable from sandboxed clients"
+    );
+  }
+
+  /// Compatibility holds only when the bound path is inside a prepared
+  /// preferred dir; a string prefix is not a path prefix.
+  #[test]
+  fn flatpak_compatibility_detects_bound_path() {
+    let preferred = Path::new("/run/user/1000/app/com.discordapp.Discord");
+    assert!(flatpak_compatibility_available(
+      Some(preferred),
+      Path::new("/run/user/1000/app/com.discordapp.Discord/discord-ipc-0")
+    ));
+    assert!(!flatpak_compatibility_available(
+      None,
+      Path::new("/run/user/1000/app/com.discordapp.Discord/discord-ipc-0")
+    ));
+    assert!(!flatpak_compatibility_available(
+      Some(preferred),
+      Path::new("/run/user/1000/discord-ipc-0")
+    ));
+    assert!(!flatpak_compatibility_available(
+      Some(preferred),
+      Path::new("/run/user/1000/app/com.discordapp.DiscordCanary/discord-ipc-0")
+    ));
+  }
 
   /// Transient per-connection failures retry at once; persistent ones
   /// pause instead of hot-spinning the accept loop.
