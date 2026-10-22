@@ -359,6 +359,36 @@ mod tests {
     let _ = std::fs::remove_dir_all(&dir);
   }
 
+  /// A live listener rebound at the same path survives a stale identity unlink.
+  #[test]
+  fn unlink_socket_if_unchanged_preserves_replaced_live_socket() {
+    let dir = scratch("unlink-live");
+    let path = dir.join("discord-ipc-0");
+    let stale = UnixListener::bind(&path).expect("stale listener");
+    let old_id = probe_socket(&path).identity.expect("stale identity");
+    // Bind the replacement while the stale inode is still allocated, then
+    // move it into place: inode reuse cannot make the identities collide.
+    let live_path = dir.join("discord-ipc-live");
+    let live = UnixListener::bind(&live_path).expect("live listener");
+    drop(stale);
+    std::fs::remove_file(&path).expect("remove stale path");
+    std::fs::rename(&live_path, &path).expect("move live socket into place");
+    assert_ne!(probe_socket(&path).identity, Some(old_id));
+
+    assert!(!unlink_socket_if_unchanged(&path, old_id));
+    assert!(
+      std::fs::symlink_metadata(&path)
+        .expect("live socket kept")
+        .file_type()
+        .is_socket()
+    );
+    std::os::unix::net::UnixStream::connect(&path).expect("live socket accepts");
+
+    drop(live);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
   /// A replaced entry survives; a matching identity is removed.
   #[test]
   fn unlink_socket_if_unchanged_preserves_replaced_entry() {

@@ -498,24 +498,8 @@ fn create_socket(dir: &Path) -> Result<(std::os::unix::net::UnixListener, String
   for index in 0..=9_u8 {
     let path = dir.join(format!("discord-ipc-{index}"));
     let probe = probe_socket(&path);
-    let listener = match probe.state {
-      SocketState::Missing => match bind_index(&path) {
-        Ok(listener) => listener,
-        Err(err) if err.kind() == ErrorKind::AddrInUse => {
-          // The entry appeared between probe and bind: retry exactly once.
-          match bind_index(&path) {
-            Ok(listener) => listener,
-            Err(err) => {
-              last_err = Some(err);
-              continue;
-            }
-          }
-        }
-        Err(err) => {
-          last_err = Some(err);
-          continue;
-        }
-      },
+    match probe.state {
+      SocketState::Missing => {}
       SocketState::Stale => {
         let Some(identity) = probe.identity else {
           continue;
@@ -528,13 +512,6 @@ fn create_socket(dir: &Path) -> Result<(std::os::unix::net::UnixListener, String
           continue;
         }
         tracing::warn!("[ipc] Reclaiming stale socket: {}", path.display());
-        match bind_index(&path) {
-          Ok(listener) => listener,
-          Err(err) => {
-            last_err = Some(err);
-            continue;
-          }
-        }
       }
       SocketState::Active | SocketState::Unknown | SocketState::NotSocket => {
         tracing::info!(
@@ -544,8 +521,15 @@ fn create_socket(dir: &Path) -> Result<(std::os::unix::net::UnixListener, String
         );
         continue;
       }
+    }
+    let (listener, temp) = match bind_temp(dir, index) {
+      Ok(pair) => pair,
+      Err(err) => {
+        last_err = Some(err);
+        continue;
+      }
     };
-    if let Some(bound) = finish_bind(listener, &path) {
+    if let Some(bound) = finish_bind(listener, &temp, &path) {
       return Ok(bound);
     }
     tracing::warn!(
@@ -559,30 +543,65 @@ fn create_socket(dir: &Path) -> Result<(std::os::unix::net::UnixListener, String
   })
 }
 
-/// One bind attempt on a path the probe declared safe.
-fn bind_index(path: &Path) -> std::io::Result<std::os::unix::net::UnixListener> {
-  tracing::info!("[ipc] Creating socket: {}", path.display());
-  std::os::unix::net::UnixListener::bind(path)
+/// Bind a listener under a short private temp name in `dir`; the caller
+/// installs it at the final path with a no-replace hard link.
+fn bind_temp(
+  dir: &Path,
+  index: u8,
+) -> std::io::Result<(std::os::unix::net::UnixListener, PathBuf)> {
+  static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+  for _ in 0..8 {
+    let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    // Keep the temp name shorter than `discord-ipc-N`: a full `sun_path`
+    // must not start failing only because publication uses a temp name.
+    let temp = dir.join(format!(".b{index:x}{:x}{counter:x}", std::process::id()));
+    tracing::info!("[ipc] Creating socket: {}", temp.display());
+    match std::os::unix::net::UnixListener::bind(&temp) {
+      Ok(listener) => return Ok((listener, temp)),
+      Err(err) if err.kind() == ErrorKind::AddrInUse => continue,
+      Err(err) => return Err(err),
+    }
+  }
+  Err(std::io::Error::new(
+    ErrorKind::AddrInUse,
+    "temporary IPC socket name exhausted",
+  ))
 }
 
-/// Finalize a fresh bind: mode `0600` and identity recheck before aliases.
+/// Install a temp-bound listener at `path` as mode `0600` via no-replace hard
+/// link, so a foreign final entry is never replaced or chmodded. Linux `fstat`
+/// reports the sockfs inode, so identity is taken from the temp path.
 fn finish_bind(
   listener: std::os::unix::net::UnixListener,
+  temp: &Path,
   path: &Path,
 ) -> Option<(std::os::unix::net::UnixListener, String, FileId)> {
-  let identity = socket_identity(path)?;
-  if std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).is_err() {
-    let _ = unlink_socket_if_unchanged(path, identity);
+  // The directory protects this temp name from other UIDs, not from a
+  // same-euid process. This identity is therefore whatever currently sits
+  // there; the no-replace link protects `path`, not this temp-path race.
+  let identity = socket_identity(temp)?;
+  if std::fs::set_permissions(temp, std::fs::Permissions::from_mode(0o600)).is_err() {
+    let _ = unlink_socket_if_unchanged(temp, identity);
     return None;
   }
-  let secured = std::fs::symlink_metadata(path).is_ok_and(|meta| {
-    meta.file_type().is_socket()
-      && meta.mode() & 0o777 == 0o600
-      && meta.dev() == identity.dev
-      && meta.ino() == identity.ino
-  });
-  if !secured {
-    let _ = unlink_socket_if_unchanged(path, identity);
+  if socket_identity(temp) != Some(identity) {
+    let _ = unlink_socket_if_unchanged(temp, identity);
+    return None;
+  }
+  // `link` fails when anything already occupies `path`, so an entry that
+  // appeared after the probe is preserved instead of adopted.
+  if std::fs::hard_link(temp, path).is_err() {
+    let _ = unlink_socket_if_unchanged(temp, identity);
+    return None;
+  }
+  // Drop the temp name only after proving the final name carries our inode.
+  let installed = socket_identity(path) == Some(identity);
+  let _ = unlink_socket_if_unchanged(temp, identity);
+  if !installed {
+    tracing::warn!(
+      "[ipc] Socket {} changed during installation; leaving it",
+      path.display()
+    );
     return None;
   }
   let socket_path = path.to_string_lossy().into_owned();
@@ -708,7 +727,80 @@ async fn accept_loop(
 
 #[cfg(test)]
 mod tests {
+  use std::os::unix::fs::DirBuilderExt;
+  use std::os::unix::net::{UnixListener, UnixStream};
+
   use super::*;
+
+  /// Isolated 0700 temp dir per test (tag-suffixed, hermetic).
+  fn scratch(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("adsum-unix-test-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::DirBuilder::new()
+      .mode(0o700)
+      .create(&dir)
+      .expect("scratch dir");
+    dir
+  }
+
+  /// A final path already occupied at install time is rejected and preserved.
+  #[test]
+  fn finish_bind_rejects_replaced_socket_path() {
+    let dir = scratch("finish-bind-replaced");
+    let path = dir.join("discord-ipc-0");
+    let temp = dir.join("discord-ipc-temp");
+    let listener = UnixListener::bind(&temp).expect("temp listener");
+    let foreign = UnixListener::bind(&path).expect("foreign listener");
+    let foreign_mode = std::fs::symlink_metadata(&path)
+      .expect("foreign metadata")
+      .mode()
+      & 0o777;
+
+    assert!(
+      finish_bind(listener, &temp, &path).is_none(),
+      "a path already naming another socket must be rejected"
+    );
+    assert!(
+      std::fs::symlink_metadata(&path)
+        .expect("foreign socket kept")
+        .file_type()
+        .is_socket(),
+      "the foreign socket must stay at the path"
+    );
+    assert_eq!(
+      std::fs::symlink_metadata(&path)
+        .expect("foreign metadata")
+        .mode()
+        & 0o777,
+      foreign_mode,
+      "finish_bind must not chmod a foreign socket"
+    );
+    UnixStream::connect(&path).expect("foreign socket still accepts connections");
+    assert!(
+      std::fs::symlink_metadata(&temp).is_err(),
+      "the private temp name must be cleaned up"
+    );
+
+    drop(foreign);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// The temp name must be shorter than `discord-ipc-N`, preserving long paths.
+  #[test]
+  fn bind_temp_name_stays_shorter_than_final() {
+    let dir = scratch("temp-name-length");
+    let (listener, temp) = bind_temp(&dir, 0).expect("temp listener");
+    let temp_name = temp.file_name().expect("temp name").to_string_lossy();
+    assert!(
+      temp_name.len() < "discord-ipc-0".len(),
+      "temp name {temp_name} must leave room for a full sun_path"
+    );
+
+    drop(listener);
+    let _ = std::fs::remove_file(&temp);
+    let _ = std::fs::remove_dir_all(&dir);
+  }
 
   /// The prepared Flatpak dir is tried before conventional bases, with
   /// shared temp roots filtered out.

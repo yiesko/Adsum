@@ -252,6 +252,68 @@ async fn concurrent_starts_do_not_replace_each_others_alias() {
   assert!(std::fs::symlink_metadata(&marker).is_err());
 }
 
+/// Simultaneous binds reserve distinct indexes in the same directory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_binds_reserve_distinct_indexes() {
+  let scratch = Scratch::new("concurrent-bind");
+  let dir = scratch.sub("a");
+  let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+
+  let first = tokio::spawn({
+    let barrier = std::sync::Arc::clone(&barrier);
+    let dir = dir.clone();
+    async move {
+      barrier.wait().await;
+      IpcTransport::bind_with_dirs(user(), vec![dir]).await
+    }
+  });
+  let second = tokio::spawn({
+    let barrier = std::sync::Arc::clone(&barrier);
+    let dir = dir.clone();
+    async move {
+      barrier.wait().await;
+      IpcTransport::bind_with_dirs(user(), vec![dir]).await
+    }
+  });
+  let (t1, _rx1) = first.await.expect("first bind task").expect("first bind");
+  let (t2, _rx2) = second
+    .await
+    .expect("second bind task")
+    .expect("second bind");
+
+  let paths = [
+    PathBuf::from(t1.socket_path()),
+    PathBuf::from(t2.socket_path()),
+  ];
+  let mut indexes: Vec<u8> = paths
+    .iter()
+    .map(|path| {
+      path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("discord-ipc-"))
+        .and_then(|index| index.parse().ok())
+        .unwrap_or_else(|| panic!("socket index in {}", path.display()))
+    })
+    .collect();
+  indexes.sort_unstable();
+  assert_eq!(indexes, vec![0, 1], "binds must reserve distinct indexes");
+  for path in &paths {
+    UnixStream::connect(path).unwrap_or_else(|err| panic!("connect {}: {err}", path.display()));
+  }
+
+  t1.shutdown().await;
+  t2.shutdown().await;
+  let leftovers: Vec<PathBuf> = std::fs::read_dir(&dir)
+    .expect("read bind dir")
+    .map(|entry| entry.expect("dir entry").path())
+    .collect();
+  assert!(
+    leftovers.is_empty(),
+    "shutdown must leave no sockets or markers: {leftovers:?}"
+  );
+}
+
 /// An empty bind-dir list is invalid input, never a silent `/tmp` bind.
 #[tokio::test]
 async fn empty_bind_dirs_return_error() {
@@ -332,22 +394,36 @@ async fn preferred_dir_binds_socket_with_connectable_aliases() {
     "marker for the direct alias must exist"
   );
 
-  // A client probing the legacy Flatpak path reaches the real server.
-  let mut client =
-    UnixStream::connect(runtime.join(".flatpak/com.discordapp.Discord/xdg-run/discord-ipc-0"))
-      .expect("connect alias");
-  client
-    .set_read_timeout(Some(Duration::from_secs(5)))
-    .expect("timeout");
-  write_frame(
-    &mut client,
-    PacketType::Handshake,
-    r#"{"v":1,"client_id":"flatpak-game"}"#,
+  // Every published path must reach the same server: the bound socket,
+  // the direct runtime alias, and each client layout alias (14 total).
+  let mut paths = Vec::with_capacity(alias_layouts.len() + 2);
+  paths.push(PathBuf::from(&bound));
+  paths.push(runtime.join("discord-ipc-0"));
+  paths.extend(
+    alias_layouts
+      .iter()
+      .map(|layout| runtime.join(layout).join("discord-ipc-0")),
   );
-  let (packet_type, body) = read_frame(&mut client);
-  assert_eq!(packet_type, 1);
-  assert!(body.contains("READY"), "expected READY, got: {body}");
-  drop(client);
+  assert_eq!(paths.len(), 14, "bound path, direct alias, and 12 layouts");
+  for path in &paths {
+    let mut client =
+      UnixStream::connect(path).unwrap_or_else(|err| panic!("connect {}: {err}", path.display()));
+    client
+      .set_read_timeout(Some(Duration::from_secs(5)))
+      .expect("timeout");
+    write_frame(
+      &mut client,
+      PacketType::Handshake,
+      r#"{"v":1,"client_id":"flatpak-game"}"#,
+    );
+    let (packet_type, body) = read_frame(&mut client);
+    assert_eq!(packet_type, 1, "handshake reply for {}", path.display());
+    assert!(
+      body.contains("READY"),
+      "expected READY from {}, got: {body}",
+      path.display()
+    );
+  }
 
   transport.shutdown().await;
   assert!(!Path::new(&bound).exists());
