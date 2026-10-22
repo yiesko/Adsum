@@ -470,6 +470,13 @@ fn recover_valid_marker(alias: &Path, marker: &ValidMarker) -> Recovery {
     );
     return Recovery::Conflict;
   }
+  if target_is_preserved(&marker.data) {
+    tracing::debug!(
+      "[ipc] Target {} became live immediately before unlink; preserving alias",
+      target.display()
+    );
+    return Recovery::Preserved;
+  }
   if let Err(err) = std::fs::remove_file(alias) {
     tracing::debug!("[ipc] Alias removal failed for {}: {err}", alias.display());
     return Recovery::Conflict;
