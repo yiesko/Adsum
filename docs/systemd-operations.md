@@ -88,12 +88,18 @@ systemctl --user restart adsum.service # service picks up the restored binary
   behind `discord-ipc-0` with a PING (1s budget); anything live keeps the
   path and Adsum binds `discord-ipc-1` instead. It goes back to `-0` on
   the next clean start once the old holder is gone. The WARN at that
-  moment is expected, not an error.
+  moment is expected, not an error. **Under the shipped systemd unit**,
+  `ExecStartPre` removes top-level `discord-ipc-*` unconditionally before
+  Adsum starts, so a live top-level foreign socket is not preserved across
+  a service restart. Nested paths under `%t/app/...`, `%t/.flatpak/...`,
+  and `%t/snap.*` are not touched by that sweep.
 - **SIGTERM vs SIGINT**: `systemctl --user stop` sends SIGTERM, which has
   no in-process handler — only Ctrl+C (SIGINT) runs the graceful shutdown
-  that removes the socket files. After a `stop`, leftover
-  `discord-ipc-*` files are swept by the unit's `ExecStartPre` on the
-  next start. Known behavior, not a bug.
+  that removes the socket files. After a `stop`, leftover top-level
+  `discord-ipc-*` files are removed by the unit's `ExecStartPre` on the
+  next start. Nested aliases are not swept by `ExecStartPre`; they are
+  only reclaimed when the same index is rebound. A clean shutdown removes
+  the real socket and every alias link. Known behavior, not a bug.
 - **No `--ignore-ids` needed for companions**: since Adsum 0.32.0 the
   handoff does this automatically (generic card shows → the game's own
   SDK takes over → generic resumes on clear). Details:

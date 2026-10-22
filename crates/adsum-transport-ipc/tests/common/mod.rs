@@ -27,7 +27,14 @@ impl Scratch {
   /// Fresh unique temp dir for one test (pre-cleaned).
   pub fn new(tag: &str) -> Self {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let path = std::env::temp_dir().join(format!(
+    // macOS caps `sun_path` at 104 bytes; `/tmp` keeps the full Flatpak
+    // alias layout short enough for the socket tests there.
+    let root = if cfg!(target_os = "macos") {
+      PathBuf::from("/tmp")
+    } else {
+      std::env::temp_dir()
+    };
+    let path = root.join(format!(
       "adsum-ipc-test-{}-{}-{}",
       std::process::id(),
       tag,

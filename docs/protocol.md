@@ -4,11 +4,14 @@ Adsum plays the part of the local Discord client. Games connect to it the
 way they would connect to Discord, publish Rich Presence, and get
 officially-shaped replies. Two transports are served:
 
-- **IPC** — local sockets named `discord-ipc-0` … `discord-ipc-9`, found in
-  `XDG_RUNTIME_DIR`, then `TMPDIR`, `TMP`, `TEMP`, and finally `/tmp`
-  (with symlinks into the other candidate directories so clients find the
-  socket wherever they look). On Windows the same names are **named pipes**
-  (`\\.\pipe\discord-ipc-0` … `-9`), with no directory involved at all.
+- **IPC** — local sockets named `discord-ipc-0` … `discord-ipc-9`. On Linux
+  the real socket is preferably bound in
+  `$XDG_RUNTIME_DIR/app/com.discordapp.Discord/`, then in the conventional
+  bases `XDG_RUNTIME_DIR`, `TMPDIR`, `TMP`, `TEMP`, `/tmp`; symlinks in every
+  existing client layout let games find it wherever they probe (see
+  [Linux socket placement](#linux-socket-placement)). On Windows the same
+  names are **named pipes** (`\\.\pipe\discord-ipc-0` … `-9`), with no
+  directory involved at all.
 - **WebSocket** — loopback only, on the first free port in
   `6463`–`6472` (`--ws-port-start` / `--ws-port-end`).
 
@@ -23,6 +26,57 @@ to the bridge instead — see [web-client.md](web-client.md).
 | Game websocket | 6463–6472 (first free) | `--ws-port-start` / `--ws-port-end` |
 | Bridge (JSON) | 1337–1347 (first free) | `--bridge-port` / `--bridge-port-end` |
 | Bridge (MessagePack) | 1338 (scans 1338–1348, first free) | `--msgpack-port` |
+
+## Linux socket placement
+
+Adsum binds one real `UnixListener` at the first free index `0..=9` in
+`$XDG_RUNTIME_DIR/app/com.discordapp.Discord/` — the path the official
+Discord Flatpak exposes to sandboxed clients. That directory is created only
+when `XDG_RUNTIME_DIR` is an absolute path that normalizes to a real
+directory other than `/`, `/tmp`, or `/var/tmp`; the runtime base, `app/`,
+and the app directory must all be real directories, not symlinks. If it
+cannot be used (or every index there is held by a live socket), Adsum falls
+back to the conventional bases in order:
+
+1. `$XDG_RUNTIME_DIR`
+2. `$TMPDIR`
+3. `$TMP`
+4. `$TEMP`
+5. `/tmp`
+
+The bound index is then published as a symlink for every **already existing,
+real** directory in the list below, under each base (symlinked layouts are
+skipped):
+
+- `<base>/discord-ipc-N` — conventional probe
+- `<base>/app/com.discordapp.Discord/discord-ipc-N` — official Flatpak Discord
+- `<base>/app/com.discordapp.DiscordCanary/discord-ipc-N` — Flatpak Canary
+- `<base>/app/com.discordapp.DiscordPTB/discord-ipc-N` — Flatpak PTB
+- `<base>/app/dev.vencord.Vesktop/discord-ipc-N` — Vesktop Flatpak
+- `<base>/app/org.equicord.equibop/discord-ipc-N` — Equibop Flatpak
+- `<base>/.flatpak/com.discordapp.Discord/xdg-run/discord-ipc-N` — legacy Flatpak
+- `<base>/.flatpak/com.discordapp.DiscordCanary/xdg-run/discord-ipc-N` — legacy Canary
+- `<base>/.flatpak/com.discordapp.DiscordPTB/xdg-run/discord-ipc-N` — legacy PTB
+- `<base>/.flatpak/dev.vencord.Vesktop/xdg-run/discord-ipc-N` — legacy Vesktop
+- `<base>/.flatpak/org.equicord.equibop/xdg-run/discord-ipc-N` — legacy Equibop
+- `<base>/snap.discord/discord-ipc-N` — Discord Snap
+- `<base>/snap.discord-canary/discord-ipc-N` — Canary Snap
+- `<base>/snap.discord-ptb/discord-ipc-N` — PTB Snap
+
+Only the official Flatpak directory is ever created. Adsum never creates
+`app/` for the other clients, `.flatpak/`, or `snap.*`: those aliases appear
+only when the client's own directory already exists. Alias publishing never
+replaces a real socket, regular file, or live symlink owned by another
+service. A dangling ours-shaped link left by a crashed Adsum run is
+reclaimed when the same index is published again. Shutdown removes the real
+socket and the links for that index, and leaves directories in place.
+
+**Sandbox limitation:** Adsum cannot grant a Flatpak or Snap package access
+to a host path. A sandboxed client is served only when its own configuration
+already exposes the directory it probes. The PrismLauncher Flatpak case is
+covered because it maps the official
+`$XDG_RUNTIME_DIR/app/com.discordapp.Discord` directory (`:create`), which is
+exactly where Adsum binds first.
 
 ## IPC handshake
 

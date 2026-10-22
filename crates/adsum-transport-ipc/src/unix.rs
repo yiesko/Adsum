@@ -6,7 +6,7 @@
 //! with a deadline, then aborts stragglers.
 
 use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
   Arc, Mutex,
   atomic::{AtomicU64, Ordering},
@@ -25,7 +25,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::frame::{IpcFacilitator, handle_stream};
 use crate::paths::{
-  fanout_socket_link, remove_socket_links, socket_dir_candidates, socket_file_name,
+  fanout_socket_link, preferred_socket_dir_from, prepare_socket_dir, remove_socket_links,
+  socket_alias_dirs, socket_dir_candidates, socket_file_name,
 };
 use crate::probe::socket_holder_alive;
 use crate::sink::{DEFAULT_IPC_QUEUE, EventSink};
@@ -159,18 +160,40 @@ impl std::fmt::Debug for IpcTransport {
 }
 
 impl IpcTransport {
-  /// Bind `discord-ipc-0..=9` in the official candidate dirs.
+  /// Bind `discord-ipc-0..=9`, preferring the official Flatpak Discord dir
+  /// and falling back to the conventional candidate bases.
   ///
   /// # Errors
   ///
   /// [`AdsumError::IpcBind`] when every index is held by a live holder.
   pub async fn bind(user: Arc<Mutex<RpcUser>>) -> Result<(Self, mpsc::Receiver<ActivityCmd>)> {
-    Self::bind_with_dirs(user, socket_dir_candidates()).await
+    let (preferred, bind_dirs, aliases) = tokio::task::spawn_blocking(|| {
+      let bases = socket_dir_candidates();
+      let preferred = prepare_preferred_dir();
+      let aliases = socket_alias_dirs(&bases);
+      let bind_dirs = bind_dirs_in_order(bases, preferred.as_deref());
+      (preferred, bind_dirs, aliases)
+    })
+    .await
+    .map_err(|_| AdsumError::IpcBind {
+      attempts: 10,
+      source: std::io::Error::other("socket path preparation panicked"),
+    })?;
+    let (transport, rx) = Self::bind_with_paths(user, bind_dirs, aliases).await?;
+    if let Some(dir) = &preferred
+      && !Path::new(transport.socket_path()).starts_with(dir)
+    {
+      tracing::warn!(
+        "[ipc] Preferred Flatpak socket dir {} not used; Flatpak Discord compatibility may be unavailable",
+        dir.display()
+      );
+    }
+    Ok((transport, rx))
   }
 
   /// Bind within explicit `dirs`, trying each in order (first = primary;
-  /// tests point here at a scratch dir instead of the real runtime dirs).
-  /// Fan-out links still cover every dir once any of them binds.
+  /// tests point here at scratch dirs instead of the real runtime dirs).
+  /// Fan-out links cover every existing alias layout under those dirs.
   ///
   /// # Errors
   ///
@@ -180,24 +203,38 @@ impl IpcTransport {
     user: Arc<Mutex<RpcUser>>,
     dirs: Vec<PathBuf>,
   ) -> Result<(Self, mpsc::Receiver<ActivityCmd>)> {
+    let bind_dirs = if dirs.is_empty() {
+      vec![PathBuf::from("/tmp")]
+    } else {
+      dirs
+    };
+    let aliases = tokio::task::spawn_blocking({
+      let bind_dirs = bind_dirs.clone();
+      move || socket_alias_dirs(&bind_dirs)
+    })
+    .await
+    .map_err(|_| AdsumError::IpcBind {
+      attempts: 10,
+      source: std::io::Error::other("socket alias discovery panicked"),
+    })?;
+    Self::bind_with_paths(user, bind_dirs, aliases).await
+  }
+
+  /// Bind in `bind_dirs` (first = primary) and fan out into `alias_dirs`;
+  /// keeping the lists separate stops production binding in alias dirs.
+  async fn bind_with_paths(
+    user: Arc<Mutex<RpcUser>>,
+    bind_dirs: Vec<PathBuf>,
+    alias_dirs: Vec<PathBuf>,
+  ) -> Result<(Self, mpsc::Receiver<ActivityCmd>)> {
     // Blocking syscalls (bind, probe with its 1s budget, symlink fan-out)
     // run off the async workers; this executes once per (re)bind.
-    let dirs_for_bind = dirs.clone();
+    let aliases_for_bind = alias_dirs.clone();
     let (std_listener, bound_path) = tokio::task::spawn_blocking(move || {
-      // One base per candidate: an unusable primary (permissions, regular
-      // file) falls through instead of failing the whole bind. Empty input
-      // keeps the legacy `/tmp` base.
-      let bases: Vec<String> = if dirs_for_bind.is_empty() {
-        vec!["/tmp/discord-ipc".to_string()]
-      } else {
-        dirs_for_bind
-          .iter()
-          .map(|dir| format!("{}/discord-ipc", dir.display()))
-          .collect()
-      };
       let mut last_err = None;
-      for (index, base) in bases.iter().enumerate() {
-        match create_socket(base, &dirs_for_bind) {
+      for (index, dir) in bind_dirs.iter().enumerate() {
+        let base = format!("{}/discord-ipc", dir.display());
+        match create_socket(&base, &aliases_for_bind) {
           Ok(bound) => return Ok(bound),
           Err(err) => {
             tracing::warn!("[ipc] Candidate dir {index} unusable, trying next: {err}");
@@ -249,7 +286,7 @@ impl IpcTransport {
         conns,
         live,
         bound_path,
-        dirs,
+        dirs: alias_dirs,
         sink,
       },
       rx,
@@ -312,6 +349,44 @@ impl IpcTransport {
   }
 }
 
+/// Put the prepared Flatpak dir before the conventional bases.
+fn bind_dirs_in_order(bases: Vec<PathBuf>, preferred: Option<&Path>) -> Vec<PathBuf> {
+  let mut bind_dirs = Vec::with_capacity(bases.len() + 1);
+  if let Some(dir) = preferred {
+    bind_dirs.push(dir.to_path_buf());
+  }
+  bind_dirs.extend(bases);
+  bind_dirs
+}
+
+/// Prepare the official Flatpak Discord dir, warning and falling back when
+/// the runtime base is missing, shared-temp, or symlinked.
+fn prepare_preferred_dir() -> Option<PathBuf> {
+  let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") else {
+    tracing::debug!("[ipc] XDG_RUNTIME_DIR is unset; skipping Flatpak socket dir");
+    return None;
+  };
+  let Some(dir) = xdg
+    .to_str()
+    .and_then(|xdg| preferred_socket_dir_from(Some(xdg)))
+  else {
+    tracing::warn!(
+      "[ipc] XDG_RUNTIME_DIR is not usable for the Flatpak Discord socket dir; Flatpak compatibility may be unavailable"
+    );
+    return None;
+  };
+  match prepare_socket_dir(&dir) {
+    Ok(()) => Some(dir),
+    Err(err) => {
+      tracing::warn!(
+        "[ipc] Cannot use Flatpak Discord socket dir {}: {err}; falling back",
+        dir.display()
+      );
+      None
+    }
+  }
+}
+
 impl Drop for IpcTransport {
   /// Best-effort shutdown without awaiting: cancel first so token-aware
   /// loops observe it, close every live socket (unblocking pumps parked in
@@ -339,10 +414,11 @@ impl Drop for IpcTransport {
   }
 }
 
-/// Bind `base-0..=9` with stale reclaim, then fan out links.
+/// Bind `base-0..=9` with stale reclaim, then fan out links into
+/// `alias_dirs`.
 fn create_socket(
   base: &str,
-  dirs: &[PathBuf],
+  alias_dirs: &[PathBuf],
 ) -> Result<(std::os::unix::net::UnixListener, String)> {
   let mut last_err = None;
   for tries in 0..=9_u8 {
@@ -351,7 +427,7 @@ fn create_socket(
     match std::os::unix::net::UnixListener::bind(&socket_path) {
       Ok(socket) => {
         tracing::info!("[ipc] Created IPC socket: {socket_path}");
-        fanout_socket_link(dirs, &socket_path, &socket_file_name(&socket_path));
+        fanout_socket_link(alias_dirs, &socket_path, &socket_file_name(&socket_path));
         return Ok((socket, socket_path));
       }
       Err(err) => {
@@ -365,7 +441,7 @@ fn create_socket(
             match std::os::unix::net::UnixListener::bind(&socket_path) {
               Ok(socket) => {
                 tracing::info!("[ipc] Created IPC socket after cleaning stale: {socket_path}");
-                fanout_socket_link(dirs, &socket_path, &socket_file_name(&socket_path));
+                fanout_socket_link(alias_dirs, &socket_path, &socket_file_name(&socket_path));
                 return Ok((socket, socket_path));
               }
               Err(retry_err) => {
@@ -496,6 +572,29 @@ async fn accept_loop(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// The prepared Flatpak dir is tried before every conventional base.
+  #[test]
+  fn bind_dirs_put_preferred_first() {
+    let bases = vec![PathBuf::from("/run/user/1000"), PathBuf::from("/tmp")];
+    let preferred = PathBuf::from("/run/user/1000/app/com.discordapp.Discord");
+    let dirs = bind_dirs_in_order(bases, Some(&preferred));
+    assert_eq!(
+      dirs,
+      vec![
+        PathBuf::from("/run/user/1000/app/com.discordapp.Discord"),
+        PathBuf::from("/run/user/1000"),
+        PathBuf::from("/tmp"),
+      ]
+    );
+  }
+
+  /// Without a prepared Flatpak dir, the conventional order is unchanged.
+  #[test]
+  fn bind_dirs_without_preferred_keep_bases() {
+    let bases = vec![PathBuf::from("/run/user/1000"), PathBuf::from("/tmp")];
+    assert_eq!(bind_dirs_in_order(bases.clone(), None), bases);
+  }
 
   /// Transient per-connection failures retry at once; persistent ones
   /// pause instead of hot-spinning the accept loop.

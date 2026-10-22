@@ -9,6 +9,7 @@ mod common;
 use std::io::{Read, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use adsum_transport_ipc::IpcTransport;
@@ -49,6 +50,154 @@ async fn bind_creates_socket_and_fans_out_links() {
   // Shutdown cleans the socket file and our links.
   assert!(!std::path::Path::new(&bound).exists());
   assert!(std::fs::read_link(b.join("discord-ipc-0")).is_err());
+}
+
+/// The Flatpak Discord dir is bound first and every existing alias layout
+/// reaches the same socket, then shutdown removes the socket and links.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preferred_dir_binds_socket_with_connectable_aliases() {
+  let scratch = Scratch::new("preferred");
+  let runtime = scratch.sub("runtime");
+  let preferred = runtime.join("app/com.discordapp.Discord");
+  std::fs::create_dir_all(&preferred).expect("preferred dir");
+  let alias_layouts = [
+    ".flatpak/com.discordapp.Discord/xdg-run",
+    ".flatpak/com.discordapp.DiscordCanary/xdg-run",
+    ".flatpak/com.discordapp.DiscordPTB/xdg-run",
+    ".flatpak/dev.vencord.Vesktop/xdg-run",
+    ".flatpak/org.equicord.equibop/xdg-run",
+    "app/com.discordapp.DiscordCanary",
+    "app/com.discordapp.DiscordPTB",
+    "app/dev.vencord.Vesktop",
+    "app/org.equicord.equibop",
+    "snap.discord",
+    "snap.discord-canary",
+    "snap.discord-ptb",
+  ];
+  for layout in alias_layouts {
+    std::fs::create_dir_all(runtime.join(layout)).expect("alias dir");
+  }
+
+  let (transport, _rx) =
+    IpcTransport::bind_with_dirs(user(), vec![preferred.clone(), runtime.clone()])
+      .await
+      .unwrap();
+  let bound = transport.socket_path().to_string();
+  assert!(
+    Path::new(&bound).starts_with(&preferred),
+    "preferred dir must win, got {bound}"
+  );
+  assert!(Path::new(&bound).ends_with("discord-ipc-0"));
+  assert!(
+    std::fs::symlink_metadata(&bound)
+      .expect("socket exists")
+      .file_type()
+      .is_socket()
+  );
+
+  for layout in alias_layouts {
+    let link = runtime.join(layout).join("discord-ipc-0");
+    assert_eq!(
+      std::fs::read_link(&link).expect("alias link"),
+      PathBuf::from(&bound),
+      "alias {layout} must point at the bound socket"
+    );
+  }
+  assert_eq!(
+    std::fs::read_link(runtime.join("discord-ipc-0")).expect("direct alias"),
+    PathBuf::from(&bound)
+  );
+
+  // A client probing the legacy Flatpak path reaches the real server.
+  let mut client =
+    UnixStream::connect(runtime.join(".flatpak/com.discordapp.Discord/xdg-run/discord-ipc-0"))
+      .expect("connect alias");
+  client
+    .set_read_timeout(Some(Duration::from_secs(5)))
+    .expect("timeout");
+  write_frame(
+    &mut client,
+    PacketType::Handshake,
+    r#"{"v":1,"client_id":"flatpak-game"}"#,
+  );
+  let (packet_type, body) = read_frame(&mut client);
+  assert_eq!(packet_type, 1);
+  assert!(body.contains("READY"), "expected READY, got: {body}");
+  drop(client);
+
+  transport.shutdown().await;
+  assert!(!Path::new(&bound).exists());
+  assert!(preferred.is_dir(), "socket dir must remain after shutdown");
+  for layout in alias_layouts {
+    assert!(
+      std::fs::read_link(runtime.join(layout).join("discord-ipc-0")).is_err(),
+      "alias {layout} must be removed on shutdown"
+    );
+  }
+  assert!(std::fs::read_link(runtime.join("discord-ipc-0")).is_err());
+}
+
+/// Existing alias dirs are used; missing client dirs are never created.
+#[tokio::test]
+async fn bind_does_not_create_missing_alias_dirs() {
+  let scratch = Scratch::new("alias-no-create");
+  let runtime = scratch.sub("runtime");
+
+  let (transport, _rx) = IpcTransport::bind_with_dirs(user(), vec![runtime.clone()])
+    .await
+    .unwrap();
+  assert!(runtime.join("discord-ipc-0").exists());
+  assert!(!runtime.join("app").exists());
+  assert!(!runtime.join(".flatpak").exists());
+  assert!(!runtime.join("snap.discord").exists());
+  transport.shutdown().await;
+}
+
+/// A symlinked client layout is never used for fan-out.
+#[tokio::test]
+async fn symlinked_alias_dir_is_not_used() {
+  let scratch = Scratch::new("alias-symlink");
+  let runtime = scratch.sub("runtime");
+  let outside = scratch.sub("outside");
+  std::fs::create_dir_all(outside.join("com.discordapp.Discord")).expect("outside official");
+  std::fs::create_dir_all(runtime.join("app")).expect("app dir");
+  std::os::unix::fs::symlink(
+    outside.join("com.discordapp.Discord"),
+    runtime.join("app/com.discordapp.Discord"),
+  )
+  .expect("official symlink");
+
+  let (transport, _rx) = IpcTransport::bind_with_dirs(user(), vec![runtime.clone()])
+    .await
+    .expect("bind");
+  assert!(Path::new(transport.socket_path()).starts_with(&runtime));
+  assert!(
+    std::fs::symlink_metadata(outside.join("com.discordapp.Discord/discord-ipc-0")).is_err(),
+    "fanout must not follow the symlinked client dir"
+  );
+  transport.shutdown().await;
+  assert!(std::fs::symlink_metadata(outside.join("com.discordapp.Discord/discord-ipc-0")).is_err());
+}
+
+/// An unusable preferred dir falls through to the conventional base.
+#[tokio::test]
+async fn unusable_preferred_dir_falls_back_to_runtime_base() {
+  let scratch = Scratch::new("preferred-unusable");
+  let runtime = scratch.sub("runtime");
+  let preferred = runtime.join("app/com.discordapp.Discord");
+  std::fs::create_dir_all(preferred.parent().expect("app parent")).expect("app dir");
+  std::fs::write(&preferred, b"squat").expect("squat preferred");
+
+  let (transport, _rx) = IpcTransport::bind_with_dirs(user(), vec![preferred, runtime.clone()])
+    .await
+    .expect("fallback bind");
+  assert_eq!(
+    Path::new(transport.socket_path()).parent(),
+    Some(runtime.as_path()),
+    "must bind in the conventional base, got {}",
+    transport.socket_path()
+  );
+  transport.shutdown().await;
 }
 
 /// Regular files squatting an index are reclaimed for the socket.
