@@ -2,7 +2,7 @@
 //!
 //! A marker is never overwritten and never authorizes removing an alias
 //! unless its recorded `(dev, ino)` still matches the on-disk file.
-#![allow(dead_code)] // Staging for Task 4, which consumes these APIs.
+#![cfg_attr(not(test), allow(dead_code))] // Staging for Task 5, which wires the transport.
 
 use std::ffi::OsStr;
 use std::fs::{File, Metadata, OpenOptions, Permissions};
@@ -13,7 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-use crate::probe::FileId;
+use crate::paths::validate_alias_dir;
+use crate::probe::{FileId, SocketState, probe_socket};
 
 /// Current marker schema version.
 pub(crate) const MARKER_VERSION: u32 = 1;
@@ -58,6 +59,43 @@ pub(crate) enum MarkerCheck {
   Valid(ValidMarker),
   /// The entry is invalid, foreign, or changed during validation.
   Conflict(String),
+}
+
+/// An alias and marker created by this transport, with both identities.
+#[derive(Debug)]
+pub(crate) struct OwnedAlias {
+  /// Socket index the alias belongs to.
+  pub index: u8,
+  /// Alias symlink path.
+  pub alias: PathBuf,
+  /// `(dev, ino)` of the alias symlink when it was created.
+  pub alias_id: FileId,
+  /// Validated marker published before the alias.
+  pub marker: ValidMarker,
+  /// Bound socket path the alias points at.
+  pub target: PathBuf,
+  /// `(dev, ino)` of the bound socket when the marker was published.
+  pub target_id: FileId,
+}
+
+/// Result of inspecting one alias and marker pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Recovery {
+  /// The alias path is free.
+  Absent,
+  /// A live or foreign entry was left untouched.
+  Preserved,
+  /// The directory, marker, or alias is invalid or divergent.
+  Conflict,
+}
+
+/// Result of publishing one alias.
+#[derive(Debug)]
+pub(crate) enum PublishOutcome {
+  /// The alias was created and is owned by this transport.
+  Created(OwnedAlias),
+  /// An existing entry, conflict, or failure prevented creation.
+  Skipped,
 }
 
 /// Marker file name for `euid` and `index`.
@@ -178,6 +216,318 @@ pub(crate) fn publish_marker(
 #[must_use]
 pub(crate) fn remove_marker_if_unchanged(marker: &ValidMarker) -> bool {
   remove_if_identity(&marker.path, marker.identity)
+}
+
+/// Recover one alias/marker pair, removing only validated dead orphans.
+#[must_use]
+pub(crate) fn recover_alias(alias_dir: &Path, index: u8, euid: u32) -> Recovery {
+  if let Err(err) = validate_alias_dir(alias_dir) {
+    tracing::debug!(
+      "[ipc] Alias dir {} rejected during recovery: {err}",
+      alias_dir.display()
+    );
+    return Recovery::Conflict;
+  }
+  let alias = alias_dir.join(socket_name(index));
+  let marker_file = marker_path(alias_dir, euid, index);
+  match validate_marker(&marker_file, &alias, euid, index) {
+    MarkerCheck::Missing => match std::fs::symlink_metadata(&alias) {
+      Err(err) if err.kind() == io::ErrorKind::NotFound => Recovery::Absent,
+      Err(err) => {
+        tracing::debug!(
+          "[ipc] Alias {} could not be inspected: {err}",
+          alias.display()
+        );
+        Recovery::Preserved
+      }
+      Ok(_) => Recovery::Preserved,
+    },
+    MarkerCheck::Conflict(reason) => {
+      tracing::debug!(
+        "[ipc] Marker conflict at {}: {reason}",
+        marker_file.display()
+      );
+      Recovery::Conflict
+    }
+    MarkerCheck::Valid(marker) => recover_valid_marker(&alias, &marker),
+  }
+}
+
+/// Recover every known alias index in each validated alias directory.
+pub(crate) fn recover_orphan_aliases(alias_dirs: &[PathBuf], euid: u32) {
+  for alias_dir in alias_dirs {
+    if let Err(err) = validate_alias_dir(alias_dir) {
+      tracing::debug!(
+        "[ipc] Alias dir {} rejected during recovery: {err}",
+        alias_dir.display()
+      );
+      continue;
+    }
+    for index in 0..=9 {
+      if recover_alias(alias_dir, index, euid) == Recovery::Conflict {
+        tracing::debug!(
+          "[ipc] Alias {} at index {index} conflicts; preserving it",
+          alias_dir.display()
+        );
+      }
+    }
+  }
+}
+
+/// Publish a marker then an alias for `index`; never replace an entry.
+#[must_use]
+pub(crate) fn publish_alias(
+  alias_dir: &Path,
+  index: u8,
+  target: &Path,
+  target_id: FileId,
+  euid: u32,
+) -> PublishOutcome {
+  if recover_alias(alias_dir, index, euid) != Recovery::Absent {
+    tracing::debug!(
+      "[ipc] Skipping alias {} because the index is occupied",
+      alias_dir.join(socket_name(index)).display()
+    );
+    return PublishOutcome::Skipped;
+  }
+  if let Err(err) = validate_alias_dir(alias_dir) {
+    tracing::debug!(
+      "[ipc] Alias dir {} rejected before publication: {err}",
+      alias_dir.display()
+    );
+    return PublishOutcome::Skipped;
+  }
+  let alias = alias_dir.join(socket_name(index));
+  let marker = match publish_marker(alias_dir, &alias, target, target_id, euid, index) {
+    Ok(marker) => marker,
+    Err(err) => {
+      tracing::debug!(
+        "[ipc] Marker publication failed for {}: {err}",
+        alias.display()
+      );
+      return PublishOutcome::Skipped;
+    }
+  };
+  if let Err(err) = std::os::unix::fs::symlink(target, &alias) {
+    tracing::debug!("[ipc] Alias creation failed for {}: {err}", alias.display());
+    let _ = remove_marker_if_unchanged(&marker);
+    return PublishOutcome::Skipped;
+  }
+  match std::fs::symlink_metadata(&alias) {
+    Ok(meta) if meta.file_type().is_symlink() => PublishOutcome::Created(OwnedAlias {
+      index,
+      alias,
+      alias_id: FileId {
+        dev: meta.dev(),
+        ino: meta.ino(),
+      },
+      marker,
+      target: target.to_path_buf(),
+      target_id,
+    }),
+    Ok(_) => {
+      tracing::debug!(
+        "[ipc] Alias {} is not a symlink after creation; preserving it",
+        alias.display()
+      );
+      let _ = remove_marker_if_unchanged(&marker);
+      PublishOutcome::Skipped
+    }
+    Err(err) => {
+      tracing::debug!(
+        "[ipc] Alias {} vanished after creation: {err}",
+        alias.display()
+      );
+      let _ = remove_marker_if_unchanged(&marker);
+      PublishOutcome::Skipped
+    }
+  }
+}
+
+/// Remove an owned alias then its marker, revalidating both identities.
+pub(crate) fn remove_owned_alias(owned: &OwnedAlias, euid: u32) {
+  let marker = match validate_marker(&owned.marker.path, &owned.alias, euid, owned.index) {
+    MarkerCheck::Valid(marker) => marker,
+    MarkerCheck::Missing => {
+      tracing::debug!(
+        "[ipc] Marker {} is missing; preserving alias",
+        owned.marker.path.display()
+      );
+      return;
+    }
+    MarkerCheck::Conflict(reason) => {
+      tracing::debug!(
+        "[ipc] Marker conflict for {}: {reason}",
+        owned.marker.path.display()
+      );
+      return;
+    }
+  };
+  let marker_target_id = FileId {
+    dev: marker.data.target_dev,
+    ino: marker.data.target_ino,
+  };
+  if marker.identity != owned.marker.identity
+    || Path::new(&marker.data.alias) != owned.alias.as_path()
+    || Path::new(&marker.data.target) != owned.target.as_path()
+    || marker_target_id != owned.target_id
+  {
+    tracing::debug!(
+      "[ipc] Marker {} diverges from the ownership record; preserving alias",
+      marker.path.display()
+    );
+    return;
+  }
+  if stable_symlink_id(&owned.alias, &owned.target) != Some(owned.alias_id) {
+    tracing::debug!(
+      "[ipc] Alias {} changed since publication; preserving it",
+      owned.alias.display()
+    );
+    return;
+  }
+  if let Err(err) = std::fs::remove_file(&owned.alias) {
+    tracing::debug!(
+      "[ipc] Alias removal failed for {}: {err}",
+      owned.alias.display()
+    );
+    return;
+  }
+  if !remove_marker_if_unchanged(&marker) {
+    tracing::debug!(
+      "[ipc] Marker {} changed after alias removal; leaving it",
+      marker.path.display()
+    );
+  }
+}
+
+/// Remove every owned alias, draining the vector in order.
+pub(crate) fn remove_owned_aliases(owned: &mut Vec<OwnedAlias>, euid: u32) {
+  for alias in owned.drain(..) {
+    remove_owned_alias(&alias, euid);
+  }
+}
+
+/// Apply the recovery table to a validated marker and its alias entry.
+fn recover_valid_marker(alias: &Path, marker: &ValidMarker) -> Recovery {
+  let target = Path::new(&marker.data.target);
+  let alias_meta = match std::fs::symlink_metadata(alias) {
+    Ok(meta) => meta,
+    Err(err) if err.kind() == io::ErrorKind::NotFound => {
+      return if target_is_preserved(&marker.data) {
+        Recovery::Preserved
+      } else if remove_marker_if_unchanged(marker) {
+        Recovery::Absent
+      } else {
+        tracing::debug!(
+          "[ipc] Marker {} changed before orphan removal",
+          marker.path.display()
+        );
+        Recovery::Conflict
+      };
+    }
+    Err(err) => {
+      tracing::debug!(
+        "[ipc] Alias {} could not be inspected: {err}",
+        alias.display()
+      );
+      return Recovery::Preserved;
+    }
+  };
+  if !alias_meta.file_type().is_symlink() {
+    tracing::debug!(
+      "[ipc] Alias {} is not a symlink; preserving it",
+      alias.display()
+    );
+    return Recovery::Conflict;
+  }
+  match std::fs::read_link(alias) {
+    Ok(link) if link == target => {}
+    Ok(_) => {
+      tracing::debug!(
+        "[ipc] Alias {} points elsewhere; preserving it",
+        alias.display()
+      );
+      return Recovery::Conflict;
+    }
+    Err(err) => {
+      tracing::debug!("[ipc] Alias {} could not be read: {err}", alias.display());
+      return Recovery::Conflict;
+    }
+  }
+  if target_is_preserved(&marker.data) {
+    return Recovery::Preserved;
+  }
+  if matches!(
+    probe_socket(target).state,
+    SocketState::Active | SocketState::Unknown
+  ) {
+    tracing::debug!(
+      "[ipc] Target {} became live; preserving alias",
+      target.display()
+    );
+    return Recovery::Preserved;
+  }
+  if stable_symlink_id(alias, target).is_none() {
+    tracing::debug!(
+      "[ipc] Alias {} changed during recovery; preserving it",
+      alias.display()
+    );
+    return Recovery::Conflict;
+  }
+  if let Err(err) = std::fs::remove_file(alias) {
+    tracing::debug!("[ipc] Alias removal failed for {}: {err}", alias.display());
+    return Recovery::Conflict;
+  }
+  if remove_marker_if_unchanged(marker) {
+    Recovery::Absent
+  } else {
+    tracing::debug!(
+      "[ipc] Marker {} changed after alias removal",
+      marker.path.display()
+    );
+    Recovery::Conflict
+  }
+}
+
+/// Whether a marker target must be preserved (live or inconclusive).
+fn target_is_preserved(data: &MarkerData) -> bool {
+  let probe = probe_socket(Path::new(&data.target));
+  if probe.state == SocketState::Active
+    && probe.identity
+      != Some(FileId {
+        dev: data.target_dev,
+        ino: data.target_ino,
+      })
+  {
+    tracing::debug!(
+      "[ipc] Marker target {} identity differs from its record",
+      data.target
+    );
+  }
+  matches!(probe.state, SocketState::Active | SocketState::Unknown)
+}
+
+/// Identity of `alias` when it is a symlink to `target` stable across reads.
+fn stable_symlink_id(alias: &Path, target: &Path) -> Option<FileId> {
+  let first = std::fs::symlink_metadata(alias).ok()?;
+  if !first.file_type().is_symlink() {
+    return None;
+  }
+  let identity = FileId {
+    dev: first.dev(),
+    ino: first.ino(),
+  };
+  if std::fs::read_link(alias).ok()? != target {
+    return None;
+  }
+  let second = std::fs::symlink_metadata(alias).ok()?;
+  if !second.file_type().is_symlink()
+    || second.dev() != identity.dev
+    || second.ino() != identity.ino
+  {
+    return None;
+  }
+  Some(identity)
 }
 
 /// Alias/target file name for `index`.
@@ -332,7 +682,8 @@ mod tests {
   use std::ffi::CString;
   use std::fs::Permissions;
   use std::os::unix::ffi::OsStrExt;
-  use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+  use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
+  use std::os::unix::net::UnixListener;
   use std::path::{Path, PathBuf};
 
   use serde_json::Value;
@@ -389,6 +740,22 @@ mod tests {
     let target_id = file_id(&target);
     publish_marker(alias_dir, &alias, &target, target_id, current_euid(), index)
       .expect("publish marker")
+  }
+
+  /// Bind a live target socket, returning it with its path and identity.
+  fn bind_target(dir: &Path, index: u8) -> (UnixListener, PathBuf, FileId) {
+    let path = socket_path(dir, index);
+    let listener = UnixListener::bind(&path).expect("target listener");
+    let identity = file_id(&path);
+    (listener, path, identity)
+  }
+
+  /// Publish an alias, panicking when the index is occupied.
+  fn published_owned(alias_dir: &Path, index: u8, target: &Path, target_id: FileId) -> OwnedAlias {
+    match publish_alias(alias_dir, index, target, target_id, current_euid()) {
+      PublishOutcome::Created(owned) => owned,
+      PublishOutcome::Skipped => panic!("alias publication must succeed"),
+    }
   }
 
   /// Write marker JSON with mode `0600`, replacing any previous content.
@@ -959,5 +1326,511 @@ mod tests {
       0,
     );
     assert_invalid_input("oversized content", result);
+  }
+
+  /// Publication creates a symlink and a marker recording both identities.
+  #[test]
+  fn publish_alias_creates_symlink_then_marker() {
+    let alias_dir = scratch("alias-create");
+    let target_dir = scratch("alias-create-target");
+    let euid = current_euid();
+    let index = 0;
+    let (listener, target, target_id) = bind_target(&target_dir, index);
+
+    let PublishOutcome::Created(owned) = publish_alias(&alias_dir, index, &target, target_id, euid)
+    else {
+      panic!("publish_alias must create the alias");
+    };
+    let alias = socket_path(&alias_dir, index);
+    assert_eq!(std::fs::read_link(&alias).expect("alias link"), target);
+    assert_eq!(owned.index, index);
+    assert_eq!(owned.alias, alias);
+    assert_eq!(owned.alias_id, file_id(&alias));
+    assert_eq!(owned.target, target);
+    assert_eq!(owned.target_id, target_id);
+    assert_eq!(owned.marker.path, marker_path(&alias_dir, euid, index));
+    assert_eq!(owned.marker.data, marker_data(&alias, &target, euid));
+    assert_eq!(owned.marker.data.target_dev, target_id.dev);
+    assert_eq!(owned.marker.data.target_ino, target_id.ino);
+
+    drop(listener);
+    let _ = std::fs::remove_dir_all(&alias_dir);
+    let _ = std::fs::remove_dir_all(&target_dir);
+  }
+
+  /// A markerless foreign symlink is never replaced or adopted.
+  #[test]
+  fn publish_alias_preserves_foreign_symlink_without_marker() {
+    let alias_dir = scratch("alias-foreign-link");
+    let target_dir = scratch("alias-foreign-link-target");
+    let euid = current_euid();
+    let index = 0;
+    let (listener, target, target_id) = bind_target(&target_dir, index);
+    let foreign_target = target_dir.join("foreign");
+    std::fs::write(&foreign_target, b"foreign").expect("foreign target");
+    let alias = socket_path(&alias_dir, index);
+    std::os::unix::fs::symlink(&foreign_target, &alias).expect("foreign alias");
+
+    assert!(matches!(
+      publish_alias(&alias_dir, index, &target, target_id, euid),
+      PublishOutcome::Skipped
+    ));
+    assert_eq!(
+      std::fs::read_link(&alias).expect("foreign link kept"),
+      foreign_target
+    );
+    assert!(
+      std::fs::symlink_metadata(marker_path(&alias_dir, euid, index)).is_err(),
+      "a preserved foreign link must not gain a marker"
+    );
+
+    drop(listener);
+    let _ = std::fs::remove_dir_all(&alias_dir);
+    let _ = std::fs::remove_dir_all(&target_dir);
+  }
+
+  /// Regular files, sockets, directories, and symlinks all block publication.
+  #[test]
+  fn publish_alias_preserves_foreign_entries() {
+    let alias_dir = scratch("alias-foreign");
+    let target_dir = scratch("alias-foreign-target");
+    let euid = current_euid();
+
+    let (listener0, target0, target_id0) = bind_target(&target_dir, 0);
+    let foreign_file = socket_path(&alias_dir, 0);
+    std::fs::write(&foreign_file, b"keep").expect("foreign file");
+
+    let (listener1, target1, target_id1) = bind_target(&target_dir, 1);
+    let foreign_socket = socket_path(&alias_dir, 1);
+    let foreign_listener = UnixListener::bind(&foreign_socket).expect("foreign socket");
+
+    let (listener2, target2, target_id2) = bind_target(&target_dir, 2);
+    let foreign_dir = socket_path(&alias_dir, 2);
+    std::fs::create_dir(&foreign_dir).expect("foreign dir");
+
+    let (listener3, target3, target_id3) = bind_target(&target_dir, 3);
+    let foreign_link = socket_path(&alias_dir, 3);
+    let link_target = target_dir.join("link-target");
+    std::fs::write(&link_target, b"link").expect("link target");
+    std::os::unix::fs::symlink(&link_target, &foreign_link).expect("foreign link");
+
+    for (index, target, target_id) in [
+      (0, &target0, target_id0),
+      (1, &target1, target_id1),
+      (2, &target2, target_id2),
+      (3, &target3, target_id3),
+    ] {
+      assert!(
+        matches!(
+          publish_alias(&alias_dir, index, target, target_id, euid),
+          PublishOutcome::Skipped
+        ),
+        "index {index} must be skipped"
+      );
+      assert!(
+        std::fs::symlink_metadata(marker_path(&alias_dir, euid, index)).is_err(),
+        "index {index} must not gain a marker"
+      );
+    }
+
+    assert_eq!(
+      std::fs::read(&foreign_file).expect("foreign file kept"),
+      b"keep"
+    );
+    assert!(
+      std::fs::symlink_metadata(&foreign_socket)
+        .expect("foreign socket kept")
+        .file_type()
+        .is_socket()
+    );
+    assert!(
+      std::fs::symlink_metadata(&foreign_dir)
+        .expect("foreign dir kept")
+        .file_type()
+        .is_dir()
+    );
+    assert_eq!(
+      std::fs::read_link(&foreign_link).expect("foreign link kept"),
+      link_target
+    );
+
+    drop(foreign_listener);
+    drop(listener0);
+    drop(listener1);
+    drop(listener2);
+    drop(listener3);
+    let _ = std::fs::remove_dir_all(&alias_dir);
+    let _ = std::fs::remove_dir_all(&target_dir);
+  }
+
+  /// A foreign-owned marker blocks publication and is never deleted.
+  #[test]
+  fn publish_alias_preserves_foreign_owned_marker() {
+    if current_euid() != 0 {
+      return;
+    }
+    let alias_dir = scratch("alias-foreign-marker");
+    let target_dir = scratch("alias-foreign-marker-target");
+    let euid = current_euid();
+    let index = 0;
+    let (listener, target, target_id) = bind_target(&target_dir, index);
+    let alias = socket_path(&alias_dir, index);
+    let marker = marker_path(&alias_dir, euid, index);
+    write_marker(&marker, &marker_data(&alias, &target, euid));
+    let path = CString::new(marker.as_os_str().as_bytes()).expect("path without nul");
+    // SAFETY: `path` is a NUL-terminated string naming the marker created
+    // above; chown only changes its owner and never outlives the buffer.
+    assert_eq!(unsafe { libc::chown(path.as_ptr(), 65534, 65534) }, 0);
+
+    assert!(matches!(
+      publish_alias(&alias_dir, index, &target, target_id, euid),
+      PublishOutcome::Skipped
+    ));
+    assert_eq!(
+      std::fs::symlink_metadata(&marker)
+        .expect("foreign marker kept")
+        .uid(),
+      65534
+    );
+    assert!(
+      std::fs::symlink_metadata(&alias).is_err(),
+      "a foreign marker must not authorize an alias"
+    );
+
+    // SAFETY: same valid path; restoring ownership lets the test clean up.
+    assert_eq!(unsafe { libc::chown(path.as_ptr(), 0, 0) }, 0);
+    drop(listener);
+    let _ = std::fs::remove_dir_all(&alias_dir);
+    let _ = std::fs::remove_dir_all(&target_dir);
+  }
+
+  /// Removing an owned alias unlinks the alias and then its marker.
+  #[test]
+  fn remove_owned_alias_removes_alias_then_marker() {
+    let alias_dir = scratch("owned-remove");
+    let target_dir = scratch("owned-remove-target");
+    let index = 0;
+    let (listener, target, target_id) = bind_target(&target_dir, index);
+    let owned = published_owned(&alias_dir, index, &target, target_id);
+    let alias = socket_path(&alias_dir, index);
+    let marker = owned.marker.path.clone();
+
+    remove_owned_alias(&owned, current_euid());
+    assert!(std::fs::symlink_metadata(&alias).is_err());
+    assert!(std::fs::symlink_metadata(&marker).is_err());
+
+    drop(listener);
+    let _ = std::fs::remove_dir_all(&alias_dir);
+    let _ = std::fs::remove_dir_all(&target_dir);
+  }
+
+  /// A missing, changed, or divergent marker preserves the alias.
+  #[test]
+  fn remove_owned_alias_preserves_when_marker_missing_invalid_or_divergent() {
+    let euid = current_euid();
+
+    let alias_dir = scratch("owned-missing");
+    let target_dir = scratch("owned-missing-target");
+    let (listener_a, target_a, id_a) = bind_target(&target_dir, 0);
+    let owned = published_owned(&alias_dir, 0, &target_a, id_a);
+    std::fs::remove_file(&owned.marker.path).expect("delete marker");
+    remove_owned_alias(&owned, euid);
+    assert!(
+      std::fs::symlink_metadata(&owned.alias).is_ok(),
+      "alias must survive a missing marker"
+    );
+    drop(listener_a);
+    let _ = std::fs::remove_dir_all(&alias_dir);
+    let _ = std::fs::remove_dir_all(&target_dir);
+
+    let alias_dir = scratch("owned-divergent-marker");
+    let target_dir = scratch("owned-divergent-marker-target");
+    let (listener_b, target_b, id_b) = bind_target(&target_dir, 0);
+    let owned = published_owned(&alias_dir, 0, &target_b, id_b);
+    let mut divergent = marker_data(&owned.alias, &owned.target, euid);
+    divergent.target_ino = divergent.target_ino.wrapping_add(1);
+    write_marker(&owned.marker.path, &divergent);
+    remove_owned_alias(&owned, euid);
+    assert!(
+      std::fs::symlink_metadata(&owned.alias).is_ok(),
+      "alias must survive a divergent marker"
+    );
+    assert!(
+      std::fs::symlink_metadata(&owned.marker.path).is_ok(),
+      "divergent marker must stay"
+    );
+    drop(listener_b);
+    let _ = std::fs::remove_dir_all(&alias_dir);
+    let _ = std::fs::remove_dir_all(&target_dir);
+
+    let alias_dir = scratch("owned-divergent-alias");
+    let target_dir = scratch("owned-divergent-alias-target");
+    let (listener_c, target_c, id_c) = bind_target(&target_dir, 0);
+    let owned = published_owned(&alias_dir, 0, &target_c, id_c);
+    let elsewhere = target_dir.join("elsewhere");
+    std::fs::write(&elsewhere, b"elsewhere").expect("elsewhere");
+    std::fs::remove_file(&owned.alias).expect("remove alias");
+    std::os::unix::fs::symlink(&elsewhere, &owned.alias).expect("divergent alias");
+    remove_owned_alias(&owned, euid);
+    assert_eq!(
+      std::fs::read_link(&owned.alias).expect("alias kept"),
+      elsewhere
+    );
+    assert!(
+      std::fs::symlink_metadata(&owned.marker.path).is_ok(),
+      "marker must stay with a divergent alias"
+    );
+    drop(listener_c);
+    let _ = std::fs::remove_dir_all(&alias_dir);
+    let _ = std::fs::remove_dir_all(&target_dir);
+  }
+
+  /// A replaced alias symlink is preserved because its identity changed.
+  #[test]
+  fn remove_owned_alias_preserves_when_alias_identity_changed() {
+    let alias_dir = scratch("owned-alias-id");
+    let target_dir = scratch("owned-alias-id-target");
+    let (listener, target, target_id) = bind_target(&target_dir, 0);
+    let owned = published_owned(&alias_dir, 0, &target, target_id);
+    let replacement = alias_dir.join("replacement");
+    std::os::unix::fs::symlink(&owned.target, &replacement).expect("replacement link");
+    std::fs::rename(&replacement, &owned.alias).expect("replace alias");
+    assert_ne!(file_id(&owned.alias), owned.alias_id);
+
+    remove_owned_alias(&owned, current_euid());
+    assert_eq!(
+      std::fs::read_link(&owned.alias).expect("alias kept"),
+      owned.target
+    );
+    assert!(
+      std::fs::symlink_metadata(&owned.marker.path).is_ok(),
+      "marker must stay when the alias identity changed"
+    );
+
+    drop(listener);
+    let _ = std::fs::remove_dir_all(&alias_dir);
+    let _ = std::fs::remove_dir_all(&target_dir);
+  }
+
+  /// An orphan marker with a dead target is removed after validation.
+  #[test]
+  fn orphan_marker_with_dead_target_is_removed() {
+    let alias_dir = scratch("orphan-dead");
+    let target_dir = scratch("orphan-dead-target");
+    let euid = current_euid();
+    let index = 0;
+    let (listener, target, target_id) = bind_target(&target_dir, index);
+    let alias = socket_path(&alias_dir, index);
+    let marker = publish_marker(&alias_dir, &alias, &target, target_id, euid, index)
+      .expect("publish orphan marker");
+    drop(listener);
+
+    assert_eq!(recover_alias(&alias_dir, index, euid), Recovery::Absent);
+    assert!(std::fs::symlink_metadata(&marker.path).is_err());
+    assert!(std::fs::symlink_metadata(&alias).is_err());
+
+    let _ = std::fs::remove_dir_all(&alias_dir);
+    let _ = std::fs::remove_dir_all(&target_dir);
+  }
+
+  /// An orphan marker whose target still accepts connections is preserved.
+  #[test]
+  fn orphan_marker_with_live_target_is_preserved() {
+    let alias_dir = scratch("orphan-live");
+    let target_dir = scratch("orphan-live-target");
+    let euid = current_euid();
+    let index = 0;
+    let (listener, target, target_id) = bind_target(&target_dir, index);
+    let alias = socket_path(&alias_dir, index);
+    let marker = publish_marker(&alias_dir, &alias, &target, target_id, euid, index)
+      .expect("publish orphan marker");
+
+    assert_eq!(recover_alias(&alias_dir, index, euid), Recovery::Preserved);
+    assert!(std::fs::symlink_metadata(&marker.path).is_ok());
+    assert!(std::fs::symlink_metadata(&alias).is_err());
+
+    drop(listener);
+    let _ = std::fs::remove_dir_all(&alias_dir);
+    let _ = std::fs::remove_dir_all(&target_dir);
+  }
+
+  /// A valid alias whose target is dead is removed with its marker.
+  #[test]
+  fn orphan_alias_with_valid_marker_and_dead_target_is_removed() {
+    let alias_dir = scratch("orphan-alias-dead");
+    let target_dir = scratch("orphan-alias-dead-target");
+    let euid = current_euid();
+    let index = 0;
+    let (listener, target, target_id) = bind_target(&target_dir, index);
+    let owned = published_owned(&alias_dir, index, &target, target_id);
+    drop(listener);
+
+    assert_eq!(recover_alias(&alias_dir, index, euid), Recovery::Absent);
+    assert!(std::fs::symlink_metadata(&owned.alias).is_err());
+    assert!(std::fs::symlink_metadata(&owned.marker.path).is_err());
+
+    let _ = std::fs::remove_dir_all(&alias_dir);
+    let _ = std::fs::remove_dir_all(&target_dir);
+  }
+
+  /// An alias pointing elsewhere is a conflict; both entries are preserved.
+  #[test]
+  fn orphan_alias_with_divergent_target_is_preserved() {
+    let alias_dir = scratch("orphan-alias-divergent");
+    let target_dir = scratch("orphan-alias-divergent-target");
+    let euid = current_euid();
+    let index = 0;
+    let (listener, target, target_id) = bind_target(&target_dir, index);
+    let owned = published_owned(&alias_dir, index, &target, target_id);
+    let elsewhere = target_dir.join("elsewhere");
+    std::fs::write(&elsewhere, b"elsewhere").expect("elsewhere");
+    std::fs::remove_file(&owned.alias).expect("remove alias");
+    std::os::unix::fs::symlink(&elsewhere, &owned.alias).expect("divergent alias");
+
+    assert_eq!(recover_alias(&alias_dir, index, euid), Recovery::Conflict);
+    assert_eq!(
+      std::fs::read_link(&owned.alias).expect("alias kept"),
+      elsewhere
+    );
+    assert!(
+      std::fs::symlink_metadata(&owned.marker.path).is_ok(),
+      "marker must stay with a divergent alias"
+    );
+
+    drop(listener);
+    let _ = std::fs::remove_dir_all(&alias_dir);
+    let _ = std::fs::remove_dir_all(&target_dir);
+  }
+
+  /// An abrupt exit leaves entries that the next recovery removes.
+  #[test]
+  fn abrupt_exit_state_is_recovered() {
+    let alias_dir = scratch("abrupt-exit");
+    let target_dir = scratch("abrupt-exit-target");
+    let euid = current_euid();
+    let index = 0;
+    let (listener, target, target_id) = bind_target(&target_dir, index);
+    let owned = published_owned(&alias_dir, index, &target, target_id);
+    drop(listener);
+
+    assert_eq!(recover_alias(&alias_dir, index, euid), Recovery::Absent);
+    assert!(std::fs::symlink_metadata(&owned.alias).is_err());
+    assert!(std::fs::symlink_metadata(&owned.marker.path).is_err());
+    assert!(
+      std::fs::symlink_metadata(&target).is_ok(),
+      "recovery removes the alias and marker, not the stale target"
+    );
+
+    let _ = std::fs::remove_dir_all(&alias_dir);
+    let _ = std::fs::remove_dir_all(&target_dir);
+  }
+
+  /// Concurrent publications produce exactly one owner and one marker.
+  #[test]
+  fn concurrent_marker_publication_keeps_one_owner() {
+    let alias_dir = scratch("alias-race");
+    let target_dir = scratch("alias-race-target");
+    let euid = current_euid();
+    let index = 0;
+    let (listener, target, target_id) = bind_target(&target_dir, index);
+    let barrier = std::sync::Barrier::new(2);
+
+    let created = std::thread::scope(|scope| {
+      let first = scope.spawn(|| {
+        barrier.wait();
+        matches!(
+          publish_alias(&alias_dir, index, &target, target_id, euid),
+          PublishOutcome::Created(_)
+        )
+      });
+      let second = scope.spawn(|| {
+        barrier.wait();
+        matches!(
+          publish_alias(&alias_dir, index, &target, target_id, euid),
+          PublishOutcome::Created(_)
+        )
+      });
+      [
+        first.join().expect("first thread"),
+        second.join().expect("second thread"),
+      ]
+    });
+    assert_eq!(
+      created.iter().filter(|created| **created).count(),
+      1,
+      "exactly one publication must win"
+    );
+    let alias = socket_path(&alias_dir, index);
+    assert_eq!(std::fs::read_link(&alias).expect("winner alias"), target);
+    assert!(
+      std::fs::symlink_metadata(marker_path(&alias_dir, euid, index)).is_ok(),
+      "the winner's marker must survive"
+    );
+
+    drop(listener);
+    let _ = std::fs::remove_dir_all(&alias_dir);
+    let _ = std::fs::remove_dir_all(&target_dir);
+  }
+
+  /// Scanning alias dirs removes orphan markers and keeps foreign entries.
+  #[test]
+  fn recover_orphan_aliases_removes_only_orphan_markers() {
+    let alias_dir = scratch("orphan-scan");
+    let target_dir = scratch("orphan-scan-target");
+    let euid = current_euid();
+    let (listener, target, target_id) = bind_target(&target_dir, 0);
+    let alias = socket_path(&alias_dir, 0);
+    let marker = publish_marker(&alias_dir, &alias, &target, target_id, euid, 0)
+      .expect("publish orphan marker");
+    drop(listener);
+    let foreign = socket_path(&alias_dir, 1);
+    std::fs::write(&foreign, b"foreign").expect("foreign entry");
+
+    recover_orphan_aliases(std::slice::from_ref(&alias_dir), euid);
+
+    assert!(
+      std::fs::symlink_metadata(&marker.path).is_err(),
+      "orphan marker must be removed"
+    );
+    assert_eq!(
+      std::fs::read(&foreign).expect("foreign entry kept"),
+      b"foreign"
+    );
+
+    let _ = std::fs::remove_dir_all(&alias_dir);
+    let _ = std::fs::remove_dir_all(&target_dir);
+  }
+
+  /// Draining owned aliases removes every alias and empties the vector.
+  #[test]
+  fn remove_owned_aliases_drains_in_order() {
+    let alias_dir = scratch("owned-drain");
+    let target_dir = scratch("owned-drain-target");
+    let euid = current_euid();
+    let (listener0, target0, id0) = bind_target(&target_dir, 0);
+    let (listener1, target1, id1) = bind_target(&target_dir, 1);
+    let mut owned = vec![
+      published_owned(&alias_dir, 0, &target0, id0),
+      published_owned(&alias_dir, 1, &target1, id1),
+    ];
+
+    remove_owned_aliases(&mut owned, euid);
+
+    assert!(owned.is_empty());
+    for index in 0..=1 {
+      assert!(
+        std::fs::symlink_metadata(socket_path(&alias_dir, index)).is_err(),
+        "alias {index} must be removed"
+      );
+      assert!(
+        std::fs::symlink_metadata(marker_path(&alias_dir, euid, index)).is_err(),
+        "marker {index} must be removed"
+      );
+    }
+
+    drop(listener0);
+    drop(listener1);
+    let _ = std::fs::remove_dir_all(&alias_dir);
+    let _ = std::fs::remove_dir_all(&target_dir);
   }
 }
