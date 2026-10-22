@@ -213,6 +213,19 @@ if [ "$NO_SYSTEMD" -eq 0 ]; then
 fi
 log "installed ${BIN_DIR}/${APP} (${TAG})"
 
+# Compatibility with legacy release units that explicitly list these
+# paths in ReadWritePaths=: systemd refuses to mount them when missing
+# (226/NAMESPACE). New units manage the cache with CacheDirectory= and
+# only read the config dir, so they need neither created here.
+if [ "$NO_SYSTEMD" -eq 0 ]; then
+  if grep -Eq '^[[:space:]]*ReadWritePaths=.*%h/\.config/adsum([[:space:]]|$)' "$UNIT"; then
+    mkdir -p "${HOME}/.config/adsum"
+  fi
+  if grep -Eq '^[[:space:]]*ReadWritePaths=.*%h/\.cache/adsum([[:space:]]|$)' "$UNIT"; then
+    mkdir -p "${HOME}/.cache/adsum"
+  fi
+fi
+
 # Opt-in stays opt-in: --yes keeps the default (off); only an explicit
 # --auto-update or an interactive yes enables staging.
 if [ "$AUTO_UPDATE" -eq 0 ] && [ "$YES" -eq 0 ] && [ "$NO_SYSTEMD" -eq 0 ] && [ -t 0 ]; then

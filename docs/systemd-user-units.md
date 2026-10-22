@@ -40,6 +40,9 @@ StartLimitBurst=3
 [Service]
 Type=exec
 Environment=XDG_RUNTIME_DIR=%t
+# CacheDirectory= creates the cache dir before the sandbox mounts; a
+# missing path in ReadWritePaths= fails with 226/NAMESPACE on fresh installs.
+CacheDirectory=adsum
 # Port/cadence parametrization (clap reads ADSUM_* env). Defaults match
 # the CLI; uncomment to pin alternatives for testing.
 Environment=ADSUM_BRIDGE_PORT=1337
@@ -48,9 +51,8 @@ Environment=ADSUM_WS_PORT_START=6463
 Environment=ADSUM_WS_PORT_END=6472
 Environment=ADSUM_SCAN_INTERVAL=5
 # Custom game mappings (missing file = no overrides, never fatal).
-# Resolution: --overrides-file > $ADSUM_OVERRIDES_FILE >
-# $XDG_CONFIG_HOME/adsum/overrides.json > ~/.config/adsum/overrides.json
-Environment=ADSUM_OVERRIDES_FILE=%h/.config/adsum/overrides.json
+# The CLI resolves $XDG_CONFIG_HOME/adsum/overrides.json (default
+# ~/.config/adsum).
 # Drop stale IPC sockets from crashed runs (the "-" ignores failure).
 ExecStartPre=-/bin/sh -c 'rm -f %t/discord-ipc-*; rm -f "${TMPDIR:-/tmp}/discord-ipc-*"'
 # Official detectable list with trim, hourly refresh while running,
@@ -70,10 +72,12 @@ NoNewPrivileges=yes
 BindPaths=/tmp
 ProtectSystem=strict
 ProtectHome=read-only
-# Steam provider + OTA caches (~/.cache/adsum) stay writable under the
-# read-only home; %t keeps the IPC sockets writable; %h/.local/bin lets
-# the sandboxed service swap in staged self-updates at boot.
-ReadWritePaths=%h/.config/adsum %t %h/.cache/adsum %h/.local/bin
+# CacheDirectory= creates the cache dir (XDG default ~/.cache/adsum) and
+# keeps it writable under the read-only home; the config dir is only read,
+# so the read-only home already covers it. %t keeps the IPC sockets
+# writable; %h/.local/bin lets the sandboxed service swap in staged
+# self-updates.
+ReadWritePaths=%t %h/.local/bin
 # cn_proc watcher needs AF_NETLINK; without it the scanner silently stays
 # on polling (diagnose via the missing "watcher live" boot line).
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
@@ -126,13 +130,15 @@ What matters:
   start at boot without a graphical login).
 - **`ExecStartPre`**: sweeps stale `discord-ipc-*` sockets left by
   crashed runs — the reason a killed service never blocks the next start.
-- **Sandboxing**: `ProtectHome=read-only` plus the `ReadWritePaths`
-  exception list (`~/.config/adsum`, the runtime dir, the OTA cache and
-  `~/.local/bin`, so staged self-updates can swap in at boot) — then
-  kernel/clock/hostname/cgroup protections, `PrivateDevices`,
-  `RestrictSUIDSGID`/`RestrictRealtime`, and a `SystemCallFilter`
-  allowlist with `MemoryDenyWriteExecute`, all verified against a live
-  boot.
+- **Sandboxing**: `ProtectHome=read-only` plus the writable exceptions:
+  `CacheDirectory=` creates the cache directory (XDG default
+  `~/.cache/adsum`) before the sandbox mounts, and `ReadWritePaths` adds
+  the runtime dir (`%t`, sockets) and `~/.local/bin` (staged self-updates
+  swap in at boot); the config directory is only read, so it needs no
+  write exception — then kernel/clock/hostname/cgroup protections,
+  `PrivateDevices`, `RestrictSUIDSGID`/`RestrictRealtime`, and a
+  `SystemCallFilter` allowlist with `MemoryDenyWriteExecute`, all verified
+  against a live boot.
 - **`RestrictAddressFamilies=... AF_NETLINK`**: required by the
   event-driven process watcher; without `AF_NETLINK` the scanner silently
   stays on polling.
@@ -152,7 +158,7 @@ Variables you will most often set on the service:
 | `ADSUM_MSGPACK_PORT` | `1338` | MessagePack bridge port |
 | `ADSUM_WS_PORT_START` / `ADSUM_WS_PORT_END` | `6463` / `6472` | Game websocket range |
 | `ADSUM_SCAN_INTERVAL` | `5` | Process scan seconds |
-| `ADSUM_OVERRIDES_FILE` | `$XDG_CONFIG_HOME/adsum/overrides.json`, else `~/.config/adsum/overrides.json` | Custom game mappings (the unit pins `%h/.config/adsum/overrides.json`) |
+| `ADSUM_OVERRIDES_FILE` | `$XDG_CONFIG_HOME/adsum/overrides.json`, else `~/.config/adsum/overrides.json` | Custom game mappings |
 | `ADSUM_IGNORE_IDS` | unset | Comma-separated app ids the scanner never publishes |
 | `ADSUM_AUTO_UPDATE` | unset | `1` stages verified updates in the background |
 | `ADSUM_USER_ID` / `ADSUM_USER_USERNAME` / `ADSUM_USER_GLOBAL_NAME` / `ADSUM_USER_DISCRIMINATOR` / `ADSUM_USER_AVATAR` | arRPC's identity | The `READY` user (blank values ignored) |
