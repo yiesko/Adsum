@@ -457,10 +457,7 @@ fn recover_valid_marker(alias: &Path, marker: &ValidMarker) -> Recovery {
   if target_is_preserved(&marker.data) {
     return Recovery::Preserved;
   }
-  if matches!(
-    probe_socket(target).state,
-    SocketState::Active | SocketState::Unknown
-  ) {
+  if target_is_preserved(&marker.data) {
     tracing::debug!(
       "[ipc] Target {} became live; preserving alias",
       target.display()
@@ -504,7 +501,10 @@ fn target_is_preserved(data: &MarkerData) -> bool {
       data.target
     );
   }
-  matches!(probe.state, SocketState::Active | SocketState::Unknown)
+  match probe.state {
+    SocketState::Active | SocketState::Unknown => true,
+    SocketState::Missing | SocketState::Stale | SocketState::NotSocket => false,
+  }
 }
 
 /// Identity of `alias` when it is a symlink to `target` stable across reads.
@@ -691,10 +691,16 @@ mod tests {
   use super::*;
   use crate::paths::current_euid;
 
-  /// Isolated 0700 temp dir per test (tag-suffixed, hermetic). The temp base
-  /// is canonicalized so platform symlinks (macOS `/var`) keep the chain real.
+  /// Isolated 0700 temp dir per test (tag-suffixed, hermetic). macOS uses
+  /// `/tmp` so paths stay inside the 104-byte `sun_path` limit; the base is
+  /// canonicalized so platform symlinks keep the chain real.
   fn scratch(tag: &str) -> PathBuf {
-    let base = std::fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
+    let root = if cfg!(target_os = "macos") {
+      PathBuf::from("/tmp")
+    } else {
+      std::env::temp_dir()
+    };
+    let base = std::fs::canonicalize(&root).unwrap_or(root);
     let pid = std::process::id();
     let dir = base.join(format!("adsum-markers-test-{pid}-{tag}"));
     let _ = std::fs::remove_dir_all(&dir);
