@@ -5,7 +5,9 @@
 use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::io;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Official Flatpak Discord app id, laid out as `app/<id>/discord-ipc-N`.
 const FLATPAK_DISCORD_APP_ID: &str = "com.discordapp.Discord";
@@ -72,9 +74,14 @@ pub(crate) fn socket_alias_dirs(bases: &[PathBuf]) -> Vec<PathBuf> {
       let Some(dir) = existing_alias_dir(base, layout) else {
         continue;
       };
-      if !dirs.contains(&dir) {
-        dirs.push(dir);
+      if dirs.contains(&dir) {
+        continue;
       }
+      if let Err(err) = validate_alias_dir(&dir) {
+        tracing::debug!("[ipc] Skipping alias dir {}: {err}", dir.display());
+        continue;
+      }
+      dirs.push(dir);
     }
   }
   dirs
@@ -144,61 +151,233 @@ fn normalize_absolute(path: &Path) -> Option<PathBuf> {
   Some(normalized)
 }
 
-/// Create the official Flatpak socket dir and its `app/` parent without
-/// following symlinks; `dir` must be `<runtime>/app/<official-id>`.
-pub(crate) fn prepare_socket_dir(dir: &Path) -> io::Result<()> {
-  if dir.file_name() != Some(OsStr::new(FLATPAK_DISCORD_APP_ID)) {
-    return Err(not_a_real_dir(dir, "not the official Flatpak dir"));
-  }
-  let app = dir
-    .parent()
-    .filter(|path| path.file_name() == Some(OsStr::new("app")))
-    .ok_or_else(|| not_a_real_dir(dir, "missing app parent"))?;
-  let base = app
-    .parent()
-    .ok_or_else(|| not_a_real_dir(app, "missing runtime base"))?;
-  require_real_dir(base)?;
-  let canonical = std::fs::canonicalize(base)?;
-  if is_shared_temp(&canonical) {
-    return Err(not_a_real_dir(base, "shared temp base"));
-  }
-  ensure_real_dir(app)?;
-  ensure_real_dir(dir)
+/// Effective user id of the current process.
+pub(crate) fn current_euid() -> u32 {
+  // SAFETY: geteuid has no preconditions and always returns the caller's
+  // effective uid; the call cannot fail.
+  unsafe { libc::geteuid() }
 }
 
-/// Whether `canonical` is `/tmp` or `/var/tmp`, resolving platform symlinks
-/// (macOS maps both into `/private`).
-fn is_shared_temp(canonical: &Path) -> bool {
-  ["/tmp", "/var/tmp"]
-    .iter()
-    .any(|shared| std::fs::canonicalize(shared).is_ok_and(|resolved| resolved == canonical))
+/// Directory policy applied before a path may host a socket or alias link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirPolicy {
+  /// User-private dir: owned by us, not writable by group or others.
+  Private,
+  /// Shared sticky temp root (`/tmp`, `/var/tmp`).
+  SharedTemp,
 }
 
-/// Require `path` to be an existing real directory, refusing symlinks.
-fn require_real_dir(path: &Path) -> io::Result<()> {
-  let meta = std::fs::symlink_metadata(path)?;
-  if meta.file_type().is_symlink() || !meta.is_dir() {
-    return Err(not_a_real_dir(path, "not a real directory"));
+/// Validate `path` against `policy`.
+pub(crate) fn validate_dir(path: &Path, policy: DirPolicy) -> io::Result<()> {
+  match policy {
+    DirPolicy::Private => validate_private_dir(path),
+    DirPolicy::SharedTemp => validate_shared_temp(path),
+  }
+}
+
+/// Require a user-private directory: real dir chain, owned by the effective
+/// uid, and not writable by group or others.
+pub(crate) fn validate_private_dir(path: &Path) -> io::Result<()> {
+  let normalized = normalize_dir(path)?;
+  let meta = validate_real_dir_chain(&normalized)?;
+  let euid = current_euid();
+  if meta.uid() != euid {
+    return Err(invalid_path(&normalized, "not owned by the effective uid"));
+  }
+  if meta.mode() & 0o022 != 0 {
+    return Err(invalid_path(&normalized, "writable by group or others"));
   }
   Ok(())
 }
 
-/// Ensure `path` is a real directory, creating it when absent; symlinks
-/// and non-directories are refused so creation never escapes the base.
-fn ensure_real_dir(path: &Path) -> io::Result<()> {
-  match require_real_dir(path) {
-    Ok(()) => Ok(()),
-    Err(err) if err.kind() == io::ErrorKind::NotFound => match std::fs::create_dir(path) {
-      Ok(()) => Ok(()),
-      Err(err) if err.kind() == io::ErrorKind::AlreadyExists => require_real_dir(path),
-      Err(err) => Err(err),
-    },
-    Err(err) => Err(err),
-  }
+/// Require a shared temp root: canonical `/tmp` or `/var/tmp`, sticky,
+/// root- or self-owned, and writable by this effective uid.
+pub(crate) fn validate_shared_temp(path: &Path) -> io::Result<()> {
+  validate_shared_temp_canonical(path).map(|_| ())
 }
 
-/// Build the refusal error for a path that cannot be used as a real dir.
-fn not_a_real_dir(path: &Path, reason: &str) -> io::Error {
+/// Validate a shared temp root and return its canonical path (resolving
+/// platform symlinks such as macOS `/tmp`).
+fn validate_shared_temp_canonical(path: &Path) -> io::Result<PathBuf> {
+  let normalized = normalize_dir(path)?;
+  let canonical = std::fs::canonicalize(&normalized)?;
+  if !is_canonical_shared_temp(&canonical) {
+    return Err(invalid_path(&normalized, "not a shared temp root"));
+  }
+  let meta = std::fs::symlink_metadata(&canonical)?;
+  if !meta.is_dir() {
+    return Err(invalid_path(&normalized, "not a directory"));
+  }
+  let euid = current_euid();
+  if meta.uid() != 0 && meta.uid() != euid {
+    return Err(invalid_path(
+      &normalized,
+      "not owned by root or the effective uid",
+    ));
+  }
+  if meta.mode() & 0o1000 == 0 {
+    return Err(invalid_path(&normalized, "missing the sticky bit"));
+  }
+  probe_temp_write(&canonical)?;
+  Ok(canonical)
+}
+
+/// Validate a fan-out alias dir: shared temp roots keep the temp policy,
+/// anything else must be user-private.
+pub(crate) fn validate_alias_dir(path: &Path) -> io::Result<()> {
+  let policy = if is_shared_temp_root(path) {
+    DirPolicy::SharedTemp
+  } else {
+    DirPolicy::Private
+  };
+  validate_dir(path, policy)
+}
+
+/// Create a `0700` private dir, revalidating an existing one; every parent
+/// must already exist as a real directory.
+pub(crate) fn prepare_private_dir(path: &Path) -> io::Result<()> {
+  let normalized = normalize_dir(path)?;
+  let parent = normalized
+    .parent()
+    .ok_or_else(|| invalid_path(&normalized, "missing parent directory"))?;
+  validate_real_dir_chain(parent)?;
+  match std::fs::DirBuilder::new().mode(0o700).create(&normalized) {
+    Ok(()) => {}
+    Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+    Err(err) => return Err(err),
+  }
+  validate_private_dir(&normalized)
+}
+
+/// Name of the per-uid fallback socket dir under a shared temp root.
+#[must_use]
+pub(crate) fn fallback_dir_name(euid: u32) -> String {
+  format!(".adsum-ipc-{euid}")
+}
+
+/// Prepare the per-uid fallback dir under the first usable shared temp root;
+/// an existing dir that fails validation is left untouched.
+pub(crate) fn prepare_fallback_dir(roots: &[PathBuf], euid: u32) -> Option<PathBuf> {
+  for root in roots {
+    let canonical = match validate_shared_temp_canonical(root) {
+      Ok(canonical) => canonical,
+      Err(err) => {
+        tracing::debug!("[ipc] Skipping fallback root {}: {err}", root.display());
+        continue;
+      }
+    };
+    let dir = canonical.join(fallback_dir_name(euid));
+    match prepare_private_dir(&dir) {
+      Ok(()) => return Some(dir),
+      Err(err) => {
+        tracing::debug!("[ipc] Fallback dir {} unusable: {err}", dir.display());
+      }
+    }
+  }
+  None
+}
+
+/// Build the bind order: preferred dir, conventional bases, then fallback;
+/// shared temp roots are filtered and duplicates dropped in place.
+#[must_use]
+pub(crate) fn bind_dirs_in_order(
+  bases: Vec<PathBuf>,
+  preferred: Option<&Path>,
+  fallback: Option<PathBuf>,
+) -> Vec<PathBuf> {
+  let mut dirs = Vec::with_capacity(bases.len() + 2);
+  let candidates = preferred
+    .map(Path::to_path_buf)
+    .into_iter()
+    .chain(bases)
+    .chain(fallback);
+  for dir in candidates {
+    if is_shared_temp_root(&dir) || dirs.contains(&dir) {
+      continue;
+    }
+    dirs.push(dir);
+  }
+  dirs
+}
+
+/// Normalize an absolute non-root path, refusing empty/relative/root input.
+fn normalize_dir(path: &Path) -> io::Result<PathBuf> {
+  normalize_absolute(path)
+    .filter(|normalized| normalized != Path::new("/"))
+    .ok_or_else(|| invalid_path(path, "not an absolute non-root directory"))
+}
+
+/// Require every component of `path` to be a real directory (never a
+/// symlink) and return the final directory's metadata.
+fn validate_real_dir_chain(path: &Path) -> io::Result<std::fs::Metadata> {
+  let mut current = PathBuf::new();
+  let mut last = None;
+  for component in path.components() {
+    current.push(component.as_os_str());
+    let meta = std::fs::symlink_metadata(&current)?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+      return Err(invalid_path(&current, "not a real directory"));
+    }
+    last = Some(meta);
+  }
+  last.ok_or_else(|| invalid_path(path, "empty directory path"))
+}
+
+/// Prove effective-uid write access by creating and removing an exclusive
+/// file inside `dir` (`O_EXCL` never follows a final symlink).
+fn probe_temp_write(dir: &Path) -> io::Result<()> {
+  static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
+  let seq = PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
+  let probe = dir.join(format!(".adsum-ipc-probe-{}-{seq}", std::process::id()));
+  let file = std::fs::OpenOptions::new()
+    .write(true)
+    .create_new(true)
+    .mode(0o600)
+    .open(&probe)?;
+  drop(file);
+  std::fs::remove_file(&probe)
+}
+
+/// Whether `path` is or resolves to `/tmp` or `/var/tmp`.
+fn is_shared_temp_root(path: &Path) -> bool {
+  if path == Path::new("/tmp") || path == Path::new("/var/tmp") {
+    return true;
+  }
+  std::fs::canonicalize(path).is_ok_and(|canonical| is_canonical_shared_temp(&canonical))
+}
+
+/// Whether canonical `path` is `/tmp` or `/var/tmp`, resolving platform
+/// symlinks (macOS maps both into `/private`).
+fn is_canonical_shared_temp(path: &Path) -> bool {
+  ["/tmp", "/var/tmp"]
+    .iter()
+    .any(|shared| std::fs::canonicalize(shared).is_ok_and(|resolved| resolved == path))
+}
+
+/// Create the official Flatpak socket dir and its `app/` parent without
+/// following symlinks; `dir` must be `<runtime>/app/<official-id>`.
+pub(crate) fn prepare_socket_dir(dir: &Path) -> io::Result<()> {
+  if dir.file_name() != Some(OsStr::new(FLATPAK_DISCORD_APP_ID)) {
+    return Err(invalid_path(dir, "not the official Flatpak dir"));
+  }
+  let app = dir
+    .parent()
+    .filter(|path| path.file_name() == Some(OsStr::new("app")))
+    .ok_or_else(|| invalid_path(dir, "missing app parent"))?;
+  let base = app
+    .parent()
+    .ok_or_else(|| invalid_path(app, "missing runtime base"))?;
+  validate_private_dir(base)?;
+  let canonical = std::fs::canonicalize(base)?;
+  if is_canonical_shared_temp(&canonical) {
+    return Err(invalid_path(base, "shared temp base"));
+  }
+  prepare_private_dir(app)?;
+  prepare_private_dir(dir)
+}
+
+/// Build the refusal error for a path that cannot be used as a socket dir.
+fn invalid_path(path: &Path, reason: &str) -> io::Error {
   io::Error::new(
     io::ErrorKind::InvalidInput,
     format!("{reason}: {}", path.display()),
@@ -305,15 +484,27 @@ pub fn socket_file_name(bound_path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-  use std::os::unix::fs::FileTypeExt;
+  use std::ffi::CString;
+  use std::fs::Permissions;
+  use std::os::unix::ffi::OsStrExt;
+  use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
+  use std::sync::Mutex;
 
   use super::*;
 
-  /// Isolated temp dir per test (tag-suffixed, hermetic).
+  /// Serializes the two tests that use the uid-qualified `/tmp` fallback.
+  static FALLBACK_LOCK: Mutex<()> = Mutex::new(());
+
+  /// Isolated 0700 temp dir per test (tag-suffixed, hermetic). The temp base
+  /// is canonicalized so platform symlinks (macOS `/var`) keep the chain real.
   fn scratch(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("adsum-paths-test-{}-{tag}", std::process::id()));
+    let base = std::fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
+    let dir = base.join(format!("adsum-paths-test-{}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    std::fs::DirBuilder::new()
+      .mode(0o700)
+      .create(&dir)
+      .expect("scratch dir");
     dir
   }
 
@@ -793,5 +984,214 @@ mod tests {
     let _ = std::fs::remove_dir_all(&ours);
     let _ = std::fs::remove_dir_all(&outside);
     let _ = std::fs::remove_dir_all(&parent);
+  }
+
+  /// A private dir must belong to us and reject group/other writes.
+  #[test]
+  fn private_dir_requires_euid_and_no_group_other_write() {
+    let dir = scratch("private-mode");
+    validate_private_dir(&dir).expect("0700 scratch must pass");
+
+    std::fs::set_permissions(&dir, Permissions::from_mode(0o770)).expect("chmod 0770");
+    assert!(
+      validate_private_dir(&dir).is_err(),
+      "group-writable dir must fail"
+    );
+
+    std::fs::set_permissions(&dir, Permissions::from_mode(0o702)).expect("chmod 0702");
+    assert!(
+      validate_private_dir(&dir).is_err(),
+      "other-writable dir must fail"
+    );
+
+    assert!(
+      validate_private_dir(Path::new("/tmp")).is_err(),
+      "shared temp root must fail the private policy"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// Shared temp roots are accepted only under their sticky-bit policy.
+  #[test]
+  fn shared_temp_policy_accepts_tmp_and_rejects_non_sticky() {
+    let tmp = Path::new("/tmp");
+    if tmp.is_dir() {
+      validate_shared_temp(tmp).expect("/tmp must pass the shared temp policy");
+    }
+
+    let dir = scratch("shared-temp");
+    std::fs::set_permissions(&dir, Permissions::from_mode(0o777)).expect("chmod 0777");
+    let err = validate_alias_dir(&dir).expect_err("non-sticky 0777 dir must fail");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+    let var_tmp = Path::new("/var/tmp");
+    if var_tmp.is_dir() {
+      validate_shared_temp(var_tmp).expect("/var/tmp must pass when present");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// Empty, relative, root, symlinked, and file paths are all refused.
+  #[test]
+  fn relative_empty_root_and_symlink_paths_are_rejected() {
+    for path in ["", "relative", "/"] {
+      let err = validate_private_dir(Path::new(path)).expect_err("shape must be refused");
+      assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "path {path:?}");
+    }
+
+    let dir = scratch("reject-shape");
+    let link = dir.join("link");
+    std::os::unix::fs::symlink(&dir, &link).expect("symlink");
+    assert!(
+      validate_private_dir(&link).is_err(),
+      "symlinked final component must fail"
+    );
+
+    let file = dir.join("file");
+    std::fs::write(&file, b"not a dir").expect("regular file");
+    assert!(
+      validate_private_dir(&file).is_err(),
+      "regular file must fail"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// Private dirs are created 0700; a symlinked parent is never followed.
+  #[test]
+  fn prepare_private_dir_creates_0700_and_refuses_symlinked_parent() {
+    let base = scratch("prepare-private");
+    let dir = base.join("new");
+    prepare_private_dir(&dir).expect("create private dir");
+    let meta = std::fs::symlink_metadata(&dir).expect("dir metadata");
+    assert_eq!(meta.mode() & 0o777, 0o700);
+    assert_eq!(meta.uid(), current_euid());
+
+    let outside = scratch("prepare-private-outside");
+    let link_parent = base.join("link-parent");
+    std::os::unix::fs::symlink(&outside, &link_parent).expect("symlinked parent");
+    let err =
+      prepare_private_dir(&link_parent.join("child")).expect_err("symlinked parent must fail");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert!(
+      !outside.join("child").exists(),
+      "symlink target must stay untouched"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&outside);
+  }
+
+  /// Fallback dir name is qualified by the effective uid.
+  #[test]
+  fn fallback_dir_name_is_uid_qualified() {
+    assert_eq!(fallback_dir_name(1000), ".adsum-ipc-1000");
+  }
+
+  /// Bind order prefers the Flatpak dir, filters temp roots, and dedupes.
+  #[test]
+  fn bind_dirs_put_preferred_first_filter_shared_temp_and_dedupe() {
+    let scratch_dir = scratch("bind-order");
+    let preferred = PathBuf::from("/run/user/1000/app/com.discordapp.Discord");
+    let fallback = scratch_dir.join(".adsum-ipc-1000");
+    let dirs = bind_dirs_in_order(
+      vec![
+        preferred.clone(),
+        PathBuf::from("/tmp"),
+        scratch_dir.clone(),
+        scratch_dir.clone(),
+        PathBuf::from("/var/tmp"),
+      ],
+      Some(&preferred),
+      Some(fallback.clone()),
+    );
+
+    assert_eq!(dirs.first(), Some(&preferred));
+    assert!(dirs.contains(&scratch_dir));
+    assert!(
+      !dirs
+        .iter()
+        .any(|dir| dir == Path::new("/tmp") || dir == Path::new("/var/tmp")),
+      "shared temp roots must be filtered: {dirs:?}"
+    );
+    assert_eq!(dirs.last(), Some(&fallback));
+
+    let mut unique = dirs.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), dirs.len(), "bind dirs must not repeat");
+
+    let _ = std::fs::remove_dir_all(&scratch_dir);
+  }
+
+  /// The fallback dir under `/tmp` is created 0700 and owned by us.
+  #[test]
+  fn prepare_fallback_dir_creates_private_dir_under_tmp() {
+    let tmp = Path::new("/tmp");
+    if !tmp.is_dir() {
+      return;
+    }
+    let euid = current_euid();
+    let fallback = std::fs::canonicalize(tmp)
+      .map(|root| root.join(fallback_dir_name(euid)))
+      .unwrap_or_else(|_| tmp.join(fallback_dir_name(euid)));
+    let _guard = FALLBACK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    if !fallback.exists() {
+      let dir =
+        prepare_fallback_dir(&[tmp.to_path_buf()], euid).expect("prepare fallback dir under /tmp");
+      assert_eq!(dir, fallback);
+      let meta = std::fs::symlink_metadata(&dir).expect("fallback metadata");
+      assert_eq!(meta.mode() & 0o777, 0o700);
+      assert_eq!(meta.uid(), euid);
+      let _ = std::fs::remove_dir(&dir);
+    }
+
+    let unique = tmp.join(format!(".adsum-ipc-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&unique);
+    prepare_private_dir(&unique).expect("create unique private dir");
+    let meta = std::fs::symlink_metadata(&unique).expect("unique metadata");
+    assert_eq!(meta.mode() & 0o777, 0o700);
+    assert_eq!(meta.uid(), euid);
+    let _ = std::fs::remove_dir_all(&unique);
+  }
+
+  /// A fallback dir owned by another uid is refused and never deleted.
+  #[test]
+  fn foreign_owned_fallback_is_not_deleted() {
+    if current_euid() != 0 {
+      return;
+    }
+    let tmp = Path::new("/tmp");
+    if !tmp.is_dir() {
+      return;
+    }
+    let fallback = tmp.join(fallback_dir_name(current_euid()));
+    let _guard = FALLBACK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if fallback.exists() {
+      return;
+    }
+
+    std::fs::create_dir(&fallback).expect("seed fallback dir");
+    std::fs::set_permissions(&fallback, Permissions::from_mode(0o700)).expect("chmod fallback");
+    let path = CString::new(fallback.as_os_str().as_bytes()).expect("path without nul");
+    // SAFETY: `path` is a NUL-terminated string naming the directory created
+    // above; chown only changes its owner and never outlives the buffer.
+    let chown_result = unsafe { libc::chown(path.as_ptr(), 65534, 65534) };
+    assert_eq!(chown_result, 0, "seed foreign owner");
+
+    assert!(
+      prepare_fallback_dir(&[tmp.to_path_buf()], current_euid()).is_none(),
+      "foreign-owned fallback must be refused"
+    );
+    assert!(
+      fallback.exists(),
+      "foreign-owned fallback must not be deleted"
+    );
+
+    // SAFETY: same valid NUL-terminated path; restoring ownership as root
+    // lets the test remove the directory it created.
+    let restore_result = unsafe { libc::chown(path.as_ptr(), 0, 0) };
+    assert_eq!(restore_result, 0, "restore fallback owner");
+    let _ = std::fs::remove_dir(&fallback);
   }
 }

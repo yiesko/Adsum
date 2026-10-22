@@ -25,8 +25,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::frame::{IpcFacilitator, handle_stream};
 use crate::paths::{
-  fanout_socket_link, preferred_socket_dir_from, prepare_socket_dir, remove_socket_links,
-  socket_alias_dirs, socket_dir_candidates, socket_file_name,
+  bind_dirs_in_order, current_euid, fanout_socket_link, preferred_socket_dir_from,
+  prepare_fallback_dir, prepare_socket_dir, remove_socket_links, socket_alias_dirs,
+  socket_dir_candidates, socket_file_name,
 };
 use crate::probe::socket_holder_alive;
 use crate::sink::{DEFAULT_IPC_QUEUE, EventSink};
@@ -170,8 +171,12 @@ impl IpcTransport {
     let (preferred, bind_dirs, aliases) = tokio::task::spawn_blocking(|| {
       let bases = socket_dir_candidates();
       let preferred = prepare_preferred_dir();
+      let fallback = prepare_fallback_dir(
+        &[PathBuf::from("/tmp"), PathBuf::from("/var/tmp")],
+        current_euid(),
+      );
       let aliases = socket_alias_dirs(&bases);
-      let bind_dirs = bind_dirs_in_order(bases, preferred.as_deref());
+      let bind_dirs = bind_dirs_in_order(bases, preferred.as_deref(), fallback);
       (preferred, bind_dirs, aliases)
     })
     .await
@@ -347,16 +352,6 @@ impl IpcTransport {
     }
     owned.abort_all();
   }
-}
-
-/// Put the prepared Flatpak dir before the conventional bases.
-fn bind_dirs_in_order(bases: Vec<PathBuf>, preferred: Option<&Path>) -> Vec<PathBuf> {
-  let mut bind_dirs = Vec::with_capacity(bases.len() + 1);
-  if let Some(dir) = preferred {
-    bind_dirs.push(dir.to_path_buf());
-  }
-  bind_dirs.extend(bases);
-  bind_dirs
 }
 
 /// Prepare the official Flatpak Discord dir, warning and falling back when
@@ -573,18 +568,18 @@ async fn accept_loop(
 mod tests {
   use super::*;
 
-  /// The prepared Flatpak dir is tried before every conventional base.
+  /// The prepared Flatpak dir is tried before conventional bases, with
+  /// shared temp roots filtered out.
   #[test]
   fn bind_dirs_put_preferred_first() {
     let bases = vec![PathBuf::from("/run/user/1000"), PathBuf::from("/tmp")];
     let preferred = PathBuf::from("/run/user/1000/app/com.discordapp.Discord");
-    let dirs = bind_dirs_in_order(bases, Some(&preferred));
+    let dirs = bind_dirs_in_order(bases, Some(&preferred), None);
     assert_eq!(
       dirs,
       vec![
         PathBuf::from("/run/user/1000/app/com.discordapp.Discord"),
         PathBuf::from("/run/user/1000"),
-        PathBuf::from("/tmp"),
       ]
     );
   }
@@ -592,8 +587,8 @@ mod tests {
   /// Without a prepared Flatpak dir, the conventional order is unchanged.
   #[test]
   fn bind_dirs_without_preferred_keep_bases() {
-    let bases = vec![PathBuf::from("/run/user/1000"), PathBuf::from("/tmp")];
-    assert_eq!(bind_dirs_in_order(bases.clone(), None), bases);
+    let bases = vec![PathBuf::from("/run/user/1000")];
+    assert_eq!(bind_dirs_in_order(bases.clone(), None, None), bases);
   }
 
   /// Transient per-connection failures retry at once; persistent ones
