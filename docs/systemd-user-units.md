@@ -53,8 +53,6 @@ Environment=ADSUM_SCAN_INTERVAL=5
 # Custom game mappings (missing file = no overrides, never fatal).
 # The CLI resolves $XDG_CONFIG_HOME/adsum/overrides.json (default
 # ~/.config/adsum).
-# Drop top-level IPC entries before start (the "-" ignores failure).
-ExecStartPre=-/bin/sh -c 'rm -f %t/discord-ipc-*; rm -f "${TMPDIR:-/tmp}/discord-ipc-*"'
 # Official detectable list with trim, hourly refresh while running,
 # offline bundled fallback. Add --auto-update (or ADSUM_AUTO_UPDATE=1
 # in a adsum.service.d/override.conf drop-in) to also stage verified
@@ -62,10 +60,11 @@ ExecStartPre=-/bin/sh -c 'rm -f %t/discord-ipc-*; rm -f "${TMPDIR:-/tmp}/discord
 ExecStart=%h/.local/bin/adsum --enable-db-update
 Restart=on-failure
 RestartSec=5s
-TimeoutStopSec=5s
+# Covers 2s accept wait + 5s connection drain + teardown/cleanup.
+TimeoutStopSec=15s
 KillMode=mixed
 NoNewPrivileges=yes
-# The IPC fan-out symlinks discord-ipc-{n} into host /tmp (games probing
+# The IPC aliases symlink discord-ipc-{n} into host /tmp (games probing
 # the last official dir): ProtectSystem=strict mounts /tmp read-only, so
 # the host path is bound back in writable. The daemon writes nothing else
 # there (cache -> ~/.cache, sockets -> %t).
@@ -128,25 +127,23 @@ What matters:
   username.
 - **`default.target`**: the service starts at login (add linger below to
   start at boot without a graphical login).
-- **`ExecStartPre`**: removes top-level `discord-ipc-*` entries left by
-  crashed runs, so a killed service does not block the next start. The
-  sweep is unconditional: it does not probe live holders and can remove a
-  top-level socket owned by another service. Nested client paths under
-  `%t/app/...`, `%t/.flatpak/...`, and `%t/snap.*` are not touched by it;
-  the bind probe reclaims a stale socket only for the index and directory
-  it tries, and fan-out reclaims a dangling ours-shaped link when it
-  publishes that index. A clean shutdown removes the real socket and every
-  alias link.
+- **Socket cleanup**: stale sockets are probed and reclaimed by the IPC
+  transport; foreign or unknown entries are preserved; valid orphan markers
+  are recovered before bind. `SIGTERM` and Ctrl+C run the same graceful
+  shutdown, which removes only the bound socket, the aliases Adsum owns, and
+  their markers. `TimeoutStopSec=15s` covers the 2s accept wait, the 5s
+  connection drain, and teardown/cleanup.
 - **Sandboxing**: `ProtectHome=read-only` plus the writable exceptions:
   `CacheDirectory=` creates the cache directory (XDG default
   `~/.cache/adsum`) before the sandbox mounts; `ReadWritePaths` adds the
   runtime dir `%t` (sockets, including the preferred
   `%t/app/com.discordapp.Discord` directory) and `~/.local/bin` (staged
-  self-updates swap in at boot). The config directory is only read, so it
-  needs no write exception. The unit then applies kernel/clock/hostname/
-  cgroup protections, `PrivateDevices`, `RestrictSUIDSGID`/
-  `RestrictRealtime`, and a `SystemCallFilter` allowlist with
-  `MemoryDenyWriteExecute`, all verified against a live boot.
+  self-updates swap in at boot). `BindPaths=/tmp` keeps the host `/tmp`
+  writable because compatibility aliases are still published there. The
+  config directory is only read, so it needs no write exception. The unit
+  then applies kernel/clock/hostname/cgroup protections, `PrivateDevices`,
+  `RestrictSUIDSGID`/`RestrictRealtime`, and a `SystemCallFilter` allowlist
+  with `MemoryDenyWriteExecute`, all verified against a live boot.
 - **`RestrictAddressFamilies=... AF_NETLINK`**: required by the
   event-driven process watcher; without `AF_NETLINK` the scanner silently
   stays on polling.
@@ -234,8 +231,8 @@ systemctl --user status my-service.service
 Rules of thumb: one concern per unit; `Type=exec` + `Restart=on-failure`
 for daemons; prefer `Environment=`/drop-ins over wrapper scripts; secrets
 go in `EnvironmentFile=` (mode `600`), never in the unit. If you copy the
-shipped unit, keep `AF_NETLINK` (watcher) and the top-level IPC sweep in
-`ExecStartPre`.
+shipped unit, keep `AF_NETLINK` (watcher) and `BindPaths=/tmp` (IPC aliases
+published into host `/tmp`).
 
 ## See also
 

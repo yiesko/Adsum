@@ -7,8 +7,9 @@ officially-shaped replies. Two transports are served:
 - **IPC** — local sockets named `discord-ipc-0` … `discord-ipc-9`. On Linux
   the real socket is preferably bound in
   `$XDG_RUNTIME_DIR/app/com.discordapp.Discord/`, then in the conventional
-  bases `XDG_RUNTIME_DIR`, `TMPDIR`, `TMP`, `TEMP`, `/tmp`; symlinks in every
-  existing client layout let games find it wherever they probe (see
+  bases `XDG_RUNTIME_DIR`, `TMPDIR`, `TMP`, `TEMP`, and finally a private
+  `.adsum-ipc-<euid>` directory under `/tmp` or `/var/tmp`; marked symlinks
+  in every existing client layout let games find it wherever they probe (see
   [Linux socket placement](#linux-socket-placement)). On Windows the same
   names are **named pipes** (`\\.\pipe\discord-ipc-0` … `-9`), with no
   directory involved at all.
@@ -29,24 +30,80 @@ to the bridge instead — see [web-client.md](web-client.md).
 
 ## Linux socket placement
 
-Adsum binds one real `UnixListener` at the first free index `0..=9` in
-`$XDG_RUNTIME_DIR/app/com.discordapp.Discord/` — the path the official
-Discord Flatpak exposes to sandboxed clients. That directory is created only
-when `XDG_RUNTIME_DIR` is an absolute path that normalizes to a real
-directory other than `/`, `/tmp`, or `/var/tmp`; the runtime base, `app/`,
-and the app directory must all be real directories, not symlinks. If it
-cannot be used (or every index there is held by a live socket), Adsum falls
-back to the conventional bases in order:
+Adsum separates where it creates the real socket from where it publishes
+compatibility links:
 
-1. `$XDG_RUNTIME_DIR`
-2. `$TMPDIR`
-3. `$TMP`
-4. `$TEMP`
-5. `/tmp`
+- **Bind directory** — where the real `discord-ipc-N` `UnixListener` is
+  created.
+- **Alias directory** — an existing directory where Adsum may publish a
+  symlink named `discord-ipc-N` that points at the bound socket.
 
-The bound index is then published as a symlink for every **already existing,
-real** directory in the list below, under each base (symlinked layouts are
-skipped):
+Adsum never binds directly in `/tmp` or `/var/tmp`. It may publish aliases
+there, and it may bind inside the private fallback directory described
+below.
+
+### Bind order
+
+Candidates are normalized, deduplicated, and validated in order:
+
+1. `$XDG_RUNTIME_DIR/app/com.discordapp.Discord`
+2. `$XDG_RUNTIME_DIR`
+3. `$TMPDIR`
+4. `$TMP`
+5. `$TEMP`
+6. `<approved-temp>/.adsum-ipc-<euid>`
+
+Shared temp roots (`/tmp`, `/var/tmp`) are filtered out of the bind list,
+so a candidate that resolves to either is skipped. `<approved-temp>` is
+`/tmp`, then `/var/tmp`, and the first root where the fallback can be
+created or validated wins; the fallback directory is created with mode
+`0700`. The preferred Flatpak directory is tried first and is created only
+when `$XDG_RUNTIME_DIR` is a valid private directory: the runtime base,
+`app/`, and `app/com.discordapp.Discord/` are created as real directories
+without following symlinks. If it cannot be used, the next candidate is
+tried. If no bind directory validates, startup fails with `IpcBind`; a
+directory is never deleted or repaired to make it usable.
+
+On `AddrInUse`, Adsum probes the entry with `lstat` (never following
+symlinks) and a connect bounded to one second. A successful connect is
+`Active` — a listener that never replies still counts as active —
+`ECONNREFUSED` is `Stale`, and any other error or timeout is `Unknown`. A
+symlink, regular file, directory, or other non-socket is `NotSocket`.
+Only `Stale` may be reclaimed: the entry must still be a socket with the
+same `(dev, ino)` immediately before unlink. `Active`, `Unknown`, and
+`NotSocket` keep the path, and Adsum tries the next index.
+
+### Directory policies
+
+Every directory Adsum writes into must satisfy exactly one policy:
+
+- **Private directory** — absolute, without a `..` component, with every
+  component an existing real directory (no symlinks), owned by the
+  effective UID, and not writable by group or others (`mode & 0o022 == 0`).
+- **Approved shared-temp directory** — canonical `/tmp` or `/var/tmp`,
+  owned by root or the effective UID, with the sticky bit set and writable
+  by the effective UID.
+
+The shared-temp policy is the only exception that allows group or other
+write permission. A nested directory below `/tmp` or `/var/tmp` still has
+to pass the private policy. Relative, empty, root (`/`), symlinked,
+non-directory, foreign-owned, and non-sticky world-writable paths are
+rejected, and rejection never authorizes deleting the path.
+
+### Socket permissions
+
+Immediately after a successful bind, Adsum sets the real socket to mode
+`0600` and verifies the mode before publishing any alias or marker. If the
+mode cannot be set or verified, that bind attempt is cleaned up with the
+same identity-checked removal as other owned-socket cleanup, and the next
+index is tried.
+
+### Alias layouts
+
+Alias bases keep the conventional order: `$XDG_RUNTIME_DIR`, `$TMPDIR`,
+`$TMP`, `$TEMP`, `/tmp`. Under each base, only layouts that already exist
+as real directories are used (symlinked layouts are skipped, never
+followed):
 
 - `<base>/discord-ipc-N` — conventional probe
 - `<base>/app/com.discordapp.Discord/discord-ipc-N` — official Flatpak Discord
@@ -63,20 +120,120 @@ skipped):
 - `<base>/snap.discord-canary/discord-ipc-N` — Canary Snap
 - `<base>/snap.discord-ptb/discord-ipc-N` — PTB Snap
 
-Only the official Flatpak directory is ever created. Adsum never creates
-`app/` for the other clients, `.flatpak/`, or `snap.*`: those aliases appear
-only when the client's own directory already exists. Alias publishing never
-replaces a real socket, regular file, or live symlink owned by another
-service. A dangling ours-shaped link left by a crashed Adsum run is
-reclaimed when the same index is published again. Shutdown removes the real
-socket and the links for that index, and leaves directories in place.
+Alias directories are never created, except for the preferred Flatpak bind
+directory. A missing layout is skipped. A path that already exists is
+preserved: Adsum never replaces a symlink, socket, regular file, or
+directory, even when the existing symlink points at Adsum's bound socket.
+A Flatpak wrapper or another service may legitimately own such a link, so
+there is no "dangling ours-shaped link" reclaim heuristic.
 
-**Sandbox limitation:** Adsum cannot grant a Flatpak or Snap package access
-to a host path. A sandboxed client is served only when its own configuration
-already exposes the directory it probes. The PrismLauncher Flatpak case is
-covered because it maps the official
-`$XDG_RUNTIME_DIR/app/com.discordapp.Discord` directory (`:create`), which is
-exactly where Adsum binds first.
+### Alias ownership markers
+
+Every alias Adsum creates has one marker in the same directory:
+
+```text
+<alias-dir>/.adsum-ipc-owner-<euid>-<index>
+```
+
+The marker is a `0600` regular file owned by the effective UID, at most
+4096 bytes, holding versioned JSON:
+
+```json
+{
+  "version": 1,
+  "owner_uid": 1000,
+  "alias": "/tmp/discord-ipc-0",
+  "target": "/run/user/1000/app/com.discordapp.Discord/discord-ipc-0",
+  "target_dev": 123,
+  "target_ino": 456
+}
+```
+
+`target_dev` and `target_ino` identify the bound socket when the marker was
+published. A marker is valid only when it is a regular file (not a
+symlink), is owned by the effective UID, has mode `0600`, is at most 4096
+bytes, parses as the version 1 schema, has `owner_uid` equal to the
+effective UID, names the expected alias, has an absolute target ending in
+`discord-ipc-<index>`, and keeps the same `(dev, ino)` throughout
+validation.
+
+Markers are published atomically and never replace an existing entry: a
+uniquely named temporary file (`.adsum-ipc-owner-<euid>-<index>.tmp-<pid>-<counter>`)
+is written and synced, then hard-linked to the final name with `link()`.
+`link()` fails when the final name already exists, so a marker is never
+overwritten, even by the same UID. The temporary name is unlinked
+afterwards; a leftover temporary file is inert, is not treated as a
+marker, and never authorizes cleanup. `rename` is not used because it can
+replace another process's marker. The marker is published before the alias
+symlink: if the process dies between the two steps, the next start finds a
+recoverable orphan marker instead of an unowned alias.
+
+### Recovery, conflicts, and shutdown
+
+Before any bind attempt, Adsum scans each validated alias directory for the
+exact marker names `.adsum-ipc-owner-<euid>-<0..9>` and validates every
+marker, the alias entry, and the recorded target. In that startup scan,
+only two cases remove anything:
+
+- An orphan marker with no alias is removed when its target probes as
+  `Missing`, `Stale`, or `NotSocket`.
+- An alias symlink whose `readlink` target equals the marker's `target` is
+  removed together with its marker under the same dead-target probe, after
+  the symlink and marker identities are revalidated.
+
+Everything else is preserved. A live or `Unknown` target keeps the alias
+and marker for the next run; a symlink pointing anywhere else, a
+non-symlink entry, and an invalid or foreign-owned marker are conflicts and
+are left untouched. Removing an orphan alias requires the symlink's
+`(dev, ino)` to stay unchanged between the two `lstat` calls around
+`readlink`, and a re-probe before unlink must still report the target as
+missing, stale, or not a socket. Recovery runs before bind so a freshly
+bound socket cannot be mistaken for the target recorded in an old marker.
+This marker-driven recovery is the only automatic startup cleanup; there is
+no unconditional sweep of `/tmp` or `$XDG_RUNTIME_DIR`.
+
+On graceful shutdown (Ctrl+C or `SIGTERM`) and on `Drop`, Adsum removes
+only aliases recorded as owned by that transport: it revalidates the
+marker's identity and content, requires the alias to still be a symlink to
+the exact owned target with the recorded `(dev, ino)`, unlinks the alias,
+and only then removes the marker. If the alias cannot be removed, the
+marker remains for the next startup's recovery. The bound socket is
+removed separately, and only when its identity still matches and it is
+still a socket; a replaced path is left untouched.
+
+### Flatpak compatibility
+
+`$XDG_RUNTIME_DIR/app/com.discordapp.Discord` is the only path guaranteed
+to match the PrismLauncher Flatpak default permission
+(`xdg-run/app/com.discordapp.Discord:create`). When Adsum cannot bind there
+but conventional IPC still works elsewhere, startup continues and logs
+exactly:
+
+```text
+[ipc] Flatpak-compatible socket path unavailable; compatibility aliases may not be reachable from sandboxed clients
+```
+
+The warning does not fail startup, and it does not mean Flatpak
+compatibility is enabled. A conventional alias may still exist in the
+official directory when that directory already exists and validates, but a
+sandboxed client may not be able to resolve a symlink whose target is
+outside its approved mount. Adsum cannot grant a Flatpak or Snap package
+access to a host path.
+
+### Official Discord discovery conflict
+
+If the official Discord client is running at the same official path and a
+client probes index `0` first, that client may connect to official Discord
+instead of Adsum. Adsum does not promise coexistence with official Discord
+RPC and does not claim to win client discovery.
+
+### Residual connection-exhaustion risk
+
+The IPC transport allows at most 16 concurrent pumps and a 1 MiB payload
+limit. These are resource bounds, not DoS protection: a local client can
+open 16 connections and keep them idle or incomplete, occupying every pump
+and preventing legitimate clients from being served. Handshake, frame-read,
+and idle-connection timeouts are explicitly deferred.
 
 ## IPC handshake
 

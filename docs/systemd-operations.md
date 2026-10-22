@@ -84,22 +84,37 @@ systemctl --user restart adsum.service # service picks up the restored binary
 
 ## 4. Known gotchas
 
-- **Restart with a busy IPC socket**: normal. Adsum probes the holder
-  behind `discord-ipc-0` with a PING (1s budget); anything live keeps the
-  path and Adsum binds `discord-ipc-1` instead. It goes back to `-0` on
-  the next clean start once the old holder is gone. The WARN at that
-  moment is expected, not an error. **Under the shipped systemd unit**,
-  `ExecStartPre` removes top-level `discord-ipc-*` unconditionally before
-  Adsum starts, so a live top-level foreign socket is not preserved across
-  a service restart. Nested paths under `%t/app/...`, `%t/.flatpak/...`,
-  and `%t/snap.*` are not touched by that sweep.
-- **SIGTERM vs SIGINT**: `systemctl --user stop` sends SIGTERM, which has
-  no in-process handler — only Ctrl+C (SIGINT) runs the graceful shutdown
-  that removes the socket files. After a `stop`, leftover top-level
-  `discord-ipc-*` files are removed by the unit's `ExecStartPre` on the
-  next start. Nested aliases are not swept by `ExecStartPre`; they are
-  only reclaimed when the same index is rebound. A clean shutdown removes
-  the real socket and every alias link. Known behavior, not a bug.
+- **Restart with a busy IPC socket**: normal. Adsum probes each index
+  with a bounded connect, not with a protocol exchange: `Active` (a
+  listener accepted, even a silent one) and `Unknown` (the probe could not
+  reach a safe verdict) keep the path, and Adsum binds the next index. Only
+  `Stale` (the socket refuses connections) may be reclaimed, and only after
+  the entry is rechecked as the same socket device/inode immediately before
+  unlink. There is no startup sweep, so a live foreign socket survives a
+  service restart; regular files, directories, symlinks, and foreign
+  sockets are preserved too.
+- **Graceful stop**: `systemctl --user stop` sends `SIGTERM`, which now
+  runs the same graceful teardown as Ctrl+C. It removes only the bound
+  socket, the aliases Adsum owns (validated by their markers), and those
+  markers; foreign entries stay in place. `TimeoutStopSec=15s` covers the
+  2s accept wait, the 5s connection drain, and teardown/cleanup.
+- **After `SIGKILL` or a crash**: the next start recovers valid orphan
+  markers whose recorded target is missing, stale, or no longer a socket,
+  removing the orphan alias and then its marker after identity
+  revalidation. Markers whose target is live or unknown are preserved, as
+  are foreign or conflicting entries. Recovery runs before bind, so a
+  fresh socket cannot be mistaken for an old marker's target.
+- **Residual connection-exhaustion risk**: the IPC transport allows 16
+  concurrent pumps and 1 MiB payloads. These are resource bounds, not DoS
+  protection: a local client can open 16 idle or incomplete connections,
+  occupy every pump, and keep legitimate clients waiting. Handshake,
+  frame-read, and idle timeouts are a follow-up.
+- **Flatpak-compatible path unavailable**: when Adsum cannot bind in
+  `%t/app/com.discordapp.Discord` but another bind candidate works, it keeps
+  running there and logs exactly
+  `[ipc] Flatpak-compatible socket path unavailable; compatibility aliases may not be reachable from sandboxed clients`.
+  Sandboxed clients may then fail to resolve the aliases; this warning is
+  not a startup failure.
 - **No `--ignore-ids` needed for companions**: since Adsum 0.32.0 the
   handoff does this automatically (generic card shows → the game's own
   SDK takes over → generic resumes on clear). Details:
