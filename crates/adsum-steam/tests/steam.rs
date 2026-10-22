@@ -4,7 +4,7 @@
 //! under a unique temp dir (removed on drop). The process-global env tests
 //! (cache roundtrip) stay in `lib` with the env-serialization harness.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use adsum_steam::{SteamLibraries, Vdf, library_paths, manifest_ids, parse_vdf_str};
 
@@ -41,17 +41,32 @@ impl Drop for Scratch {
   }
 }
 
+/// Write `libraryfolders.vdf` under `root` listing every given library.
+fn write_libraryfolders(root: &Path, libraries: &[&Path]) {
+  let entries: String = libraries
+    .iter()
+    .enumerate()
+    .map(|(index, library)| {
+      format!(
+        "\"{index}\"\n{{\n\"path\"\t\t\"{}\"\n}}\n",
+        library.to_string_lossy().replace('\\', "\\\\")
+      )
+    })
+    .collect();
+  std::fs::write(
+    root.join("steamapps/libraryfolders.vdf"),
+    format!("\"libraryfolders\"\n{{\n{entries}}}"),
+  )
+  .unwrap();
+}
+
 /// Hermetic fake Steam root with `libraryfolders.vdf` + manifests.
 /// Fake Steam root with libraryfolders.vdf plus the given manifests.
 fn fake_steam_root(tag: &str, manifests: &[(&str, &str)]) -> Scratch {
   let root = Scratch::new(tag);
   let apps = root.join("steamapps");
   std::fs::create_dir_all(&apps).unwrap();
-  let folders = format!(
-    "\"libraryfolders\"\n{{\n\"0\"\n{{\n\"path\"\t\t\"{}\"\n}}\n}}",
-    root.path.to_string_lossy().replace('\\', "\\\\")
-  );
-  std::fs::write(apps.join("libraryfolders.vdf"), folders).unwrap();
+  write_libraryfolders(&root.path, &[&root.path]);
   for (appid, dir) in manifests {
     let manifest =
       format!("\"AppState\"\n{{\n\"appid\"\t\t\"{appid}\"\n\"installdir\"\t\t\"{dir}\"\n}}");
@@ -149,6 +164,118 @@ fn from_root_matches_install_prefix() {
   );
   // Outside every install dir: no match.
   assert!(libraries.match_prefix("/usr/bin/fish").is_none());
+}
+
+/// Proton rewrites the library away, so only the tail after
+/// `steamapps/common/` is comparable — and it names the AppId.
+#[test]
+fn install_tail_matches_a_proton_path() {
+  let root = fake_steam_root("tail", &[("12345", "Vdf Game")]);
+  let libraries = SteamLibraries::from_root(&root.path);
+  let path = r"S:\steamapps\common\Vdf Game\bin\game.exe";
+  assert_eq!(libraries.match_install_tail(path), Some("12345"));
+  let mut scratch = String::new();
+  assert_eq!(
+    libraries.match_install_tail_into(path, &mut scratch),
+    Some("12345")
+  );
+}
+
+/// Paths outside `steamapps/common/` match nothing, and the tail compares
+/// on a component boundary (`Vdf Game 2` is not under `Vdf Game`).
+#[test]
+fn install_tail_rejects_paths_outside_common() {
+  let root = fake_steam_root("tail-outside", &[("12345", "Vdf Game")]);
+  let libraries = SteamLibraries::from_root(&root.path);
+  assert!(libraries.match_install_tail("/usr/bin/fish").is_none());
+  assert!(
+    libraries
+      .match_install_tail(r"S:\steamapps\common\Vdf Game 2\game.exe")
+      .is_none()
+  );
+}
+
+/// Proton prefixes live under `compatdata/<id>/`, never `common/`: the
+/// install-dir evidence must not leak from one to the other.
+#[test]
+fn install_tail_rejects_compatdata_paths() {
+  let root = fake_steam_root("tail-compat", &[("12345", "Vdf Game")]);
+  std::fs::create_dir_all(root.path.join("steamapps/compatdata/12345/pfx")).unwrap();
+  let libraries = SteamLibraries::from_root(&root.path);
+  assert!(
+    libraries
+      .match_install_tail(r"S:\steamapps\compatdata\12345\pfx\drive_c\game.exe")
+      .is_none()
+  );
+  // A prefix's virtual drive can carry its own `steamapps/common`: the
+  // nested copy is still runtime state, not an install.
+  assert!(
+    libraries
+      .match_install_tail(
+        r"S:\steamapps\compatdata\12345\pfx\drive_c\steamapps\common\Vdf Game\game.exe"
+      )
+      .is_none()
+  );
+}
+
+/// Two manifests in one library claiming the same install dir poison it:
+/// a stale duplicate must not answer for either AppId.
+#[test]
+fn install_tail_refuses_duplicate_install_dirs() {
+  let root = fake_steam_root("tail-dup", &[("12345", "Vdf Game"), ("67890", "Vdf Game")]);
+  let libraries = SteamLibraries::from_root(&root.path);
+  assert!(
+    libraries
+      .match_install_tail(r"S:\steamapps\common\Vdf Game\game.exe")
+      .is_none()
+  );
+  let host = format!(
+    "{}/steamapps/common/vdf game/game.exe",
+    root.path.to_string_lossy().to_lowercase()
+  );
+  assert!(libraries.match_prefix(&host).is_none());
+}
+
+/// The same tail in two libraries is ambiguous: neither AppId answers.
+#[test]
+fn install_tail_refuses_a_tail_shared_by_two_libraries() {
+  let root = fake_steam_root("tail-two-libs", &[("12345", "Vdf Game")]);
+  let other = Scratch::new("tail-two-libs-other");
+  let other_apps = other.join("steamapps");
+  std::fs::create_dir_all(&other_apps).unwrap();
+  let manifest = "\"AppState\"\n{\n\"appid\"\t\t\"67890\"\n\"installdir\"\t\t\"Vdf Game\"\n}";
+  std::fs::write(other_apps.join("appmanifest_67890.acf"), manifest).unwrap();
+  write_libraryfolders(&root.path, &[&root.path, &other.path]);
+  let libraries = SteamLibraries::from_root(&root.path);
+  assert!(
+    libraries
+      .match_install_tail(r"S:\steamapps\common\Vdf Game\game.exe")
+      .is_none()
+  );
+}
+
+/// A `..` component anywhere in the path never matches, even when the
+/// textual prefix after `steamapps/common/` would.
+#[test]
+fn install_tail_rejects_dotdot_components() {
+  let root = fake_steam_root("tail-dotdot", &[("12345", "Vdf Game")]);
+  let libraries = SteamLibraries::from_root(&root.path);
+  // Before the marker: `games/..` textually lands in the library.
+  assert!(
+    libraries
+      .match_install_tail(r"S:\games\..\steamapps\common\Vdf Game\game.exe")
+      .is_none()
+  );
+  assert!(
+    libraries
+      .match_install_tail(r"S:\steamapps\common\Vdf Game\..\Other\game.exe")
+      .is_none()
+  );
+  assert!(
+    libraries
+      .match_install_tail(r"S:\steamapps\common\..\common\Vdf Game\game.exe")
+      .is_none()
+  );
 }
 
 /// Vanished roots drop out on refresh instead of serving stale dirs.

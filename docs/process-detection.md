@@ -83,9 +83,34 @@ it does not say which binary is *running*. Steam hands its own helpers the
 game's environment, and those helpers run during an update. So when the entry
 declares executables, the process must be running one of them: the declared
 name must end the path, or — for a short Proton/Heroic launch — its bare
-basename must, when the declared directory is absent. An entry with **no**
-declared executables is the exception and stands on the id alone, which is
-what that tier is for.
+basename must, when the declared directory is absent. A second, independent
+piece of evidence is the install dir: when Steam's own `libraryfolders.vdf`
+and `appmanifest_*.acf` files say the AppId owns
+`steamapps/common/<installdir>/`, a process running under that tail is
+corroborated even if its binary is not in the database. Demos and
+edition-specific binaries are the motivating case, and Proton paths such as
+`S:/steamapps/common/...` work because only the tail is compared, not the
+host prefix. The tail must sit on a component boundary (`Game/` never matches
+`Game 2/`), a path containing `..` is refused outright, only `common/` counts
+(`compatdata/` is runtime state, not an install, even when a prefix's virtual
+drive contains a nested `steamapps/common`), and a tail claimed by two
+different AppIds — two libraries with the same tail, or duplicate manifests in
+one library — is refused as ambiguous. An entry with **no** declared
+executables is the exception and stands on the id alone, which is what that
+tier is for.
+
+The install-dir route is not "accept the AppId alone": it still refuses a
+process that names a declared launcher (`is_launcher`), and the exclusion
+list keeps its veto. A prerequisite installer on a `_CommonRedist`, `_redist`,
+`redist` or `directx` shelf at any level below the install dir is refused
+too: Steam runs those with the game's AppId. Steam helpers outside the
+install dir (the `reaper`, the runtime, the client, `winedevice.exe`) never
+gain this evidence.
+
+The `steam-library` fallback does not use the install-dir evidence: it
+derives the AppId from that same path, so the id and the path cannot
+corroborate each other. That tier still requires a declared executable, or
+an entry that declares none.
 
 **Names.** When no automaton and no id resolve, the scanner falls back to the
 executable stem or install-folder name. This runs for **any** entry, not only

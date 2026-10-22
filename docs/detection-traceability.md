@@ -38,9 +38,9 @@ Sources (`via`), and what each one actually had to satisfy:
 | `automaton` | A declared executable named the end of the process path |
 | `cwd-joined` | Bare exe joined with the process working directory |
 | `proton-automaton` | `win32` (Proton/Wine) database entries |
-| `steam-app-id` | Store id (Steam environ, cmdline fallback, custom SKU), and the process runs a declared executable — or the entry declares none |
+| `steam-app-id` | Store id (Steam environ, cmdline fallback, custom SKU), and the process runs a declared executable, sits under the AppId's `steamapps/common/<installdir>/` without naming a declared launcher or a prerequisite-installer shelf, or the entry declares none |
 | `epic-app-id` | Epic id (sandbox id, or an `-epicapp` name resolved through Heroic's library), and the process runs a declared executable — or the entry declares none |
-| `steam-library` | Process runs under a known Steam install dir |
+| `steam-library` | Process runs under a known Steam install dir (`steamapps/common/<installdir>/` tail, Proton-safe) and runs a declared executable — or the entry declares none; the path-derived AppId is not independent evidence |
 | `exe-stem` | Executable stem equals a game name of at least two words |
 | `folder` | Install folder carries the title |
 
