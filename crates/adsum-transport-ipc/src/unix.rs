@@ -32,7 +32,9 @@ use crate::paths::{
   bind_dirs_in_order, current_euid, preferred_socket_dir_from, prepare_fallback_dir,
   prepare_socket_dir, socket_alias_dirs, socket_dir_candidates, validate_private_dir,
 };
-use crate::probe::{FileId, SocketState, probe_socket, unlink_socket_if_unchanged};
+use crate::probe::{
+  FileId, SocketState, probe_socket, unlink_socket_if_unchanged, unlink_stale_socket_if_unchanged,
+};
 use crate::sink::{DEFAULT_IPC_QUEUE, EventSink};
 
 /// Upper bound for graceful connection drain in [`IpcTransport::shutdown`].
@@ -504,9 +506,12 @@ fn create_socket(dir: &Path) -> Result<(std::os::unix::net::UnixListener, String
         let Some(identity) = probe.identity else {
           continue;
         };
-        if !unlink_socket_if_unchanged(&path, identity) {
+        // The fresh probe narrows, but does not close, the TOCTOU window
+        // before unlink; the structural protection is the validated private
+        // directory.
+        if !unlink_stale_socket_if_unchanged(&path, identity) {
           tracing::warn!(
-            "[ipc] Stale socket {} changed before unlink; leaving it",
+            "[ipc] Stale socket {} changed or is no longer a reclaimable stale socket; leaving it",
             path.display()
           );
           continue;

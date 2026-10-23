@@ -172,13 +172,16 @@ pub(crate) fn publish_marker(
   }
 
   let final_path = marker_path(alias_dir, euid, index);
-  let temp_path = temp_marker_path(alias_dir, euid, index);
-  let file = OpenOptions::new()
-    .write(true)
-    .create_new(true)
-    .mode(0o600)
-    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-    .open(&temp_path)?;
+  let (file, temp_path) = create_temp_marker(|| {
+    let temp_path = temp_marker_path(alias_dir, euid, index);
+    let file = OpenOptions::new()
+      .write(true)
+      .create_new(true)
+      .mode(0o600)
+      .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+      .open(&temp_path)?;
+    Ok((file, temp_path))
+  })?;
   let identity = {
     let meta = file.metadata()?;
     FileId {
@@ -455,7 +458,7 @@ fn recover_valid_marker(alias: &Path, marker: &ValidMarker) -> Recovery {
   }
   if target_is_preserved(&marker.data) {
     tracing::debug!(
-      "[ipc] Target {} became live; preserving alias",
+      "[ipc] Target {} is preserved; keeping alias",
       target.display()
     );
     return Recovery::Preserved;
@@ -471,7 +474,7 @@ fn recover_valid_marker(alias: &Path, marker: &ValidMarker) -> Recovery {
   // between the check and the unlink below.
   if target_is_preserved(&marker.data) {
     tracing::debug!(
-      "[ipc] Target {} became live immediately before unlink; preserving alias",
+      "[ipc] Target {} remains preserved before unlink; keeping alias",
       target.display()
     );
     return Recovery::Preserved;
@@ -491,24 +494,36 @@ fn recover_valid_marker(alias: &Path, marker: &ValidMarker) -> Recovery {
   }
 }
 
-/// Whether a marker target must be preserved (live or inconclusive).
+/// Whether a marker target must be preserved: live, inconclusive, or not the
+/// published object. Only a missing target or a stale socket with the recorded
+/// identity authorizes orphan removal.
 fn target_is_preserved(data: &MarkerData) -> bool {
   let probe = probe_socket(Path::new(&data.target));
-  if probe.state == SocketState::Active
-    && probe.identity
-      != Some(FileId {
-        dev: data.target_dev,
-        ino: data.target_ino,
-      })
-  {
-    tracing::debug!(
-      "[ipc] Marker target {} identity differs from its record",
-      data.target
-    );
-  }
+  let recorded = FileId {
+    dev: data.target_dev,
+    ino: data.target_ino,
+  };
   match probe.state {
     SocketState::Active | SocketState::Unknown => true,
-    SocketState::Missing | SocketState::Stale | SocketState::NotSocket => false,
+    SocketState::Missing => false,
+    SocketState::Stale => {
+      if probe.identity == Some(recorded) {
+        false
+      } else {
+        tracing::debug!(
+          "[ipc] Marker target {} is stale but not the recorded object; preserving it",
+          data.target
+        );
+        true
+      }
+    }
+    SocketState::NotSocket => {
+      tracing::debug!(
+        "[ipc] Marker target {} is not a socket; preserving the foreign entry",
+        data.target
+      );
+      true
+    }
   }
 }
 
@@ -650,6 +665,23 @@ fn temp_marker_path(alias_dir: &Path, euid: u32, index: u8) -> PathBuf {
   let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
   let pid = std::process::id();
   alias_dir.join(format!("{}.tmp-{pid}-{counter}", marker_name(euid, index)))
+}
+
+/// Open a temporary marker, retrying distinct candidate names on collision.
+fn create_temp_marker(
+  mut create: impl FnMut() -> io::Result<(File, PathBuf)>,
+) -> io::Result<(File, PathBuf)> {
+  for _ in 0..8 {
+    match create() {
+      Ok(created) => return Ok(created),
+      Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+      Err(err) => return Err(err),
+    }
+  }
+  Err(io::Error::new(
+    io::ErrorKind::AlreadyExists,
+    "temporary marker name exhausted",
+  ))
 }
 
 /// Fill the temp file, sync it, and link it under the final name.
@@ -900,6 +932,61 @@ mod tests {
     let _ = std::fs::remove_dir_all(&alias_dir);
     let _ = std::fs::remove_dir_all(&target_dir);
     let _ = std::fs::remove_dir_all(&other_target_dir);
+  }
+
+  /// Temporary marker creation retries distinct names after collisions.
+  #[test]
+  fn create_temp_marker_retries_collisions() {
+    let dir = scratch("temp-marker-retry");
+    let mut attempts = 0;
+    let (mut file, path) = create_temp_marker(|| {
+      attempts += 1;
+      if attempts <= 2 {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, "taken"));
+      }
+      let path = dir.join(format!("marker-{attempts}"));
+      let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)?;
+      Ok((file, path))
+    })
+    .expect("third attempt must succeed");
+
+    assert_eq!(attempts, 3, "two collisions must be retried");
+    assert!(path.is_file(), "created marker must stay on disk");
+    file.write_all(b"payload").expect("write marker");
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// Errors other than a name collision propagate without retrying.
+  #[test]
+  fn create_temp_marker_propagates_other_errors() {
+    let mut attempts = 0;
+    let err = create_temp_marker(|| {
+      attempts += 1;
+      Err(io::Error::from(io::ErrorKind::PermissionDenied))
+    })
+    .expect_err("non-collision error must propagate");
+
+    assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(attempts, 1, "other errors must not be retried");
+  }
+
+  /// Eight collisions exhaust the temporary-name budget.
+  #[test]
+  fn create_temp_marker_exhausts_after_eight_collisions() {
+    let mut attempts = 0;
+    let err = create_temp_marker(|| {
+      attempts += 1;
+      Err::<(File, PathBuf), _>(io::Error::new(io::ErrorKind::AlreadyExists, "taken"))
+    })
+    .expect_err("exhausted names must fail");
+
+    assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+    assert_eq!(attempts, 8, "creation must stop at the retry budget");
   }
 
   /// A symlink is never followed, even when its target content would validate.
@@ -1872,6 +1959,76 @@ mod tests {
     assert_eq!(recover_alias(&alias_dir, index, euid), Recovery::Absent);
     assert!(std::fs::symlink_metadata(&owned.alias).is_err());
     assert!(std::fs::symlink_metadata(&owned.marker.path).is_err());
+
+    let _ = std::fs::remove_dir_all(&alias_dir);
+    let _ = std::fs::remove_dir_all(&target_dir);
+  }
+
+  /// A stale target with a different inode is not the published object;
+  /// recovery preserves the alias and its marker.
+  #[test]
+  fn recovery_preserves_alias_when_stale_target_identity_differs() {
+    let alias_dir = scratch("recover-stale-identity");
+    let target_dir = scratch("recover-stale-identity-target");
+    let euid = current_euid();
+    let index = 0;
+    let (listener, target, target_id) = bind_target(&target_dir, index);
+    let owned = published_owned(&alias_dir, index, &target, target_id);
+    drop(listener);
+
+    let replacement_path = target_dir.join("replacement");
+    let replacement = UnixListener::bind(&replacement_path).expect("replacement listener");
+    let replacement_id = file_id(&replacement_path);
+    assert_ne!(
+      replacement_id, target_id,
+      "replacement must have a distinct inode"
+    );
+    std::fs::remove_file(&target).expect("remove stale target path");
+    std::fs::rename(&replacement_path, &target).expect("move replacement into place");
+    drop(replacement);
+
+    assert_eq!(probe_socket(&target).state, SocketState::Stale);
+    assert_eq!(recover_alias(&alias_dir, index, euid), Recovery::Preserved);
+    assert_eq!(
+      std::fs::read_link(&owned.alias).expect("alias kept"),
+      target
+    );
+    assert!(
+      std::fs::symlink_metadata(&owned.marker.path).is_ok(),
+      "marker must stay with a foreign stale target"
+    );
+
+    let _ = std::fs::remove_dir_all(&alias_dir);
+    let _ = std::fs::remove_dir_all(&target_dir);
+  }
+
+  /// A target replaced by a regular file is preserved as a foreign entry.
+  #[test]
+  fn recovery_preserves_alias_when_target_is_not_a_socket() {
+    let alias_dir = scratch("recover-not-socket");
+    let target_dir = scratch("recover-not-socket-target");
+    let euid = current_euid();
+    let index = 0;
+    let (listener, target, target_id) = bind_target(&target_dir, index);
+    let owned = published_owned(&alias_dir, index, &target, target_id);
+    drop(listener);
+    std::fs::remove_file(&target).expect("remove stale target path");
+    std::fs::write(&target, b"foreign").expect("replace with regular file");
+
+    assert_eq!(probe_socket(&target).state, SocketState::NotSocket);
+    assert_eq!(recover_alias(&alias_dir, index, euid), Recovery::Preserved);
+    assert_eq!(
+      std::fs::read_link(&owned.alias).expect("alias kept"),
+      target
+    );
+    assert!(
+      std::fs::symlink_metadata(&owned.marker.path).is_ok(),
+      "marker must stay with a foreign non-socket target"
+    );
+    assert_eq!(
+      std::fs::read(&target).expect("foreign file kept"),
+      b"foreign"
+    );
 
     let _ = std::fs::remove_dir_all(&alias_dir);
     let _ = std::fs::remove_dir_all(&target_dir);

@@ -196,8 +196,8 @@ pub(crate) fn validate_dir(path: &Path, policy: DirPolicy) -> io::Result<()> {
   }
 }
 
-/// Require a user-private directory: real dir chain, owned by the effective
-/// uid, and not writable by group or others.
+/// Require a user-private directory: trusted real dir chain, owned by the
+/// effective uid, and not writable by group or others.
 pub(crate) fn validate_private_dir(path: &Path) -> io::Result<()> {
   let normalized = normalize_dir(path)?;
   let meta = validate_real_dir_chain(&normalized)?;
@@ -255,7 +255,7 @@ pub(crate) fn validate_alias_dir(path: &Path) -> io::Result<()> {
 }
 
 /// Create a `0700` private dir, revalidating an existing one; every parent
-/// must already exist as a real directory.
+/// must already exist as a trusted real directory.
 pub(crate) fn prepare_private_dir(path: &Path) -> io::Result<()> {
   let normalized = normalize_dir(path)?;
   let parent = normalized
@@ -335,9 +335,10 @@ fn normalize_dir(path: &Path) -> io::Result<PathBuf> {
     .ok_or_else(|| invalid_path(path, "not an absolute non-root directory"))
 }
 
-/// Require every component of `path` to be a real directory (never a
-/// symlink) and return the final directory's metadata.
+/// Require every component of `path` to be a real, trusted directory and
+/// return the final directory's metadata.
 fn validate_real_dir_chain(path: &Path) -> io::Result<std::fs::Metadata> {
+  let euid = current_euid();
   let mut current = PathBuf::new();
   let mut last = None;
   for component in path.components() {
@@ -346,9 +347,26 @@ fn validate_real_dir_chain(path: &Path) -> io::Result<std::fs::Metadata> {
     if meta.file_type().is_symlink() || !meta.is_dir() {
       return Err(invalid_path(&current, "not a real directory"));
     }
+    validate_chain_component(&current, &meta, euid)?;
     last = Some(meta);
   }
   last.ok_or_else(|| invalid_path(path, "empty directory path"))
+}
+
+/// Check one chain component: root/self-owned and not writable by group or
+/// others; a shared temp root is accepted when it carries the sticky bit.
+fn validate_chain_component(path: &Path, meta: &std::fs::Metadata, euid: u32) -> io::Result<()> {
+  if meta.uid() != 0 && meta.uid() != euid {
+    return Err(invalid_path(path, "not owned by root or the effective uid"));
+  }
+  if is_shared_temp_root(path) {
+    if meta.mode() & 0o1000 == 0 {
+      return Err(invalid_path(path, "missing the sticky bit"));
+    }
+  } else if meta.mode() & 0o022 != 0 {
+    return Err(invalid_path(path, "writable by group or others"));
+  }
+  Ok(())
 }
 
 /// Prove effective-uid write access by creating and removing an exclusive
@@ -768,6 +786,84 @@ mod tests {
       "shared temp root must fail the private policy"
     );
     let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// A group-writable ancestor is rejected even when the final dir is 0700.
+  #[test]
+  fn private_dir_rejects_group_writable_ancestor() {
+    let base = scratch("private-ancestor-0770");
+    let ancestor = base.join("shared");
+    let dir = ancestor.join("private");
+    std::fs::create_dir(&ancestor).expect("ancestor dir");
+    std::fs::set_permissions(&ancestor, Permissions::from_mode(0o770)).expect("chmod ancestor");
+    std::fs::DirBuilder::new()
+      .mode(0o700)
+      .create(&dir)
+      .expect("private dir");
+
+    let err = validate_private_dir(&dir).expect_err("group-writable ancestor must fail");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+    let _ = std::fs::remove_dir_all(&base);
+  }
+
+  /// A group-writable grandparent is rejected even when nearer components
+  /// are private; this exercises every component of the chain.
+  #[test]
+  fn private_dir_rejects_group_writable_grandparent() {
+    let base = scratch("private-grandparent-0770");
+    let outer = base.join("outer");
+    let middle = outer.join("middle");
+    let private = middle.join("private");
+    std::fs::DirBuilder::new()
+      .mode(0o700)
+      .create(&outer)
+      .expect("outer dir");
+    std::fs::create_dir(&middle).expect("middle dir");
+    std::fs::set_permissions(&middle, Permissions::from_mode(0o770)).expect("chmod middle");
+    std::fs::DirBuilder::new()
+      .mode(0o700)
+      .create(&private)
+      .expect("private dir");
+
+    let err = validate_private_dir(&private).expect_err("group-writable grandparent must fail");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+    let _ = std::fs::remove_dir_all(&base);
+  }
+
+  /// An ancestor without group/other write is trusted, even at 0755.
+  #[test]
+  fn private_dir_accepts_read_only_ancestor() {
+    let base = scratch("private-ancestor-0755");
+    let ancestor = base.join("shared");
+    let dir = ancestor.join("private");
+    std::fs::create_dir(&ancestor).expect("ancestor dir");
+    std::fs::set_permissions(&ancestor, Permissions::from_mode(0o755)).expect("chmod ancestor");
+    std::fs::DirBuilder::new()
+      .mode(0o700)
+      .create(&dir)
+      .expect("private dir");
+
+    validate_private_dir(&dir).expect("0755 ancestor must pass");
+
+    let _ = std::fs::remove_dir_all(&base);
+  }
+
+  /// Preparation refuses a group-writable ancestor before creating the child.
+  #[test]
+  fn prepare_private_dir_does_not_create_under_writable_ancestor() {
+    let base = scratch("prepare-ancestor-0770");
+    let ancestor = base.join("shared");
+    std::fs::create_dir(&ancestor).expect("ancestor dir");
+    std::fs::set_permissions(&ancestor, Permissions::from_mode(0o770)).expect("chmod ancestor");
+    let child = ancestor.join("child");
+
+    let err = prepare_private_dir(&child).expect_err("group-writable ancestor must fail");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert!(!child.exists(), "child must not be created");
+
+    let _ = std::fs::remove_dir_all(&base);
   }
 
   /// Shared temp roots are accepted only under their sticky-bit policy.

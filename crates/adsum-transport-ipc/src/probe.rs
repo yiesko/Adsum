@@ -93,6 +93,15 @@ pub(crate) fn unlink_socket_if_unchanged(path: &Path, identity: FileId) -> bool 
   std::fs::remove_file(path).is_ok()
 }
 
+/// Remove `path` only when a fresh probe still reports the same stale socket.
+#[must_use]
+pub(crate) fn unlink_stale_socket_if_unchanged(path: &Path, identity: FileId) -> bool {
+  let probe = probe_socket(path);
+  probe.state == SocketState::Stale
+    && probe.identity == Some(identity)
+    && unlink_socket_if_unchanged(path, identity)
+}
+
 /// Nonblocking connect verdict for a path already known to be a socket.
 fn connect_state(path: &Path) -> SocketState {
   let Ok(addr) = unix_addr(path) else {
@@ -252,9 +261,11 @@ mod tests {
 
   use super::*;
 
-  /// Isolated temp dir per test (tag-suffixed, hermetic).
+  /// Isolated temp dir per test (tag-suffixed, hermetic). The base is
+  /// canonicalized so macOS `$TMPDIR` stays inside the 104-byte `sun_path`.
   fn scratch(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("adsum-probe-test-{}-{tag}", std::process::id()));
+    let base = std::fs::canonicalize("/tmp").unwrap_or_else(|_| std::env::temp_dir());
+    let dir = base.join(format!("adsum-probe-test-{}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("scratch dir");
     dir
@@ -385,6 +396,67 @@ mod tests {
     std::os::unix::net::UnixStream::connect(&path).expect("live socket accepts");
 
     drop(live);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// A fresh probe keeps a live listener even when the identity matches.
+  #[test]
+  fn stale_recheck_preserves_live_socket_with_matching_identity() {
+    let dir = scratch("recheck-live");
+    let path = dir.join("discord-ipc-0");
+    let listener = UnixListener::bind(&path).expect("listener");
+    let identity = probe_socket(&path).identity.expect("socket identity");
+
+    assert!(!unlink_stale_socket_if_unchanged(&path, identity));
+    assert!(
+      std::fs::symlink_metadata(&path).is_ok(),
+      "live socket must stay"
+    );
+
+    drop(listener);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// After the listener drops, the matching stale socket is removed.
+  #[test]
+  fn stale_recheck_removes_matching_stale_socket() {
+    let dir = scratch("recheck-stale");
+    let path = dir.join("discord-ipc-0");
+    let listener = UnixListener::bind(&path).expect("listener");
+    let identity = probe_socket(&path).identity.expect("socket identity");
+    drop(listener);
+    assert_eq!(probe_socket(&path).state, SocketState::Stale);
+
+    assert!(unlink_stale_socket_if_unchanged(&path, identity));
+    assert!(std::fs::symlink_metadata(&path).is_err());
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// A stale socket with a different inode is preserved by the recheck.
+  #[test]
+  fn stale_recheck_preserves_replaced_identity() {
+    let dir = scratch("recheck-replaced");
+    let path = dir.join("discord-ipc-0");
+    let listener = UnixListener::bind(&path).expect("listener");
+    let old_id = probe_socket(&path).identity.expect("socket identity");
+    let replacement_path = dir.join("discord-ipc-live");
+    let replacement = UnixListener::bind(&replacement_path).expect("replacement listener");
+    drop(listener);
+    std::fs::remove_file(&path).expect("remove stale path");
+    std::fs::rename(&replacement_path, &path).expect("move replacement into place");
+    drop(replacement);
+    assert_eq!(probe_socket(&path).state, SocketState::Stale);
+    assert_ne!(probe_socket(&path).identity, Some(old_id));
+
+    assert!(!unlink_stale_socket_if_unchanged(&path, old_id));
+    assert!(
+      std::fs::symlink_metadata(&path).is_ok(),
+      "replaced socket must stay"
+    );
+
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(&dir);
   }

@@ -70,28 +70,34 @@ following symlinks) and a connect bounded to one second. A successful
 connect is `Active` — a listener that never replies still counts as active
 — `ECONNREFUSED` is `Stale`, and any other error or timeout is `Unknown`.
 A symlink, regular file, directory, or other non-socket is `NotSocket`.
-Only `Stale` may be reclaimed: the entry must still be a socket with the
-same `(dev, ino)` immediately before unlink. `Active`, `Unknown`, and
-`NotSocket` keep the path, and Adsum tries the next index. A `Missing`
-path that becomes `AddrInUse` between probe and bind is retried once,
-without another probe.
+Only `Stale` may be reclaimed: a new probe immediately before unlink must
+still report `Stale`, and the entry must still be a socket with the same
+`(dev, ino)`. `Active`, `Unknown`, and `NotSocket` keep the path, and Adsum
+tries the next index. A `Missing` path that becomes `AddrInUse` between
+probe and bind is retried once, without another probe.
 
 ### Directory policies
 
 Every directory Adsum writes into must satisfy exactly one policy:
 
 - **Private directory** — absolute, without a `..` component, with every
-  component an existing real directory (no symlinks), owned by the
-  effective UID, and not writable by group or others (`mode & 0o022 == 0`).
+  component an existing real directory (no symlinks). Every component must
+  be owned by root or the effective UID and not writable by group or others
+  (`mode & 0o022 == 0`); the final directory must be owned by the effective
+  UID.
 - **Approved shared-temp directory** — canonical `/tmp` or `/var/tmp`,
   owned by root or the effective UID, with the sticky bit set and writable
   by the effective UID.
 
 The shared-temp policy is the only exception that allows group or other
-write permission. A nested directory below `/tmp` or `/var/tmp` still has
-to pass the private policy. Relative, empty, root (`/`), symlinked,
-non-directory, foreign-owned, and non-sticky world-writable paths are
-rejected, and rejection never authorizes deleting the path.
+write permission. `/tmp`, `/var/tmp`, and the canonical `/private/tmp` on
+macOS may appear as chain components when owned by root or the effective
+UID and carrying the sticky bit; that ancestor check is metadata-only. The
+exact temp root still requires write access by the effective UID. A nested
+directory below `/tmp` or `/var/tmp` still has to pass the private policy.
+Relative, empty, root (`/`), symlinked, non-directory, foreign-owned, and
+non-sticky world-writable paths are rejected, and rejection never
+authorizes deleting the path.
 
 ### Socket permissions
 
@@ -179,18 +185,22 @@ marker, the alias entry, and the recorded target. In that startup scan,
 only two cases remove anything:
 
 - An orphan marker with no alias is removed when its target probes as
-  `Missing`, `Stale`, or `NotSocket`.
+  `Missing` or as `Stale` with the recorded `(dev, ino)`.
 - An alias symlink whose `readlink` target equals the marker's `target` is
-  removed together with its marker under the same dead-target probe, after
+  removed together with its marker under the same dead-target rule, after
   the symlink and marker identities are revalidated.
 
 Everything else is preserved. A live or `Unknown` target keeps the alias
-and marker for the next run; a symlink pointing anywhere else, a
-non-symlink entry, and an invalid or foreign-owned marker are conflicts and
-are left untouched. Removing an orphan alias requires the symlink's
-`(dev, ino)` to stay unchanged between the two `lstat` calls around
-`readlink`, and a re-probe before unlink must still report the target as
-missing, stale, or not a socket. Recovery runs before bind so a freshly
+and marker for the next run; a `NotSocket` target and a `Stale` target with
+a different identity are preserved as foreign or unproven entries. A
+symlink pointing anywhere else, a non-symlink entry, and an invalid or
+foreign-owned marker are conflicts and are left untouched. Removing an
+orphan alias requires the symlink's `(dev, ino)` to stay unchanged between
+the two `lstat` calls around `readlink`, and a recheck before unlink must
+still report the target as `Missing` or as `Stale` with the recorded
+`(dev, ino)`. A marker whose target is `Stale` with a divergent identity is
+not adopted automatically and may remain until the target becomes `Missing`
+or until manual reconciliation. Recovery runs before bind so a freshly
 bound socket cannot be mistaken for the target recorded in an old marker.
 This marker-driven recovery is the only automatic alias/marker cleanup at
 startup; it is separate from the per-index stale-socket reclamation that
