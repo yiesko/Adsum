@@ -38,7 +38,7 @@ use crate::markers::{
 };
 use crate::paths::{
   bind_dirs_in_order, current_euid, preferred_socket_dir_from, prepare_fallback_dir,
-  prepare_socket_dir, socket_alias_dirs, socket_dir_candidates, validate_private_dir,
+  prepare_socket_dir, socket_alias_dirs, socket_dir_candidates, validate_bind_dir,
 };
 use crate::probe::{
   FileId, SocketState, probe_socket, unlink_socket_if_unchanged, unlink_stale_socket_if_unchanged,
@@ -500,7 +500,7 @@ fn alias_index(bound: &Path) -> Option<u8> {
 /// Bind `discord-ipc-0..=9` in the private `dir`, probing every index
 /// before touching it; aliases are published by the caller afterwards.
 fn create_socket(dir: &Path) -> Result<(std::os::unix::net::UnixListener, String, FileId)> {
-  validate_private_dir(dir).map_err(|source| AdsumError::IpcBind {
+  validate_bind_dir(dir).map_err(|source| AdsumError::IpcBind {
     attempts: 10,
     source,
   })?;

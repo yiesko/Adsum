@@ -147,6 +147,18 @@ What matters:
   and cgroup protections, `PrivateDevices`, `RestrictSUIDSGID`/
   `RestrictRealtime`, and a `SystemCallFilter` allowlist with
   `MemoryDenyWriteExecute`, all verified against a live boot.
+- **User namespaces and the overflow UID**: in a *user* unit,
+  `PrivateDevices=yes` and `ProtectKernelTunables=yes` enable `PrivateUsers`
+  implicitly. The unit then runs in a user namespace where host UID 0 (and
+  every other unmapped UID) appears as the overflow UID
+  (`/proc/sys/kernel/overflowuid`, usually `65534`). Adsum accepts that UID
+  only for ancestor mount points and canonical temp roots, only when
+  `/proc/self/uid_map` proves parent UID 0 is unmapped and the overflow UID is
+  not mapped inside the namespace, and only when `statx`/`STATX_MNT_ID` is
+  available (Linux 5.8 or newer); otherwise the exception stays off and the
+  bind fails closed. The socket directory itself must still be owned by the
+  effective UID with mode `0700`, and `/tmp` is the practical fallback under
+  this sandbox. See `protocol.md` for the exact policy.
 - **IPC fd operations**: the Linux install opens the temp socket with
   `O_PATH`, checks it with `fstat`, applies `0600` with
   `fchmodat`/`fchmodat2` (falling back to `chmod` via `/proc/self/fd`),

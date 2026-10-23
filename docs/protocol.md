@@ -104,6 +104,34 @@ validation (availability limitation). Relative, empty, root (`/`),
 symlinked, non-directory, foreign-owned, and non-sticky world-writable
 paths are rejected, and rejection never authorizes deleting the path.
 
+#### User-namespace overflow UID
+
+In a user namespace (including the implicit `PrivateUsers` of a systemd user
+unit), host UIDs without a mapping inside appear as the overflow UID from
+`/proc/sys/kernel/overflowuid` (normally `65534`). Adsum accepts that UID for
+an ancestor component only when all of these hold:
+
+- `/proc/self/uid_map` parses and does not map parent UID 0;
+- the overflow UID is not one of the namespace's own mapped UIDs;
+- Linux `statx` reports `STATX_MNT_ID` for `/` (kernel 5.8 or newer);
+- the component is a mount point or a canonical shared temp root.
+
+The final bind directory is never excused: it must be owned by the effective
+UID, and its permission bits must be exactly `0700` (`mode & 0o777 == 0o700`).
+Alias directories keep the private policy (effective-UID owner,
+`mode & 0o022 == 0`) and may therefore be `0755`. A shared temp root is
+validated as a whole canonical chain, so in a sandbox where `/var` is not a
+separate mount, `/var/tmp` can be rejected because `/var` appears as the
+overflow UID; the private fallback under `/tmp` remains the practical choice.
+If a namespace probe fails (`/proc` reads or `statx`/`STATX_MNT_ID`), the
+exception is off and these components are rejected as before; a failed write
+probe only rejects that temp root.
+
+The kernel cannot distinguish host root from any other unmapped UID. The
+residual risk is therefore bounded by the anchor: the exception applies only
+to mount points and canonical temp roots, never to the final directory, and
+every other owner check is unchanged.
+
 ### Socket permissions
 
 Immediately after a successful bind, Adsum sets the real socket to mode

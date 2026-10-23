@@ -2,10 +2,15 @@
 //! alias directories for every known client layout. Helpers are best-effort
 //! and never touch foreign files.
 
+#[cfg(target_os = "linux")]
+use std::ffi::CString;
 use std::ffi::OsStr;
 use std::io;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Official Flatpak Discord app id, laid out as `app/<id>/discord-ipc-N`.
@@ -179,6 +184,211 @@ pub(crate) fn current_euid() -> u32 {
   unsafe { libc::geteuid() }
 }
 
+/// Directory-chain trust inputs that depend on the caller's user namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NamespaceContext {
+  /// Overflow UID accepted on anchored components, when the exception is on.
+  overflow_uid: Option<u32>,
+  /// UID read from `/proc/sys/kernel/overflowuid`, kept for error messages.
+  raw_overflow_uid: Option<u32>,
+  /// Why the exception is off; empty while it is on.
+  inactive_reason: &'static str,
+}
+
+impl NamespaceContext {
+  /// Process-wide context, probed once from `/proc` and a Linux `statx`.
+  pub(crate) fn atual() -> &'static Self {
+    static CONTEXT: OnceLock<NamespaceContext> = OnceLock::new();
+    CONTEXT.get_or_init(Self::sondar)
+  }
+
+  /// Probe the real namespace; any read, parse, or `statx` failure turns the
+  /// overflow exception off (fail closed).
+  fn sondar() -> Self {
+    let Ok(overflow) = std::fs::read_to_string("/proc/sys/kernel/overflowuid") else {
+      return Self::inactive("cannot read /proc/sys/kernel/overflowuid", None);
+    };
+    let raw_overflow_uid = overflow.trim().parse::<u32>().ok();
+    let Ok(uid_map) = std::fs::read_to_string("/proc/self/uid_map") else {
+      return Self::inactive("cannot read /proc/self/uid_map", raw_overflow_uid);
+    };
+    let mnt_supported = facts_of(Path::new("/")).is_ok_and(|facts| facts.mnt_id.is_some());
+    Self::evaluate(&uid_map, &overflow, mnt_supported)
+  }
+
+  /// Pure evaluation of `uid_map`, `overflowuid`, and mount-id support; the
+  /// exception is active only when root is unmapped and the UID is not mapped.
+  fn evaluate(uid_map: &str, overflow: &str, mnt_supported: bool) -> Self {
+    let Some(raw_overflow_uid) = overflow.trim().parse::<u32>().ok() else {
+      return Self::inactive("invalid /proc/sys/kernel/overflowuid", None);
+    };
+    let Some(map) = UidMap::parse(uid_map) else {
+      return Self::inactive("invalid /proc/self/uid_map", Some(raw_overflow_uid));
+    };
+    if map.parent_uid_mapped(0) {
+      return Self::inactive("parent uid 0 is mapped", Some(raw_overflow_uid));
+    }
+    if map.inside_uid_mapped(raw_overflow_uid) {
+      return Self::inactive(
+        "overflow uid is mapped inside the namespace",
+        Some(raw_overflow_uid),
+      );
+    }
+    if !mnt_supported {
+      return Self::inactive("statx mount ids are unavailable", Some(raw_overflow_uid));
+    }
+    Self {
+      overflow_uid: Some(raw_overflow_uid),
+      raw_overflow_uid: Some(raw_overflow_uid),
+      inactive_reason: "",
+    }
+  }
+
+  /// Context with the overflow exception disabled for `reason`.
+  fn inactive(reason: &'static str, raw_overflow_uid: Option<u32>) -> Self {
+    Self {
+      overflow_uid: None,
+      raw_overflow_uid,
+      inactive_reason: reason,
+    }
+  }
+}
+
+/// Parsed `/proc/self/uid_map`: `(inside, outside, count)` ranges.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UidMap {
+  ranges: Vec<UidRange>,
+}
+
+/// One `uid_map` line; `count` is non-zero by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UidRange {
+  inside: u32,
+  outside: u32,
+  count: u32,
+}
+
+impl UidMap {
+  /// Parse every line; malformed lines, extra fields, and zero counts are
+  /// refused so a partial namespace view can never enable the exception.
+  fn parse(input: &str) -> Option<Self> {
+    let mut ranges = Vec::new();
+    for line in input.lines() {
+      let mut fields = line.split_whitespace();
+      let inside = fields.next()?.parse::<u32>().ok()?;
+      let outside = fields.next()?.parse::<u32>().ok()?;
+      let count = fields.next()?.parse::<u32>().ok()?;
+      if fields.next().is_some() || count == 0 {
+        return None;
+      }
+      ranges.push(UidRange {
+        inside,
+        outside,
+        count,
+      });
+    }
+    if ranges.is_empty() {
+      return None;
+    }
+    Some(Self { ranges })
+  }
+
+  /// Whether a parent-namespace UID falls in an `outside` range.
+  fn parent_uid_mapped(&self, uid: u32) -> bool {
+    self.ranges.iter().any(|range| range.outside_contains(uid))
+  }
+
+  /// Whether a namespace UID falls in an `inside` range.
+  fn inside_uid_mapped(&self, uid: u32) -> bool {
+    self.ranges.iter().any(|range| range.inside_contains(uid))
+  }
+}
+
+impl UidRange {
+  /// Whether `uid` is inside the `outside` interval (u64 avoids overflow).
+  fn outside_contains(&self, uid: u32) -> bool {
+    Self::contains(self.outside, self.count, uid)
+  }
+
+  /// Whether `uid` is inside the `inside` interval (u64 avoids overflow).
+  fn inside_contains(&self, uid: u32) -> bool {
+    Self::contains(self.inside, self.count, uid)
+  }
+
+  /// Half-open range check with a 64-bit end.
+  fn contains(start: u32, count: u32, uid: u32) -> bool {
+    let start = u64::from(start);
+    let end = start + u64::from(count);
+    let uid = u64::from(uid);
+    uid >= start && uid < end
+  }
+}
+
+/// Owner, mode, and mount identity of one directory-chain component.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Facts {
+  uid: u32,
+  mode: u32,
+  mnt_id: Option<u64>,
+}
+
+/// `S_IFMT` mask in `Facts::mode` (portable literal, not `libc::mode_t`).
+const MODE_TYPE_MASK: u32 = 0o170000;
+/// Directory type in `Facts::mode`.
+const MODE_DIRECTORY: u32 = 0o040000;
+
+/// Metadata for `path` without following symlinks; Linux adds the mount id.
+fn facts_of(path: &Path) -> io::Result<Facts> {
+  #[cfg(target_os = "linux")]
+  if let Some(facts) = statx_facts(path)? {
+    return Ok(facts);
+  }
+  let meta = std::fs::symlink_metadata(path)?;
+  Ok(Facts {
+    uid: meta.uid(),
+    mode: meta.mode(),
+    mnt_id: None,
+  })
+}
+
+/// Linux `statx` metadata; `Ok(None)` means the syscall failed and the caller
+/// may fall back, while a missing UID/MODE mask is a hard failure.
+#[cfg(target_os = "linux")]
+fn statx_facts(path: &Path) -> io::Result<Option<Facts>> {
+  let c_path = CString::new(path.as_os_str().as_bytes())
+    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains nul"))?;
+  let mut statx = std::mem::MaybeUninit::<libc::statx>::uninit();
+  // SAFETY: `c_path` is NUL-terminated and lives for the call; `AT_FDCWD` and
+  // the flags are valid; `statx` points to writable storage for one struct.
+  let result = unsafe {
+    libc::statx(
+      libc::AT_FDCWD,
+      c_path.as_ptr(),
+      libc::AT_SYMLINK_NOFOLLOW,
+      libc::STATX_BASIC_STATS | libc::STATX_MNT_ID,
+      statx.as_mut_ptr(),
+    )
+  };
+  if result != 0 {
+    return Ok(None);
+  }
+  // SAFETY: `statx` returned 0, so the kernel initialized the whole struct.
+  let statx = unsafe { statx.assume_init() };
+  let required = libc::STATX_UID | libc::STATX_MODE;
+  if statx.stx_mask & required != required {
+    return Err(io::Error::new(
+      io::ErrorKind::InvalidData,
+      "statx did not report uid and mode",
+    ));
+  }
+  let mnt_id = (statx.stx_mask & libc::STATX_MNT_ID != 0).then_some(statx.stx_mnt_id);
+  Ok(Some(Facts {
+    uid: statx.stx_uid,
+    mode: u32::from(statx.stx_mode),
+    mnt_id,
+  }))
+}
+
 /// Directory policy applied before a path may host a socket or alias link.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DirPolicy {
@@ -199,46 +409,53 @@ pub(crate) fn validate_dir(path: &Path, policy: DirPolicy) -> io::Result<()> {
 /// Require a user-private directory: trusted real dir chain, owned by the
 /// effective uid, and not writable by group or others.
 pub(crate) fn validate_private_dir(path: &Path) -> io::Result<()> {
-  let normalized = normalize_dir(path)?;
-  let meta = validate_real_dir_chain(&normalized)?;
-  let euid = current_euid();
-  if meta.uid() != euid {
-    return Err(invalid_path(&normalized, "not owned by the effective uid"));
-  }
-  if meta.mode() & 0o022 != 0 {
-    return Err(invalid_path(&normalized, "writable by group or others"));
+  let facts = validate_private_dir_facts(path)?;
+  if facts.mode & 0o022 != 0 {
+    return Err(invalid_path(path, "writable by group or others"));
   }
   Ok(())
 }
 
-/// Require a shared temp root: canonical `/tmp` or `/var/tmp`, sticky,
-/// root- or self-owned, and writable by this effective uid.
+/// Private-directory core; returns the final facts so bind dirs can add the
+/// stricter `0700` requirement without a second metadata read.
+fn validate_private_dir_facts(path: &Path) -> io::Result<Facts> {
+  let normalized = normalize_dir(path)?;
+  let facts = validate_real_dir_chain(&normalized, NamespaceContext::atual(), false)?;
+  let euid = current_euid();
+  if facts.uid != euid {
+    return Err(invalid_owner_path(&normalized, facts.uid));
+  }
+  Ok(facts)
+}
+
+/// Require a bind directory: private policy plus exact `0700` permissions on
+/// the final directory.
+pub(crate) fn validate_bind_dir(path: &Path) -> io::Result<()> {
+  let facts = validate_private_dir_facts(path)?;
+  if facts.mode & 0o777 != 0o700 {
+    return Err(invalid_path(path, "bind directory must be 0700"));
+  }
+  Ok(())
+}
+
+/// Require a shared temp root: canonical `/tmp` or `/var/tmp`, sticky, owned
+/// by root, the effective uid, or the anchored overflow UID, and writable.
 pub(crate) fn validate_shared_temp(path: &Path) -> io::Result<()> {
   validate_shared_temp_canonical(path).map(|_| ())
 }
 
 /// Validate a shared temp root and return its canonical path (resolving
 /// platform symlinks such as macOS `/tmp`).
+///
+/// The whole canonical chain is checked, so an unmapped `/var` refuses
+/// `/var/tmp` in a sandbox; `/tmp` remains the practical fallback.
 fn validate_shared_temp_canonical(path: &Path) -> io::Result<PathBuf> {
   let normalized = normalize_dir(path)?;
   let canonical = std::fs::canonicalize(&normalized)?;
   if !is_canonical_shared_temp(&canonical) {
     return Err(invalid_path(&normalized, "not a shared temp root"));
   }
-  let meta = std::fs::symlink_metadata(&canonical)?;
-  if !meta.is_dir() {
-    return Err(invalid_path(&normalized, "not a directory"));
-  }
-  let euid = current_euid();
-  if meta.uid() != 0 && meta.uid() != euid {
-    return Err(invalid_path(
-      &normalized,
-      "not owned by root or the effective uid",
-    ));
-  }
-  if meta.mode() & 0o1000 == 0 {
-    return Err(invalid_path(&normalized, "missing the sticky bit"));
-  }
+  validate_real_dir_chain(&canonical, NamespaceContext::atual(), true)?;
   probe_temp_write(&canonical)?;
   Ok(canonical)
 }
@@ -254,14 +471,14 @@ pub(crate) fn validate_alias_dir(path: &Path) -> io::Result<()> {
   validate_dir(path, policy)
 }
 
-/// Create a `0700` private dir, revalidating an existing one; every parent
-/// must already exist as a trusted real directory.
+/// Create a private dir with mode `0700`; an existing dir is revalidated as
+/// private. Every parent must already exist as a trusted real directory.
 pub(crate) fn prepare_private_dir(path: &Path) -> io::Result<()> {
   let normalized = normalize_dir(path)?;
   let parent = normalized
     .parent()
     .ok_or_else(|| invalid_path(&normalized, "missing parent directory"))?;
-  validate_real_dir_chain(parent)?;
+  validate_real_dir_chain(parent, NamespaceContext::atual(), true)?;
   match std::fs::DirBuilder::new().mode(0o700).create(&normalized) {
     Ok(()) => {}
     Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
@@ -336,37 +553,103 @@ fn normalize_dir(path: &Path) -> io::Result<PathBuf> {
 }
 
 /// Require every component of `path` to be a real, trusted directory and
-/// return the final directory's metadata.
-fn validate_real_dir_chain(path: &Path) -> io::Result<std::fs::Metadata> {
+/// return the final facts. Only ancestors may use the overflow exception,
+/// unless `anchor_final` marks a canonical temp root that is itself anchored.
+fn validate_real_dir_chain(
+  path: &Path,
+  ctx: &NamespaceContext,
+  anchor_final: bool,
+) -> io::Result<Facts> {
   let euid = current_euid();
+  let mut components = path.components().peekable();
   let mut current = PathBuf::new();
+  let mut previous_mnt_id = None;
   let mut last = None;
-  for component in path.components() {
+  while let Some(component) = components.next() {
+    let is_final = components.peek().is_none();
     current.push(component.as_os_str());
-    let meta = std::fs::symlink_metadata(&current)?;
-    if meta.file_type().is_symlink() || !meta.is_dir() {
+    let facts = facts_of(&current)?;
+    if facts.mode & MODE_TYPE_MASK != MODE_DIRECTORY {
       return Err(invalid_path(&current, "not a real directory"));
     }
-    validate_chain_component(&current, &meta, euid)?;
-    last = Some(meta);
+    let is_mount = matches!(component, Component::RootDir)
+      || matches!(
+        (previous_mnt_id, facts.mnt_id),
+        (Some(previous), Some(current)) if current != previous
+      );
+    let allow_overflow = !is_final || anchor_final;
+    validate_chain_component(&current, &facts, euid, is_mount, allow_overflow, ctx)?;
+    previous_mnt_id = facts.mnt_id;
+    last = Some(facts);
   }
   last.ok_or_else(|| invalid_path(path, "empty directory path"))
 }
 
-/// Check one chain component: root/self-owned and not writable by group or
-/// others; a shared temp root is accepted when it carries the sticky bit.
-fn validate_chain_component(path: &Path, meta: &std::fs::Metadata, euid: u32) -> io::Result<()> {
-  if meta.uid() != 0 && meta.uid() != euid {
-    return Err(invalid_path(path, "not owned by root or the effective uid"));
+/// Check one chain component: owner trust, sticky shared temp roots, and no
+/// group/other write. `allow_overflow` is false for the final bind directory.
+fn validate_chain_component(
+  path: &Path,
+  facts: &Facts,
+  euid: u32,
+  is_mount: bool,
+  allow_overflow: bool,
+  ctx: &NamespaceContext,
+) -> io::Result<()> {
+  let uid = facts.uid;
+  let shared_temp = is_shared_temp_root(path);
+  let trusted = uid == 0
+    || uid == euid
+    || (allow_overflow && ctx.overflow_uid == Some(uid) && (is_mount || shared_temp));
+  if !trusted {
+    return Err(owner_error(path, uid, allow_overflow, ctx));
   }
-  if is_shared_temp_root(path) {
-    if meta.mode() & 0o1000 == 0 {
+  if shared_temp {
+    if facts.mode & 0o1000 == 0 {
       return Err(invalid_path(path, "missing the sticky bit"));
     }
-  } else if meta.mode() & 0o022 != 0 {
+  } else if facts.mode & 0o022 != 0 {
     return Err(invalid_path(path, "writable by group or others"));
   }
   Ok(())
+}
+
+/// Refusal for an untrusted component, naming the path, UID, and why.
+fn owner_error(path: &Path, uid: u32, allow_overflow: bool, ctx: &NamespaceContext) -> io::Error {
+  if ctx.overflow_uid.is_none() && ctx.raw_overflow_uid == Some(uid) {
+    return io::Error::new(
+      io::ErrorKind::InvalidInput,
+      format!(
+        "overflow uid, but exception inactive: {}: {} (uid {uid})",
+        ctx.inactive_reason,
+        path.display()
+      ),
+    );
+  }
+  let reason = if !allow_overflow && ctx.overflow_uid == Some(uid) {
+    "overflow uid, but the final directory cannot use the exception"
+  } else if allow_overflow && ctx.overflow_uid == Some(uid) {
+    "overflow uid, but not a mount point or shared temp root"
+  } else if allow_overflow {
+    "not owned by root or the effective uid"
+  } else {
+    "not owned by the effective uid"
+  };
+  io::Error::new(
+    io::ErrorKind::InvalidInput,
+    format!("{reason}: {} (uid {uid})", path.display()),
+  )
+}
+
+/// Refusal for a final directory not owned by the effective UID, with the
+/// observed UID for diagnostics.
+fn invalid_owner_path(path: &Path, uid: u32) -> io::Error {
+  io::Error::new(
+    io::ErrorKind::InvalidInput,
+    format!(
+      "not owned by the effective uid: {} (uid {uid})",
+      path.display()
+    ),
+  )
 }
 
 /// Prove effective-uid write access by creating and removing an exclusive
@@ -883,7 +1166,9 @@ mod tests {
     let _ = std::fs::remove_dir_all(&base);
   }
 
-  /// Shared temp roots are accepted only under their sticky-bit policy.
+  /// Shared temp roots pass only under their sticky-bit policy; `/var/tmp`
+  /// passes when its chain is trusted, but a user-namespace sandbox may reject
+  /// `/var` itself, which is expected and documented.
   #[test]
   fn shared_temp_policy_accepts_tmp_and_rejects_non_sticky() {
     let tmp = Path::new("/tmp");
@@ -898,7 +1183,21 @@ mod tests {
 
     let var_tmp = Path::new("/var/tmp");
     if var_tmp.is_dir() {
-      validate_shared_temp(var_tmp).expect("/var/tmp must pass when present");
+      match validate_shared_temp(var_tmp) {
+        Ok(()) => {}
+        Err(err) => {
+          let ctx = NamespaceContext::atual();
+          assert!(
+            ctx.overflow_uid.is_some(),
+            "/var/tmp failed outside the overflow sandbox: {err}"
+          );
+          let message = err.to_string();
+          assert!(
+            message.contains("/var") && message.contains("not a mount point"),
+            "unexpected /var/tmp failure: {message}"
+          );
+        }
+      }
     }
     let _ = std::fs::remove_dir_all(&dir);
   }
@@ -1097,9 +1396,12 @@ mod tests {
       let dir = prepare_fallback_dir(std::slice::from_ref(&root), euid)
         .expect("prepare fallback dir under /tmp");
       assert_eq!(dir, fallback);
+      assert_eq!(dir.parent(), Some(root.as_path()));
+      assert_ne!(dir, root, "the fallback must never be the shared root");
       let meta = std::fs::symlink_metadata(&dir).expect("fallback metadata");
       assert_eq!(meta.mode() & 0o777, 0o700);
       assert_eq!(meta.uid(), euid);
+      validate_bind_dir(&dir).expect("fallback dir must satisfy the bind policy");
       let _ = std::fs::remove_dir(&dir);
     }
 
@@ -1150,5 +1452,271 @@ mod tests {
     let restore_result = unsafe { libc::chown(path.as_ptr(), 0, 0) };
     assert_eq!(restore_result, 0, "restore fallback owner");
     let _ = std::fs::remove_dir(&fallback);
+  }
+
+  /// Synthetic chain facts for owner and mode policy tests.
+  fn facts(uid: u32, mode: u32, mnt_id: Option<u64>) -> Facts {
+    Facts { uid, mode, mnt_id }
+  }
+
+  /// Sandbox and host maps parse; malformed, extra-field, and zero ranges fail.
+  #[test]
+  fn uid_map_parses_sandbox_host_and_rejects_invalid() {
+    let sandbox = UidMap::parse("         1000       1000          1\n").expect("sandbox map");
+    assert!(!sandbox.parent_uid_mapped(0));
+    assert!(sandbox.parent_uid_mapped(1000));
+    assert!(sandbox.inside_uid_mapped(1000));
+    assert!(!sandbox.inside_uid_mapped(65534));
+
+    let host = UidMap::parse("0 0 4294967295\n").expect("host map");
+    assert!(host.parent_uid_mapped(0));
+    assert!(host.parent_uid_mapped(4294967294));
+    assert!(host.inside_uid_mapped(0));
+
+    for invalid in [
+      "",
+      "1000 1000\n",
+      "1000 1000 1 extra\n",
+      "a b c\n",
+      "1000 1000 0\n",
+      "1000 1000 1\nbogus\n",
+    ] {
+      assert!(UidMap::parse(invalid).is_none(), "must reject {invalid:?}");
+    }
+
+    let mapped = UidMap::parse("1000 1000 1\n65534 524288 1\n").expect("mapped overflow");
+    assert!(mapped.inside_uid_mapped(65534));
+  }
+
+  /// Range ends are computed in u64, so a high start plus a full count is safe.
+  #[test]
+  fn uid_map_range_arithmetic_does_not_overflow() {
+    let map = UidMap::parse("0 1 4294967295\n").expect("large range");
+    assert!(!map.parent_uid_mapped(0));
+    assert!(map.parent_uid_mapped(1));
+    assert!(map.parent_uid_mapped(4294967295));
+    assert!(map.inside_uid_mapped(4294967294));
+  }
+
+  /// The exception is active only when root is unmapped and mount ids exist.
+  #[test]
+  fn namespace_context_is_active_only_for_unmapped_root() {
+    let active = NamespaceContext::evaluate("1000 1000 1\n", "65534\n", true);
+    assert_eq!(active.overflow_uid, Some(65534));
+    assert_eq!(active.raw_overflow_uid, Some(65534));
+    assert!(active.inactive_reason.is_empty());
+
+    let host = NamespaceContext::evaluate("0 0 4294967295\n", "65534\n", true);
+    assert_eq!(host.overflow_uid, None);
+    assert_eq!(host.raw_overflow_uid, Some(65534));
+    assert!(host.inactive_reason.contains("parent uid 0"));
+
+    let mapped = NamespaceContext::evaluate("1000 1000 1\n65534 524288 1\n", "65534\n", true);
+    assert_eq!(mapped.overflow_uid, None);
+    assert!(mapped.inactive_reason.contains("mapped inside"));
+  }
+
+  /// Invalid maps, invalid overflow values, and missing mount ids fail closed.
+  #[test]
+  fn namespace_context_turns_off_on_invalid_input_or_missing_mount_ids() {
+    for (uid_map, overflow) in [
+      ("bogus", "65534"),
+      ("1000 1000 1", "not-a-uid"),
+      ("1000 1000 0", "65534"),
+    ] {
+      let ctx = NamespaceContext::evaluate(uid_map, overflow, true);
+      assert_eq!(
+        ctx.overflow_uid, None,
+        "map {uid_map:?} overflow {overflow:?}"
+      );
+      assert!(!ctx.inactive_reason.is_empty(), "map {uid_map:?}");
+    }
+
+    let no_mount = NamespaceContext::evaluate("1000 1000 1", "65534", false);
+    assert_eq!(no_mount.overflow_uid, None);
+    assert!(no_mount.inactive_reason.contains("mount ids"));
+  }
+
+  /// An active overflow UID passes only on a mount point or shared temp root.
+  #[test]
+  fn chain_component_allows_overflow_only_with_an_anchor() {
+    let ctx = NamespaceContext::evaluate("1000 1000 1", "65534", true);
+    let overflow = facts(65534, 0o040755, Some(2));
+    validate_chain_component(Path::new("/mnt"), &overflow, 1000, true, true, &ctx)
+      .expect("mount point anchor must pass");
+
+    let temp = facts(65534, 0o041777, Some(2));
+    validate_chain_component(Path::new("/tmp"), &temp, 1000, false, true, &ctx)
+      .expect("shared temp anchor must pass");
+
+    let err = validate_chain_component(Path::new("/usr"), &overflow, 1000, false, true, &ctx)
+      .expect_err("unanchored overflow uid must fail");
+    let message = err.to_string();
+    assert!(message.contains("/usr"), "path missing: {message}");
+    assert!(message.contains("65534"), "uid missing: {message}");
+    assert!(
+      message.contains("not a mount point"),
+      "reason missing: {message}"
+    );
+
+    let err = validate_chain_component(Path::new("/final"), &overflow, 1000, false, false, &ctx)
+      .expect_err("the final directory must never use the exception");
+    let message = err.to_string();
+    assert!(
+      message.contains("final directory"),
+      "final-directory reason missing: {message}"
+    );
+    assert!(message.contains("65534"), "uid missing: {message}");
+  }
+
+  /// An inactive exception rejects the overflow UID even on a mount point.
+  #[test]
+  fn chain_component_reports_inactive_exception() {
+    let ctx = NamespaceContext::evaluate("0 0 4294967295", "65534", true);
+    let overflow = facts(65534, 0o040755, Some(2));
+    let err = validate_chain_component(Path::new("/"), &overflow, 1000, true, true, &ctx)
+      .expect_err("inactive exception must reject even a mount point");
+    let message = err.to_string();
+    assert!(
+      message.contains("exception inactive"),
+      "reason missing: {message}"
+    );
+    assert!(message.contains("65534"), "uid missing: {message}");
+    assert!(message.contains("parent uid 0"), "cause missing: {message}");
+  }
+
+  /// Bind dirs require exact 0700, while aliases may keep the 0755 private
+  /// policy; a 0600 dir is private but still not a valid bind directory.
+  #[test]
+  fn bind_dir_requires_exact_0700_but_private_dir_allows_0755() {
+    let dir = scratch("bind-mode");
+    let set = |mode| std::fs::set_permissions(&dir, Permissions::from_mode(mode));
+
+    set(0o700).expect("chmod 0700");
+    validate_private_dir(&dir).expect("private dir accepts 0700");
+    validate_bind_dir(&dir).expect("bind dir accepts 0700");
+
+    set(0o755).expect("chmod 0755");
+    validate_private_dir(&dir).expect("private dir accepts 0755");
+    let err = validate_bind_dir(&dir).expect_err("bind dir must reject 0755");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert!(err.to_string().contains("0700"), "unexpected: {err}");
+
+    set(0o600).expect("chmod 0600");
+    validate_private_dir(&dir).expect("private dir accepts 0600");
+    let err = validate_bind_dir(&dir).expect_err("bind dir must reject 0600");
+    assert!(err.to_string().contains("0700"), "unexpected: {err}");
+
+    set(0o700).expect("restore 0700");
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// Under the systemd user-unit sandbox, host root is unmapped and the
+  /// anchored overflow UID must keep the runtime dir and `/tmp` usable.
+  #[cfg(target_os = "linux")]
+  #[test]
+  #[ignore = "requires the systemd user-unit sandbox; run via systemd-run --user"]
+  fn user_namespace_overflow_accepts_anchored_dirs() {
+    let uid_map = std::fs::read_to_string("/proc/self/uid_map").expect("uid_map");
+    let map = UidMap::parse(&uid_map).expect("parse uid_map");
+    assert!(
+      !map.parent_uid_mapped(0),
+      "host root must be unmapped: {uid_map}"
+    );
+    let ctx = NamespaceContext::atual();
+    assert!(
+      ctx.overflow_uid.is_some(),
+      "overflow exception must be active: {}",
+      ctx.inactive_reason
+    );
+
+    let euid = current_euid();
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+      .map_or_else(|| PathBuf::from(format!("/run/user/{euid}")), PathBuf::from);
+    validate_private_dir(&runtime).expect("runtime dir must pass the private policy");
+    validate_shared_temp(Path::new("/tmp")).expect("/tmp must pass the shared temp policy");
+  }
+
+  /// An unanchored overflow-owned ancestor must be refused with the anchor
+  /// reason; separate mounts are skipped, and the test reports if none fits.
+  #[cfg(target_os = "linux")]
+  #[test]
+  #[ignore = "requires the systemd user-unit sandbox; run via systemd-run --user"]
+  fn user_namespace_overflow_rejects_unanchored_dirs() {
+    let ctx = NamespaceContext::atual();
+    let Some(overflow) = ctx.overflow_uid else {
+      panic!("overflow exception must be active: {}", ctx.inactive_reason);
+    };
+    assert!(
+      facts_of(Path::new("/"))
+        .expect("root facts")
+        .mnt_id
+        .is_some(),
+      "statx mount ids are required for this test"
+    );
+
+    // Prove the shared-temp validator checks the whole canonical chain: in
+    // this sandbox `/var` is unanchored, so `/var/tmp` must be refused.
+    if Path::new("/var/tmp").is_dir()
+      && std::fs::canonicalize("/var/tmp").is_ok_and(|path| path == Path::new("/var/tmp"))
+      && let (Ok(root), Ok(var)) = (facts_of(Path::new("/")), facts_of(Path::new("/var")))
+      && var.uid == overflow
+      && var.mode & MODE_TYPE_MASK == MODE_DIRECTORY
+      && matches!((root.mnt_id, var.mnt_id), (Some(root), Some(var)) if root == var)
+      && !is_shared_temp_root(Path::new("/var"))
+    {
+      let err = validate_shared_temp(Path::new("/var/tmp"))
+        .expect_err("unanchored /var must refuse /var/tmp");
+      let message = err.to_string();
+      assert!(message.contains("/var"), "component missing: {message}");
+      assert!(
+        message.contains("not a mount point"),
+        "anchor reason missing: {message}"
+      );
+    }
+
+    // The final directory never uses the exception, so the anchor rule is
+    // exercised through an ancestor: validate a child of the unanchored dir.
+    let found = ["/usr", "/var", "/etc", "/opt"]
+      .into_iter()
+      .map(Path::new)
+      .find_map(|ancestor| {
+        let facts = facts_of(ancestor).ok()?;
+        if facts.uid != overflow || facts.mode & MODE_TYPE_MASK != MODE_DIRECTORY {
+          return None;
+        }
+        let parent_facts = facts_of(ancestor.parent()?).ok()?;
+        let (Some(parent_mnt), Some(ancestor_mnt)) = (parent_facts.mnt_id, facts.mnt_id) else {
+          return None;
+        };
+        if ancestor_mnt != parent_mnt || is_shared_temp_root(ancestor) {
+          return None;
+        }
+        let child = std::fs::read_dir(ancestor)
+          .ok()?
+          .filter_map(Result::ok)
+          .find(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))?
+          .path();
+        Some((ancestor.to_path_buf(), child))
+      });
+    let Some((ancestor, candidate)) = found else {
+      eprintln!("skipping: no unmounted overflow-owned directory with a child dir available");
+      return;
+    };
+
+    let err = validate_private_dir(&candidate).expect_err("unanchored overflow owner must fail");
+    let message = err.to_string();
+    assert!(
+      message.contains(&ancestor.display().to_string()),
+      "component missing: {message}"
+    );
+    assert!(
+      message.contains(&overflow.to_string()),
+      "uid missing: {message}"
+    );
+    assert!(
+      message.contains("not a mount point"),
+      "anchor reason missing: {message}"
+    );
   }
 }
