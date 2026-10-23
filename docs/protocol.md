@@ -95,17 +95,44 @@ macOS may appear as chain components when owned by root or the effective
 UID and carrying the sticky bit; that ancestor check is metadata-only. The
 exact temp root still requires write access by the effective UID. A nested
 directory below `/tmp` or `/var/tmp` still has to pass the private policy.
-Relative, empty, root (`/`), symlinked, non-directory, foreign-owned, and
-non-sticky world-writable paths are rejected, and rejection never
-authorizes deleting the path.
+Write access is proven by `probe_temp_write`: an exclusive probe file is
+created and removed, and up to eight distinct names are tried on
+`AlreadyExists`, while every other error propagates. The probe names are
+predictable: the retry covers collisions and residual state, not a
+determined attacker, so occupying all eight names can still deny
+validation (availability limitation). Relative, empty, root (`/`),
+symlinked, non-directory, foreign-owned, and non-sticky world-writable
+paths are rejected, and rejection never authorizes deleting the path.
 
 ### Socket permissions
 
 Immediately after a successful bind, Adsum sets the real socket to mode
-`0600` and verifies the mode before publishing any alias or marker. If the
-mode cannot be set or verified, that bind attempt is cleaned up with the
-same identity-checked removal as other owned-socket cleanup, and the next
-index is tried.
+`0600` before publishing any alias or marker. On Linux it opens the
+temporary socket with `O_PATH | O_NOFOLLOW | O_CLOEXEC`, checks with
+`fstat` that the handle is a socket, and takes `(dev, ino)` from the
+handle instead of the path. The mode is applied through the handle with
+`fchmodat(..., AT_EMPTY_PATH)`, falling back to `/proc/self/fd/<fd>`, and
+the final name is installed with `linkat(..., AT_EMPTY_PATH)`, falling
+back to the `/proc/self/fd/<fd>` path with `AT_SYMLINK_FOLLOW`. Replacing
+the temporary name after the handle is open therefore cannot redirect the
+chmod or the link, and the replacement is left in place. The residual
+window is between `bind` and opening the handle; a same-euid substitution
+inside that window is what the handle sees. If the mode cannot be set,
+the final link is not attempted, and the attempt is cleaned up with the
+same identity-checked removal as other owned-socket cleanup before the
+next index is tried. After linking, the final `(dev, ino)` is checked; an
+entry that does not match is never adopted, and only a final link that
+still matches is removed. The temporary name is removed only while it
+still names the captured socket. If the captured inode can no longer be
+linked, the attempt is abandoned rather than falling back to the temporary
+path. Linux never falls back to pathname chmod/link: if neither
+`AT_EMPTY_PATH` nor `/proc/self/fd` works for an operation, the attempt
+fails closed. Non-Linux Unix keeps the path-based chmod/hard-link fallback
+and its residual race.
+
+Processes under the same effective UID are one trust boundary. These
+checks protect against other UIDs and accidental or concurrent
+replacement, not against a malicious process running as the same user.
 
 ### Alias layouts
 

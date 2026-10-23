@@ -5,7 +5,15 @@
 //! on an async worker). Shutdown cancels the accept loop, drains the set
 //! with a deadline, then aborts stragglers.
 
+#[cfg(target_os = "linux")]
+use std::ffi::CString;
+#[cfg(target_os = "linux")]
+use std::io;
 use std::io::ErrorKind;
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -573,9 +581,20 @@ fn bind_temp(
   ))
 }
 
-/// Install a temp-bound listener at `path` as mode `0600` via no-replace hard
-/// link, so a foreign final entry is never replaced or chmodded. Linux `fstat`
-/// reports the sockfs inode, so identity is taken from the temp path.
+/// Linux install: open the temp socket first so a later name substitution
+/// cannot redirect chmod or the final link.
+#[cfg(target_os = "linux")]
+fn finish_bind(
+  listener: std::os::unix::net::UnixListener,
+  temp: &Path,
+  path: &Path,
+) -> Option<(std::os::unix::net::UnixListener, String, FileId)> {
+  let handle = open_socket_handle(temp)?;
+  finish_bind_from_handle(listener, temp, path, handle)
+}
+
+/// Portable install: path-based fallback for non-Linux Unix platforms.
+#[cfg(not(target_os = "linux"))]
 fn finish_bind(
   listener: std::os::unix::net::UnixListener,
   temp: &Path,
@@ -612,6 +631,132 @@ fn finish_bind(
   let socket_path = path.to_string_lossy().into_owned();
   tracing::info!("[ipc] Created IPC socket: {socket_path}");
   Some((listener, socket_path, identity))
+}
+
+/// Linux install: use the opened handle for chmod and the final link, then
+/// remove the temp name only while it still names the same socket.
+#[cfg(target_os = "linux")]
+fn finish_bind_from_handle(
+  listener: std::os::unix::net::UnixListener,
+  temp: &Path,
+  path: &Path,
+  handle: OwnedFd,
+) -> Option<(std::os::unix::net::UnixListener, String, FileId)> {
+  let identity = socket_identity_from_fd(handle.as_fd())?;
+  if chmod_socket_handle(handle.as_fd()).is_err() {
+    let _ = unlink_socket_if_unchanged(temp, identity);
+    return None;
+  }
+  if link_socket_handle(handle.as_fd(), path).is_err() {
+    let _ = unlink_socket_if_unchanged(temp, identity);
+    return None;
+  }
+  if socket_identity(path) != Some(identity) {
+    let _ = unlink_socket_if_unchanged(path, identity);
+    let _ = unlink_socket_if_unchanged(temp, identity);
+    tracing::warn!(
+      "[ipc] Socket {} changed during installation; leaving it",
+      path.display()
+    );
+    return None;
+  }
+  let _ = unlink_socket_if_unchanged(temp, identity);
+  let socket_path = path.to_string_lossy().into_owned();
+  tracing::info!("[ipc] Created IPC socket: {socket_path}");
+  Some((listener, socket_path, identity))
+}
+
+/// Apply `0600` through the handle, falling back to `/proc/self/fd`.
+#[cfg(target_os = "linux")]
+fn chmod_socket_handle(fd: BorrowedFd<'_>) -> io::Result<()> {
+  // SAFETY: `fd` is valid and `c""` is a NUL-terminated empty path.
+  if unsafe { libc::fchmodat(fd.as_raw_fd(), c"".as_ptr(), 0o600, libc::AT_EMPTY_PATH) } == 0 {
+    return Ok(());
+  }
+  std::fs::set_permissions(
+    proc_fd_path(fd.as_raw_fd()),
+    std::fs::Permissions::from_mode(0o600),
+  )
+}
+
+/// Hard-link the handle at `path` without replacing an existing entry.
+#[cfg(target_os = "linux")]
+fn link_socket_handle(fd: BorrowedFd<'_>, path: &Path) -> io::Result<()> {
+  let target = CString::new(path.as_os_str().as_bytes())
+    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket path contains nul"))?;
+  // SAFETY: `fd` is valid, both paths are NUL-terminated, and the flags are
+  // valid; the empty source asks `linkat` to link the descriptor itself.
+  let linked = unsafe {
+    libc::linkat(
+      fd.as_raw_fd(),
+      c"".as_ptr(),
+      libc::AT_FDCWD,
+      target.as_ptr(),
+      libc::AT_EMPTY_PATH,
+    )
+  };
+  if linked == 0 {
+    return Ok(());
+  }
+  let proc_path = CString::new(proc_fd_path(fd.as_raw_fd()).as_os_str().as_bytes())
+    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "proc path contains nul"))?;
+  // SAFETY: both paths are NUL-terminated and the fd is valid; following the
+  // magic `/proc/self/fd` link targets the open socket.
+  let linked = unsafe {
+    libc::linkat(
+      libc::AT_FDCWD,
+      proc_path.as_ptr(),
+      libc::AT_FDCWD,
+      target.as_ptr(),
+      libc::AT_SYMLINK_FOLLOW,
+    )
+  };
+  if linked == 0 {
+    Ok(())
+  } else {
+    Err(io::Error::last_os_error())
+  }
+}
+
+/// `/proc/self/fd/<fd>`, the Linux fallback path for fd operations.
+#[cfg(target_os = "linux")]
+fn proc_fd_path(fd: RawFd) -> PathBuf {
+  PathBuf::from(format!("/proc/self/fd/{fd}"))
+}
+
+/// Open the socket at `path` as an `O_PATH` handle without following links.
+#[cfg(target_os = "linux")]
+fn open_socket_handle(path: &Path) -> Option<OwnedFd> {
+  let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+  // SAFETY: `c_path` is a valid NUL-terminated path and the flags are valid.
+  let raw = unsafe {
+    libc::open(
+      c_path.as_ptr(),
+      libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+    )
+  };
+  if raw < 0 {
+    return None;
+  }
+  // SAFETY: `raw` is a fresh descriptor owned by this function.
+  let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+  socket_identity_from_fd(fd.as_fd()).map(|_| fd)
+}
+
+/// `(dev, ino)` of an open socket handle; `None` for any other file type.
+#[cfg(target_os = "linux")]
+fn socket_identity_from_fd(fd: BorrowedFd<'_>) -> Option<FileId> {
+  let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+  // SAFETY: `fd` is valid and `stat` points to writable storage.
+  if unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+    return None;
+  }
+  // SAFETY: `fstat` succeeded and initialized `stat`.
+  let stat = unsafe { stat.assume_init() };
+  (stat.st_mode & libc::S_IFMT == libc::S_IFSOCK).then_some(FileId {
+    dev: stat.st_dev,
+    ino: stat.st_ino,
+  })
 }
 
 /// Identity of `path` when it is a socket, without following symlinks.
@@ -789,6 +934,116 @@ mod tests {
 
     drop(foreign);
     let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// A handle opened before the temp name is replaced must keep chmod/link
+  /// on the original socket, never on the replacement.
+  #[cfg(target_os = "linux")]
+  #[test]
+  fn finish_bind_from_handle_ignores_replaced_temp_name() {
+    let dir = scratch("finish-bind-handle-race");
+    let path = dir.join("discord-ipc-0");
+    let (listener, temp) = bind_temp(&dir, 0).expect("temp listener");
+    let handle = open_socket_handle(&temp).expect("socket handle");
+    let original = socket_identity_from_fd(handle.as_fd()).expect("original identity");
+
+    std::fs::remove_file(&temp).expect("remove temp name");
+    let foreign = UnixListener::bind(&temp).expect("foreign listener");
+    std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o666)).expect("foreign mode");
+    let foreign_id = socket_identity(&temp).expect("foreign identity");
+    assert_ne!(original, foreign_id, "the replacement must be distinct");
+
+    let result = finish_bind_from_handle(listener, &temp, &path, handle);
+
+    let foreign_mode = std::fs::symlink_metadata(&temp)
+      .expect("foreign name must be preserved")
+      .mode()
+      & 0o777;
+    assert_eq!(foreign_mode, 0o666, "foreign socket mode must not change");
+
+    match result {
+      Some((_, socket_path, identity)) => {
+        assert_eq!(socket_path, path.to_string_lossy().as_ref());
+        assert_eq!(identity, original);
+        assert_eq!(
+          socket_identity(&path),
+          Some(original),
+          "the final name must carry the original inode"
+        );
+      }
+      None => {
+        assert_ne!(
+          socket_identity(&path),
+          Some(foreign_id),
+          "the foreign inode must never be installed"
+        );
+      }
+    }
+
+    drop(foreign);
+    let _ = std::fs::remove_file(&temp);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// A renamed temp socket stays linkable: the fd install must succeed with
+  /// the original inode and leave the foreign temp name untouched.
+  #[cfg(target_os = "linux")]
+  #[test]
+  fn finish_bind_from_handle_installs_original_after_temp_rename() {
+    let dir = scratch("finish-bind-handle-rename");
+    let path = dir.join("discord-ipc-0");
+    let renamed = dir.join("original-socket");
+    let (listener, temp) = bind_temp(&dir, 0).expect("temp listener");
+    let handle = open_socket_handle(&temp).expect("socket handle");
+    let original = socket_identity_from_fd(handle.as_fd()).expect("original identity");
+
+    std::fs::rename(&temp, &renamed).expect("rename temp name");
+    let foreign = UnixListener::bind(&temp).expect("foreign listener");
+    std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o666)).expect("foreign mode");
+    let foreign_id = socket_identity(&temp).expect("foreign identity");
+    assert_ne!(original, foreign_id, "the replacement must be distinct");
+
+    let (_, socket_path, identity) =
+      finish_bind_from_handle(listener, &temp, &path, handle).expect("fd install must succeed");
+
+    assert_eq!(socket_path, path.to_string_lossy().as_ref());
+    assert_eq!(
+      identity, original,
+      "the installed identity must be original"
+    );
+    assert_eq!(
+      socket_identity(&path),
+      Some(original),
+      "the final name must carry the original inode"
+    );
+    assert_eq!(
+      std::fs::symlink_metadata(&path)
+        .expect("final metadata")
+        .mode()
+        & 0o777,
+      0o600,
+      "the original socket must be 0600"
+    );
+    assert_eq!(
+      socket_identity(&temp),
+      Some(foreign_id),
+      "the foreign temp name must be preserved"
+    );
+    assert_eq!(
+      std::fs::symlink_metadata(&temp)
+        .expect("foreign metadata")
+        .mode()
+        & 0o777,
+      0o666,
+      "the foreign socket mode must not change"
+    );
+
+    drop(foreign);
+    let _ = std::fs::remove_file(&temp);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&renamed);
     let _ = std::fs::remove_dir_all(&dir);
   }
 

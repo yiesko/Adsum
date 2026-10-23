@@ -124,9 +124,16 @@ systemctl --user restart adsum.service # service picks up the restored binary
 - **Home read-only**: the cache directory (XDG default `~/.cache/adsum`)
   is created by systemd through `CacheDirectory=` and stays writable; the
   config directory (`~/.config/adsum` by default) is read-only, which is
-  all the service needs. `%t` (sockets) and `~/.local/bin` (the update
-  swap) are the other writable paths. Anything else you add to the unit
-  needs its own directory directive or `ReadWritePaths` entry.
+  all the service needs. `%t` (runtime sockets), host `/tmp` through
+  `BindPaths` (compatibility aliases and the private fallback socket), and
+  `~/.local/bin` (the update swap) are the other writable paths. Anything
+  else you add to the unit needs its own directory directive or
+  `ReadWritePaths` entry.
+- **IPC install under the sandbox**: `SystemCallFilter=@system-service`
+  covers the fd-based install (`open`, `fstat`, `fchmodat`/`fchmodat2`,
+  `linkat`), so no extra capability is needed. If the kernel or glibc
+  lacks `AT_EMPTY_PATH`, the service uses `/proc/self/fd`, which remains
+  visible inside the unit.
 
 ## See also
 

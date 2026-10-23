@@ -141,11 +141,20 @@ What matters:
   runtime dir `%t` (sockets, including the preferred
   `%t/app/com.discordapp.Discord` directory) and `~/.local/bin` (staged
   self-updates swap in at boot). `BindPaths=/tmp` keeps the host `/tmp`
-  writable because compatibility aliases are still published there. The
-  config directory is only read, so it needs no write exception. The unit
-  then applies kernel/clock/hostname/cgroup protections, `PrivateDevices`,
-  `RestrictSUIDSGID`/`RestrictRealtime`, and a `SystemCallFilter` allowlist
-  with `MemoryDenyWriteExecute`, all verified against a live boot.
+  writable because compatibility aliases and the private fallback socket
+  are still published there. The config directory is only read, so it
+  needs no write exception. The unit then applies kernel, clock, hostname
+  and cgroup protections, `PrivateDevices`, `RestrictSUIDSGID`/
+  `RestrictRealtime`, and a `SystemCallFilter` allowlist with
+  `MemoryDenyWriteExecute`, all verified against a live boot.
+- **IPC fd operations**: the Linux install opens the temp socket with
+  `O_PATH`, checks it with `fstat`, applies `0600` with
+  `fchmodat`/`fchmodat2` (falling back to `chmod` via `/proc/self/fd`),
+  and publishes it with `linkat` (falling back to the same proc path).
+  `SystemCallFilter=@system-service` already includes these calls, so the
+  unit needs no extra syscall exception or capability. The unit keeps
+  `BindPaths=/tmp` for host aliases and the private fallback, and the `%t`
+  write exception for runtime sockets.
 - **`RestrictAddressFamilies=... AF_NETLINK`**: required by the
   event-driven process watcher; without `AF_NETLINK` the scanner silently
   stays on polling.
@@ -234,7 +243,7 @@ Rules of thumb: one concern per unit; `Type=exec` + `Restart=on-failure`
 for daemons; prefer `Environment=`/drop-ins over wrapper scripts; secrets
 go in `EnvironmentFile=` (mode `600`), never in the unit. If you copy the
 shipped unit, keep `AF_NETLINK` (watcher) and `BindPaths=/tmp` (IPC aliases
-published into host `/tmp`).
+and the private fallback socket published into host `/tmp`).
 
 ## See also
 
