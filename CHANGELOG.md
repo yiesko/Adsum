@@ -13,9 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   classification cache (`crates/adsum-detect/src/cache/procs.rs`) records
   what the EXEC fast path and first-sighting ticks already computed; a
   tick now enumerates `/proc` for liveness, sweeps the dead, revalidates
-  cached hits (one cmdline read per detected game, so a zombie can never
-  hold a card), and reads + classifies only pids with no current-generation
-  entry. Steady state: zero cmdline reads, zero automaton walks, zero
+  cached hits (one cmdline read per detected game — re-running the
+  matcher whenever the re-read's argv fingerprint drifts, a case the
+  full sweep caught and no EXEC event ever reports, so neither a zombie
+  nor an in-place argv rewrite can hold a card; cached misses rest —
+  re-reading ~1k non-games per tick is the cost this cache exists to
+  avoid, and a rewrite that would turn a miss into a hit surfaces as
+  an EXEC event or a watcher-loss flush —), and reads + classifies
+  only pids with no current-generation entry. Steady state: zero cmdline reads, zero automaton walks, zero
   allocations per tick — measured on the bundled database's shape (1062
   processes): 5.05 → 0.38 ms/tick (−92%), 3152 → 3 allocs/tick, 40.3 KB →
   54 B/tick of allocator churn, identical detections. Every watcher loss

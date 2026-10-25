@@ -334,6 +334,116 @@ fn a_zombied_hit_is_revalidated_out() {
   let _ = child.wait();
 }
 
+/// Command-line drift the watcher cannot see: a process that rewrites
+/// its argv in place without ever `exec`ing produces no EXEC event, so
+/// revalidating mere readability would keep a stale classification
+/// forever. The tick re-hashes the re-read command line against the
+/// entry, and a drifted fingerprint must force a fresh classification
+/// (the sentinel start a cached entry keeps cannot survive it).
+#[test]
+fn an_in_place_argv_drift_reclassifies_the_cached_hit() {
+  let server = live_server();
+  let mut child = spawn_sleeper();
+  let pid = child.id() as u64;
+  let mut processes = Vec::new();
+  let mut scratch = ScanScratch::default();
+
+  let first = tick(&server, &mut processes, &mut scratch);
+  assert!(
+    start_for(&first, pid).is_some(),
+    "the sleeper child must be detected on the first (cold) tick"
+  );
+
+  // The drift is planted by hand: exactly the shape production must
+  // handle if the pid had been classified back when its argv read the
+  // phantom bytes below, then rewrote its own command line in place
+  // (its real bytes — `/bin/sleep 60` — stay the only ones /proc
+  // serves). No EXEC, no dirty flag, watcher believed live — every
+  // invalidation channel in the matrix is quiet, and the entry's
+  // fingerprint is the only difference between the cached belief and
+  // process reality.
+  let phantom = argv_fingerprint(&Exec {
+    pid,
+    path: "/bin/phantom-with-other-argv".into(),
+    arguments: Some("other-argv".into()),
+  });
+  {
+    let mut cache = server.proc_cache.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = cache.get_mut(&pid).expect("the child must be cached");
+    entry.argv = phantom;
+    let hit = entry
+      .hit
+      .as_mut()
+      .expect("the child matches the sleep entry");
+    hit.start = SENTINEL_START;
+  }
+
+  let second = tick(&server, &mut processes, &mut scratch);
+  let start =
+    start_for(&second, pid).expect("a drifted-but-alive game is reclassified, not dropped");
+  assert_ne!(
+    start, SENTINEL_START,
+    "a drifted fingerprint must force reclassification, not serve the cache"
+  );
+  assert!(
+    start > 1_000_000_000_000,
+    "the fresh stamp must be a real epoch-millis value, got {start}"
+  );
+
+  let _ = child.kill();
+  let _ = child.wait();
+}
+
+/// The drift scope's boundary: a cached MISS rests. Re-reading every
+/// non-game's cmdline each tick is the full sweep's cost, which is
+/// what the cache exists to remove; a rewrite that would turn a miss
+/// into a hit surfaces as an EXEC event or a watcher-loss flush — the
+/// watcher holds the truth for misses, the fingerprint for hits.
+/// (This pins the boundary the argv-drift fix chose, so a future edit
+/// cannot silently start (or stop) re-reading misses.)
+#[test]
+fn a_cached_miss_is_not_revalidated_on_argv_drift() {
+  let server = live_server();
+  let mut child = spawn_sleeper();
+  let pid = child.id() as u64;
+  let mut processes = Vec::new();
+  let mut scratch = ScanScratch::default();
+
+  let _ = tick(&server, &mut processes, &mut scratch);
+
+  // Forge the MISS shape: no classification, and a fingerprint that
+  // describes bytes the real child does not serve — the "argv changed
+  // since classification" case at miss scope.
+  let phantom = argv_fingerprint(&Exec {
+    pid,
+    path: "/bin/phantom-with-other-argv".into(),
+    arguments: Some("other-argv".into()),
+  });
+  {
+    let mut cache = server.proc_cache.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = cache.get_mut(&pid).expect("the child must be cached");
+    entry.hit = None;
+    entry.argv = phantom;
+  }
+
+  let second = tick(&server, &mut processes, &mut scratch);
+  assert!(
+    start_for(&second, pid).is_none(),
+    "a cached miss is out of the tick's table even when reality would match"
+  );
+  {
+    let cache = server.proc_cache.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = cache.get(&pid).expect("a resting miss stays cached");
+    assert_eq!(
+      entry.argv, phantom,
+      "a miss must not be read/rewritten by revalidation"
+    );
+  }
+
+  let _ = child.kill();
+  let _ = child.wait();
+}
+
 /// The dispatch-side seams in isolation: `cache_proc` records (misses
 /// included — a verified miss is a classification too), `uncache_proc`
 /// forgets, and the dirty flag round-trips through `take_cache_dirty`.
@@ -343,11 +453,12 @@ fn cache_helpers_record_and_forget() {
   let bundle = server.bundle();
 
   // A cached MISS (None) with the current epoch.
-  server.cache_proc(4242, bundle.epoch, None, false);
+  server.cache_proc(4242, bundle.epoch, 0, None, false);
   {
     let cache = server.proc_cache.lock().unwrap_or_else(|e| e.into_inner());
     let entry = cache.get(&4242).expect("inserted");
     assert_eq!(entry.epoch, bundle.epoch);
+    assert_eq!(entry.argv, 0, "the argv fingerprint travels through");
     assert!(entry.hit.is_none());
     assert!(!entry.obs);
   }
@@ -373,7 +484,7 @@ fn flush_releases_capacity() {
   let server = live_server();
   let bundle = server.bundle();
   for pid in 0..4096u64 {
-    server.cache_proc(pid, bundle.epoch, None, false);
+    server.cache_proc(pid, bundle.epoch, 0, None, false);
   }
   let spiked = server
     .proc_cache

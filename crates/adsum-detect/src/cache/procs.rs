@@ -6,15 +6,18 @@
 //! closes that redundancy: a pid's classification is computed once — by
 //! the EXEC fast path or by the tick that first sees the pid — and later
 //! ticks only ENUMERATE `/proc` (liveness truth), sweep the dead, and
-//! re-read the pids whose entry is missing or was classified against a
-//! foreign bundle generation.
+//! re-read the pids whose entry is missing, is classified against a
+//! foreign bundle generation, or fails the command-line fingerprint
+//! re-check.
 //!
 //! # Trust model (why this is sound)
 //!
 //! Liveness never comes from the cache: every tick enumerates the live
 //! pid set and sweeps entries against it, exactly like the AppId memo's
-//! dead-pid sweep. What the cache asserts is narrower — "this pid has
-//! not `exec`'d since it was classified" — and that rests on the same
+//! dead-pid sweep. What the cache asserts per entry: for a HIT, "not
+//! `exec`'d, and the command line still hashes to the entry's
+//! fingerprint"; for a MISS, only the not-exec'd part (misses rest —
+//! the argv-drift rows below draw that boundary). It rests on the same
 //! watcher the EXIT-wake and idle-backoff paths already trust, with
 //! every known loss channel mapped to a full invalidation:
 //!
@@ -23,6 +26,8 @@
 //! | `EXEC(pid)` | dispatch thread | entry replaced with the fresh classification (before the existing publish) |
 //! | `EXIT(pid)` | dispatch thread | entry removed (unconditionally — dead is dead) |
 //! | zombie between ticks | the tick itself | cached HITS are revalidated every tick (one cmdline read each, 0-3 of them): a zombie is still enumerated but reads empty, and "unreadable = absent" is the full sweep's rule, so it drops its entry at once |
+//! | argv drift (cached HIT) | the tick's revalidation | the re-read's fingerprint differs from the entry's → reclassified right there; a no-exec rewrite emits no EXEC for the watcher to see |
+//! | argv drift (cached MISS) | out of cache scope | misses rest: re-reading every non-game each tick is the full sweep's cost this cache exists to remove; a rewrite that would turn a miss into a hit surfaces as an EXEC event or a watcher-loss flush |
 //! | cn_proc sequence gap | watcher (`SeqTracker`) | `cache_dirty` → next tick flushes: one full-cost re-read, self-healing |
 //! | backlog shed (>cap) | watcher (`send_checked`) | same flag: a shed event is a lost invalidation |
 //! | socket overrun (ENOBUFS) | watcher (`recv`) | same flag |
@@ -37,7 +42,7 @@
 //!
 //! # Memory
 //!
-//! One small entry per live pid (~56 B + bucket): ~60 KB at 1k
+//! One small entry per live pid (~64 B + bucket): ~64 KB at 1k
 //! processes, bounded by the live set (swept every tick) and shrunk
 //! after a collapse like the AppId memo. The cache REPLACES per-tick
 //! work, not the slot list: the `Vec<Exec>` high-water slots survive
@@ -47,7 +52,7 @@ use rustc_hash::FxHashMap;
 use std::sync::atomic::Ordering;
 
 use crate::server::ProcessServer;
-use crate::types::ScannedHit;
+use crate::types::{Exec, ScannedHit};
 
 /// One cached classification for a live pid.
 pub(crate) struct CachedProc {
@@ -55,6 +60,9 @@ pub(crate) struct CachedProc {
   /// (hourly refresh, override edit) sends the pid back through the
   /// reader and matcher — see the module docs.
   pub(crate) epoch: u64,
+  /// FNV-1a 64 of the command line as classified (`argv_fingerprint`):
+  /// catches argv rewrites in place, which never produce an EXEC.
+  pub(crate) argv: u64,
   /// The classification: `None` is a verified miss (excluded, refused,
   /// or simply not a game) and skips the pid exactly like a fresh miss
   /// would. Hits carry the shared `Arc<ScannedEntry>`, so a tick's
@@ -72,6 +80,27 @@ pub(crate) struct CachedProc {
 /// EXEC/EXIT, work inserts) are single-entry ops — a read lock would add
 /// a writer-starvation question for no gain.
 pub(crate) type ProcCache = FxHashMap<u64, CachedProc>;
+
+/// FNV-1a 64 over `path`, a NUL separator, then the arguments: zero
+/// allocations, no dependency, and 64 bits need only say "the same bytes
+/// this was classified from" vs. anything else.
+pub(crate) fn argv_fingerprint(exec: &Exec) -> u64 {
+  const FNV1A_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+  const FNV1A_PRIME: u64 = 0x0000_0100_0000_01b3;
+  let mut hash = FNV1A_OFFSET;
+  let mut mix = |bytes: &[u8]| {
+    for &byte in bytes {
+      hash ^= u64::from(byte);
+      hash = hash.wrapping_mul(FNV1A_PRIME);
+    }
+  };
+  mix(exec.path.as_bytes());
+  mix(b"\0");
+  if let Some(arguments) = &exec.arguments {
+    mix(arguments.as_bytes());
+  }
+  hash
+}
 
 impl ProcessServer {
   /// Whether the next tick may run incremental: the watcher must be
@@ -100,13 +129,30 @@ impl ProcessServer {
     cache.shrink_to(0);
   }
 
-  /// Record one classification (EXEC fast path, work re-reads).
-  pub(crate) fn cache_proc(&self, pid: u64, epoch: u64, hit: Option<ScannedHit>, obs: bool) {
+  /// Record one classification (EXEC fast path, work re-reads): `argv`
+  /// is [`argv_fingerprint`] of the command line this classification
+  /// was computed from.
+  pub(crate) fn cache_proc(
+    &self,
+    pid: u64,
+    epoch: u64,
+    argv: u64,
+    hit: Option<ScannedHit>,
+    obs: bool,
+  ) {
     self
       .proc_cache
       .lock()
       .unwrap_or_else(|e| e.into_inner())
-      .insert(pid, CachedProc { epoch, hit, obs });
+      .insert(
+        pid,
+        CachedProc {
+          epoch,
+          argv,
+          hit,
+          obs,
+        },
+      );
   }
 
   /// Forget one pid (EXIT fast path: dead is dead, tracked or not).

@@ -10,6 +10,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::cache::procs::argv_fingerprint;
 use crate::runtime::lanes::{EXEC_EVENT_CAP, exec_hit_ignored, publish_exec_hit};
 use crate::runtime::workers::{
   is_shutting_down, spawn_worker, track_shutdown_thread, unpark_scan_wake,
@@ -94,7 +95,13 @@ pub(crate) fn spawn_proc_watcher(server: &ProcessServer) -> adsum_telemetry::Que
             // verified miss, and re-walking the automata for the same
             // unchanged pid every tick is exactly the redundancy the
             // cache exists to remove.
-            dispatch.cache_proc(pid, bundle.epoch, matched.clone(), obs_open);
+            dispatch.cache_proc(
+              pid,
+              bundle.epoch,
+              argv_fingerprint(exec),
+              matched.clone(),
+              obs_open,
+            );
             if let Some(hit) = matched {
               // Coexistence parity with the polling path: ignored IDs never
               // publish, even on the event-driven fast path.

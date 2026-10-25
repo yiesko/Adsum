@@ -14,6 +14,7 @@
 use super::runtime::ScanGuard;
 use super::server::ProcessServer;
 use super::types::{Exec, ProcessScanState, ScannedHit};
+use crate::cache::procs::argv_fingerprint;
 use crate::platform::PlatformEnumerator;
 // All four scratch groups exist on every target: the snapshot backend
 // reuses the same enumeration state (pid list, liveness set, work lists)
@@ -332,13 +333,16 @@ impl ProcessServer {
     //    between ticks cannot hold a stale card — zombies are still
     //    enumerated (the /proc dir outlives the address space; sysinfo
     //    lists them too) but read empty, and "unreadable = absent" is
-    //    the rule the full sweep has always applied. Misses are not
-    //    revalidated: a cached miss can only become a hit through an
-    //    exec, and every exec either arrives as an EXEC event (replacing
-    //    the entry) or was lost with a signal that flushed the whole
-    //    cache. The read refills slot 0 in place; the entry itself is
-    //    untouched when the pid is still readable, so a cached hit keeps
-    //    its first-classification stamp.
+    //    the rule the full sweep has always applied. The re-read must
+    //    also hash to the entry's fingerprint: an argv rewritten in
+    //    place emits no EXEC (there was no exec), so drift is caught
+    //    here and reclassified against this tick's bundle and hoisted
+    //    exclusions; a dispatch race over the same pid self-heals on
+    //    the next tick (foreign-epoch work list or dead-entry sweep).
+    //    Misses are out of scope (see the cache docs' argv-drift rows):
+    //    re-reading every non-game each tick is the full sweep's cost,
+    //    so a miss rests until an EXEC event or a watcher-loss flush —
+    //    a rewrite that would turn a miss into a hit is one of those.
     {
       let hits = std::mem::take(&mut scratch.enumerate.hit_pids);
       if !hits.is_empty() {
@@ -349,6 +353,22 @@ impl ProcessServer {
           if !PlatformEnumerator::read_one(self, pid, &mut processes[0], &mut scratch.exec_scratch)
           {
             self.uncache_proc(pid);
+            continue;
+          }
+          // The fingerprint is computed outside the lock: the hold is
+          // the field compare only, classification runs with locks
+          // released, like the work-list path. An EXIT racing between
+          // compare and insert resurrects nothing past one tick — the
+          // next tick's retain drops a dead pid's entry.
+          let argv = argv_fingerprint(&processes[0]);
+          let drifted = {
+            let cache = self.proc_cache.lock().unwrap_or_else(|e| e.into_inner());
+            cache.get(&pid).is_some_and(|entry| entry.argv != argv)
+          };
+          if drifted {
+            let mut ev_obs = false;
+            let hit = self.match_process(&processes[0], bundle, excl, &mut ev_obs, scratch);
+            self.cache_proc(pid, epoch, argv, hit, ev_obs);
           }
         }
       }
@@ -376,7 +396,13 @@ impl ProcessServer {
         ) {
           let mut ev_obs = false;
           let hit = self.match_process(&processes[filled], bundle, excl, &mut ev_obs, scratch);
-          self.cache_proc(pid, epoch, hit, ev_obs);
+          self.cache_proc(
+            pid,
+            epoch,
+            argv_fingerprint(&processes[filled]),
+            hit,
+            ev_obs,
+          );
           filled += 1;
         }
       }
