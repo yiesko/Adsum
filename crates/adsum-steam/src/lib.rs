@@ -366,6 +366,16 @@ fn dir_fingerprint(apps_dir: &Path) -> Option<Fingerprint> {
   })
 }
 
+/// One install-dir tail in the precomputed index: a cached prefix after
+/// `/steamapps/common/`, filed under its first path component with the
+/// AppId it answers. Owned copies, rebuilt at every `dirs` mutation.
+#[derive(Clone, Debug)]
+struct TailEntry {
+  first: Box<str>,
+  tail: Box<str>,
+  appid: Box<str>,
+}
+
 /// Install-dir -> AppId over every known Steam library.
 #[derive(Clone, Debug, Default)]
 pub struct SteamLibraries {
@@ -375,6 +385,10 @@ pub struct SteamLibraries {
   mtimes: HashMap<PathBuf, SystemTime>,
   /// Lowercased install-dir prefix -> AppId.
   dirs: HashMap<String, String>,
+  /// Precomputed install-dir TAIL index derived from `dirs` at every
+  /// mutation (never serialized): sorted by the tail's first component,
+  /// so `match_install_tail_into` binary-searches a short candidate run.
+  tail_index: Box<[TailEntry]>,
   /// Library path (string form) -> fingerprint at last scan.
   fingerprints: HashMap<String, Fingerprint>,
   /// Roots this map was built from. Refresh re-resolves libraries from
@@ -482,6 +496,9 @@ impl SteamLibraries {
       scanned,
       reused
     );
+    // The cache-merge branch above inserts into `dirs` without going
+    // through `scan_library`: rebuild the index once, at the end.
+    libraries.rebuild_tail_index();
     save_cache(&libraries);
     libraries
   }
@@ -551,27 +568,31 @@ impl SteamLibraries {
         .collect();
       self.watched.retain(|file| live_files.contains(file));
       self.mtimes.retain(|file, _| live_files.contains(file));
+      // Fast path (steady state: every tick): every library fingerprints
+      // identically and the set is unchanged — return without the recopy
+      // below and without touching the on-disk cache.
+      if libs.len() == self.fingerprints.len()
+        && libs.iter().all(|lib| {
+          let key = lib.to_string_lossy();
+          match (
+            dir_fingerprint(&lib.join("steamapps")),
+            self.fingerprints.get(key.as_ref()),
+          ) {
+            (Some(live), Some(known)) => live == *known,
+            _ => false,
+          }
+        })
+      {
+        return;
+      }
+    } else if self.fingerprints.iter().all(|(key, known)| {
+      // Steady tick with no folders change: the same check, straight over
+      // the map — no per-tick `Vec<PathBuf>` nor `to_string_lossy` keys.
+      dir_fingerprint(&Path::new(key).join("steamapps")).is_some_and(|live| live == *known)
+    }) {
+      return;
     } else {
       libs = self.fingerprints.keys().map(PathBuf::from).collect();
-    }
-    // Fast path (steady state: every tick): every library fingerprints
-    // identically and the set is unchanged — the cached prefixes are
-    // current, so return without the O(libs x prefixes) recopy below
-    // and without touching the on-disk cache. Fingerprinting itself is
-    // a handful of stats.
-    if libs.len() == self.fingerprints.len()
-      && libs.iter().all(|lib| {
-        let key = lib.to_string_lossy();
-        match (
-          dir_fingerprint(&lib.join("steamapps")),
-          self.fingerprints.get(key.as_ref()),
-        ) {
-          (Some(live), Some(known)) => live == *known,
-          _ => false,
-        }
-      })
-    {
-      return;
     }
     let mut changed = false;
     let mut fresh_dirs: HashMap<String, String> = HashMap::new();
@@ -611,8 +632,33 @@ impl SteamLibraries {
     self.fingerprints = fresh_fingerprints;
     if changed || fresh_dirs.len() != self.dirs.len() {
       self.dirs = fresh_dirs;
+      self.rebuild_tail_index();
       save_cache(self);
     }
+  }
+
+  /// Derive [`Self::tail_index`] from the current `dirs`: one entry per
+  /// `/steamapps/common/` prefix (empty and `..` tails refused), sorted
+  /// by `(first, tail)`. Called after every `dirs` mutation.
+  fn rebuild_tail_index(&mut self) {
+    let mut entries: Vec<TailEntry> = Vec::new();
+    for (prefix, appid) in &self.dirs {
+      let Some((_, tail)) = prefix.split_once(STEAM_COMMON) else {
+        continue;
+      };
+      let tail = tail.strip_suffix('/').unwrap_or(tail);
+      if tail.is_empty() || has_dotdot_component(tail) {
+        continue;
+      }
+      let first = tail.split('/').next().unwrap_or(tail);
+      entries.push(TailEntry {
+        first: Box::from(first),
+        tail: Box::from(tail),
+        appid: Box::from(appid.as_str()),
+      });
+    }
+    entries.sort_by(|a, b| a.first.cmp(&b.first).then_with(|| a.tail.cmp(&b.tail)));
+    self.tail_index = entries.into_boxed_slice();
   }
 
   /// AppId whose install dir is the longest prefix of `path`. The
@@ -667,27 +713,35 @@ impl SteamLibraries {
       return None;
     }
     let (_, path_tail) = scratch.split_once(STEAM_COMMON)?;
+    // Index hop, lossless by construction: `install_tail_names` only
+    // answers true when both tails share `path_tail`'s first component
+    // (equal or `/`-boundary prefix); the scan below keeps every rule.
+    let first = match path_tail.split_once('/') {
+      Some((head, _)) => head,
+      None => path_tail,
+    };
+    if first.is_empty() {
+      return None;
+    }
+    let start = self
+      .tail_index
+      .partition_point(|entry| entry.first.as_ref() < first);
     let mut best: Option<&str> = None;
     let mut best_len = 0;
     let mut ambiguous = false;
-    for (prefix, appid) in &self.dirs {
-      // Only real installs corroborate; Proton prefixes (`compatdata/`)
-      // are runtime state, not the game's install directory.
-      let Some((_, tail)) = prefix.split_once(STEAM_COMMON) else {
-        continue;
-      };
-      let tail = tail.strip_suffix('/').unwrap_or(tail);
-      if tail.is_empty() || has_dotdot_component(tail) {
+    for entry in self.tail_index[start..]
+      .iter()
+      .take_while(|entry| entry.first.as_ref() == first)
+    {
+      if !install_tail_names(path_tail, &entry.tail) {
         continue;
       }
-      if !install_tail_names(path_tail, tail) {
-        continue;
-      }
-      if tail.len() > best_len {
-        best = Some(appid.as_str());
-        best_len = tail.len();
+      let appid: &str = &entry.appid;
+      if entry.tail.len() > best_len {
+        best = Some(appid);
+        best_len = entry.tail.len();
         ambiguous = false;
-      } else if tail.len() == best_len && best != Some(appid.as_str()) {
+      } else if entry.tail.len() == best_len && best != Some(appid) {
         ambiguous = true;
       }
     }
@@ -704,6 +758,7 @@ impl SteamLibraries {
     let mut dirs = std::mem::take(&mut self.dirs);
     self.scan_library_into(library, &mut dirs);
     self.dirs = dirs;
+    self.rebuild_tail_index();
     let key = library.to_string_lossy().to_string();
     if let Some(fingerprint) = dir_fingerprint(&library.join("steamapps")) {
       self.fingerprints.insert(key, fingerprint);
