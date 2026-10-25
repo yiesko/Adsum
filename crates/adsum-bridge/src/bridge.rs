@@ -892,7 +892,9 @@ async fn persist_task(shared: Arc<Shared>, interval: Duration, token: Cancellati
       biased;
       () = token.cancelled() => break,
       _ = tick.tick() => {
-        if shared.dirty.swap(false, Ordering::SeqCst) {
+        // AcqRel, not SeqCst: the flag is only a wake-up hint — publishers
+        // store it Relaxed, and `persist_now` exchanges data under the cache lock.
+        if shared.dirty.swap(false, Ordering::AcqRel) {
           shared.persist_now().await;
         }
       }

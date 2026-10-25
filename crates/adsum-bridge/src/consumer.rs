@@ -237,14 +237,16 @@ impl Shared {
       return;
     }
     // Serialized once per encoding, and only when a consumer actually
-    // speaks it: the check is "does anyone speak this" rather than "is this
-    // map empty", which is what one map makes natural.
-    let wants_json = consumers
-      .values()
-      .any(|c| c.protocol == BridgeProtocol::Json);
-    let wants_msgpack = consumers
-      .values()
-      .any(|c| c.protocol == BridgeProtocol::MsgPack);
+    // speaks it (not "is this map empty"). One pass answers both questions
+    // (the old two `any()` scans walked the same table twice).
+    let mut wants_json = false;
+    let mut wants_msgpack = false;
+    for consumer in consumers.values() {
+      match consumer.protocol {
+        BridgeProtocol::Json => wants_json = true,
+        BridgeProtocol::MsgPack => wants_msgpack = true,
+      }
+    }
     let json_payload: Option<TextBytes> = if wants_json {
       match serde_json::to_string(cmd) {
         Ok(payload) => Some(TextBytes::from(payload)),
