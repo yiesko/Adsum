@@ -61,13 +61,22 @@ impl ProcessEnumerator for SnapshotEnumerator {
       return false;
     };
     slot.pid = pid;
-    // Path buffer reused: `to_string_lossy` borrows for valid UTF-8 (the
-    // common case), so the copy lands in the slot's own String.
+    // Path buffer reused, folded and anchored AT FILL TIME: kills the
+    // match path's last per-process allocations on Windows (its `Cow`
+    // stays `Borrowed`) with byte-identical probe strings.
     // No exe resolves to the empty path — the historical
     // `exe().unwrap_or(Path::new(""))` shape, minus its allocation.
     slot.path.clear();
     if let Some(exe) = proc.exe() {
-      slot.path.push_str(&exe.to_string_lossy());
+      let text = exe.to_string_lossy();
+      // Anchor on the FOLDED first byte: a leading `\` (UNC) folds to
+      // `/` and is its own anchor — exactly what the old shape did.
+      if !matches!(text.as_bytes().first(), Some(b'/') | Some(b'\\')) {
+        slot.path.push('/');
+      }
+      for ch in text.chars() {
+        slot.path.push(if ch == '\\' { '/' } else { ch });
+      }
     }
     // Arguments buffer reused: take the slot's own String, refill it, put
     // it back. Semantics identical to the historical per-tick rebuild:
