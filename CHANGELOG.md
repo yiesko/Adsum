@@ -7,6 +7,140 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+- **Incremental process table (Linux):** the periodic sweep no longer
+  re-reads and reclassifies every process each tick. A per-pid
+  classification cache (`crates/adsum-detect/src/cache/procs.rs`) records
+  what the EXEC fast path and first-sighting ticks already computed; a
+  tick now enumerates `/proc` for liveness, sweeps the dead, revalidates
+  cached hits (one cmdline read per detected game, so a zombie can never
+  hold a card), and reads + classifies only pids with no current-generation
+  entry. Steady state: zero cmdline reads, zero automaton walks, zero
+  allocations per tick — measured on the bundled database's shape (1062
+  processes): 5.05 → 0.38 ms/tick (−92%), 3152 → 3 allocs/tick, 40.3 KB →
+  54 B/tick of allocator churn, identical detections. Every watcher loss
+  channel (cn_proc sequence gaps via `SeqTracker`, backlog sheds, socket
+  overruns, watcher death AND resubscribe) sets one invalidation flag that
+  costs exactly one full-read tick; bundle swaps invalidate through an
+  epoch carried inside the generation `Arc`, so writers never touch the
+  cache. Watcher disabled/dead, other OSes and one-shot diagnostics keep
+  the classic full sweep, byte-for-byte.
+- **Zero-allocation `/proc` enumeration:** the sweep reads directory
+  records through raw `getdents64` into a reused, 8-byte-aligned arena
+  and parses `d_name` in place, replacing `std::fs::read_dir` — whose
+  iterator allocates per entry internally and whose `DirEntry::file_name()`
+  returns an owned `OsString` (the old code called it twice per pid:
+  filter and loop). Measured: ~3 allocations per `/proc` entry per tick
+  → 0; at 1000 processes that is ~29 MB/h of allocator churn removed,
+  which is what kept the glibc arenas (and the RSS floor between the
+  hourly trims) warm.
+- **Snapshot lane without strings:** `ScannedEntry.id` is now `AppId`
+  (`Arc<str>`) and `.name` is `Arc<str>`, `ProcessDetectedEvent::Removed`
+  carries `AppId`, and the scan loop's snapshot `Vec` is hoisted out of
+  the tick and swapped with the recorded table instead of rebuilt. Per
+  tick with games running: one `String` per hit plus a `Box<str>` copy
+  per removal → zero allocations; the daemon pump's `ScannedGame`
+  construction (two deep string copies per detection) is two refcount
+  bumps. Layout asserts unchanged (`Arc<str>` and `Box<str>` are both
+  16 B).
+- **Hoisted locks and buffers off the hot path:** the exclusions `RwLock`
+  is read once per tick (or per EXEC event) instead of once per process;
+  the dead-pid AppId sweep reuses a caller-owned liveness set (was a
+  fresh `FxHashSet` per tick); `is_suspended` and the bare-exe cwd probe
+  (`read_cwd_into`: raw `readlink`, lowercase in place, joined candidate
+  in a scratch buffer) reuse their path/body buffers — three allocations
+  per bare-exe miss and one per hit removed.
+- **Aux-table arena:** the four `SortedIndex` tables (steam/epic/name/
+  nodot) pack their keys into one contiguous per-generation arena with
+  `(start, end, index)` `u32` slots: binary searches probe contiguous
+  bytes instead of ~20k scattered `Box<str>` allocations (13–39% faster
+  miss-heavy lookups, measured over the real key set), and the per-key
+  malloc headers vanish from every generation. Build order, first-wins
+  ties and lookups are byte-identical (pinned by new unit tests).
+- **Slot reuse on Windows/macOS:** the `sysinfo` enumeration refills the
+  caller's high-water `Exec` slots in place (exe path into the slot's own
+  `String`, argv joined into the recycled arguments buffer) instead of
+  rebuilding the `Vec<Exec>` per tick — ~3 allocations per process per
+  tick removed on those targets, which now also get the sustained-drop
+  slot compaction Linux already had (`compact_slots`, shared).
+- `process_start_ms` off Linux refreshes with
+  `ProcessRefreshKind::nothing()` instead of `everything()`: `start_time`
+  is collected unconditionally per process in sysinfo 0.39, so the old
+  call paid cwd/environ/user/root reads per detection to discard them.
+
+### Changed
+- **File organization: one concern per module.** The near-twin module
+  pairs are gone — `scan.rs` (classification) is now `matching/` with
+  the pipeline in `mod.rs` and its rule families in `normalize` (the one
+  name-folding rule), `paths` (what it means for a declared name to name
+  a path), `args` (borrowed command-line token scans) and `tiers` (the
+  aux match tiers + shared hit tail); the tick orchestration moved from
+  `scanner.rs` to `sweep.rs`; `database.rs` (bundle swaps) became
+  `generations.rs`, leaving `db.rs` as the single wire-model module.
+  `runtime.rs` split into `runtime/{mod,workers,lanes,cadence,loops}` —
+  `start()` reads as lifecycle and the two 150+ line thread closures are
+  named bodies (`run_scan_loop`, `run_refresh_loop`). The reuse-buffer
+  family moved to a top-level `scratch.rs` with a new
+  `EnumerateScratch` group (pid list, getdents arena, liveness/work
+  lists) so the enumeration state no longer rides inside the per-pid
+  reader scratch, and the two per-pid caches grouped under `cache/`
+  (`appid` + `procs`) with their shared trust model documented once.
+  `os_matches` moved beside `OsName` in `types.rs`; `first_sightings` /
+  `apply_ignore_list` moved beside the lanes that consume them. Public
+  paths that embedders use are preserved (`adsum_detect::proc_start`,
+  `runtime::ScanGuard`/`idle_wait`, the `matching::` re-exports); the
+  test tree mirrors the source (`tests/unit/matching/`,
+  `tests/unit/cache/`, `tests/unit/platform/`). No behavior change: the
+  full suite passes untouched, rustdoc is warning-free.
+- **Platform backends behind one seam:** the OS-specific code that was
+  scattered as `#[cfg]` islands inside shared files (six reader pairs in
+  `scan.rs`, two enumerations in `scanner.rs`, the netlink wiring in
+  `runtime.rs`, four arena-release arms in `server.rs`) now lives under
+  `crates/adsum-detect/src/platform/` — `linux/` (`/proc` readers,
+  `getdents64` enumerator, netlink dispatch/watcher), `snapshot/` (the
+  `sysinfo` backend for every non-Linux target), `macos/` (the `.app`
+  bundle-interior shape — deliberately ungated: the tier is data-driven
+  and must run, and be tested, everywhere), `windows/` (documented
+  empty: nothing Windows-only is left in the crate), plus unified
+  `memory.rs` (arena release) and `proc_start.rs` (public path
+  `adsum_detect::proc_start` unchanged). The seam is a static-method
+  `ProcessEnumerator` trait (`traits/enumerator.rs`: `begin_tick` +
+  `read_one`), so the tick orchestration — BOTH the full sweep and the
+  incremental cache — is now 100% cfg-free and runs on every target;
+  the incremental mode is gated only by `cache_mode_live` (watcher
+  enabled AND live), which today can only hold on Linux. No behavior
+  change: the full test suite passes untouched, and the `parse_proc_pid`
+  suite moved with its function.
+
+### Added
+- **SteamAppId tier on Windows and macOS:** `read_steam_app_id` was a
+  `None` stub off Linux, leaving the 57% of database entries with no
+  declared executables without their authoritative tier on those
+  platforms. sysinfo 0.39 reads the environ block on both (PEB through
+  the process handle on Windows, the sysctl arg/env route on macOS); the
+  reader uses a `System` scoped to the call — the shared snapshot never
+  accumulates environ copies — and the existing per-pid memo
+  (`Present`/`Absent`/`Stale` + invalidation sequence) keeps it to one
+  read per process lifetime. Permission-gated processes memoize
+  `Absent`, exactly like an unreadable `/proc/<pid>/environ`.
+- **Steam and Heroic discovery off Linux:** fallback Steam roots now
+  include the registry's `SteamPath` (`HKCU\Software\Valve\Steam` via
+  `reg query` — dependency-free; discovery runs at startup plus every
+  120th tick) and the `Program Files (x86)`/`Program Files` defaults on
+  Windows, and `~/Library/Application Support/Steam` on macOS; Heroic's
+  cached library is found under `%APPDATA%\heroic` (Windows) and
+  `~/Library/Application Support/heroic` (macOS). The
+  `ADSUM_STEAM_ROOT`/`ADSUM_HEROIC_ROOT` overrides stay exclusive.
+  Without these, the Steam-library and `-epicapp` tiers were silently
+  dead off Linux (`$HOME`/XDG shapes do not exist on Windows).
+- `DetectablesBundle` carries a monotonic `epoch` (stamped inside the
+  generation `Arc`, so a reader can never pair it with a foreign
+  bundle): the cache-invalidation signal for refreshes and override
+  edits, costing one full-read tick per swap.
+- `watch()` takes an `invalidate` flag it sets on every loss channel it
+  can observe from inside (sequence gap, shed, `ENOBUFS`); the retry
+  loop sets it on both edges of the watch.
+
 ### Fixed
 - Steam demos whose executable is not in the database (VEIN Demo is the
   motivating case) are now detected when the process runs under the AppId's
