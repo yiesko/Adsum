@@ -8,70 +8,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Performance
-- **Incremental process table (Linux):** the periodic sweep no longer
-  re-reads and reclassifies every process each tick. A per-pid
-  classification cache (`crates/adsum-detect/src/cache/procs.rs`) records
-  what the EXEC fast path and first-sighting ticks already computed; a
-  tick now enumerates `/proc` for liveness, sweeps the dead, revalidates
-  cached hits (one cmdline read per detected game — re-running the
-  matcher whenever the re-read's argv fingerprint drifts, a case the
-  full sweep caught and no EXEC event ever reports, so neither a zombie
-  nor an in-place argv rewrite can hold a card; cached misses rest —
-  re-reading ~1k non-games per tick is the cost this cache exists to
-  avoid, and a rewrite that would turn a miss into a hit surfaces as
-  an EXEC event or a watcher-loss flush —), and reads + classifies
-  only pids with no current-generation entry. Steady state: zero cmdline reads, zero automaton walks, zero
-  allocations per tick — measured on the bundled database's shape (1062
-  processes): 5.05 → 0.38 ms/tick (−92%), 3152 → 3 allocs/tick, 40.3 KB →
-  54 B/tick of allocator churn, identical detections. Every watcher loss
-  channel (cn_proc sequence gaps via `SeqTracker`, backlog sheds, socket
-  overruns, watcher death AND resubscribe) sets one invalidation flag that
-  costs exactly one full-read tick; bundle swaps invalidate through an
-  epoch carried inside the generation `Arc`, so writers never touch the
-  cache. Watcher disabled/dead, other OSes and one-shot diagnostics keep
-  the classic full sweep, byte-for-byte.
-- **Zero-allocation `/proc` enumeration:** the sweep reads directory
-  records through raw `getdents64` into a reused, 8-byte-aligned arena
-  and parses `d_name` in place, replacing `std::fs::read_dir` — whose
-  iterator allocates per entry internally and whose `DirEntry::file_name()`
-  returns an owned `OsString` (the old code called it twice per pid:
-  filter and loop). Measured: ~3 allocations per `/proc` entry per tick
-  → 0; at 1000 processes that is ~29 MB/h of allocator churn removed,
-  which is what kept the glibc arenas (and the RSS floor between the
-  hourly trims) warm.
-- **Snapshot lane without strings:** `ScannedEntry.id` is now `AppId`
-  (`Arc<str>`) and `.name` is `Arc<str>`, `ProcessDetectedEvent::Removed`
-  carries `AppId`, and the scan loop's snapshot `Vec` is hoisted out of
-  the tick and swapped with the recorded table instead of rebuilt. Per
-  tick with games running: one `String` per hit plus a `Box<str>` copy
-  per removal → zero allocations; the daemon pump's `ScannedGame`
-  construction (two deep string copies per detection) is two refcount
-  bumps. Layout asserts unchanged (`Arc<str>` and `Box<str>` are both
-  16 B).
-- **Hoisted locks and buffers off the hot path:** the exclusions `RwLock`
-  is read once per tick (or per EXEC event) instead of once per process;
-  the dead-pid AppId sweep reuses a caller-owned liveness set (was a
-  fresh `FxHashSet` per tick); `is_suspended` and the bare-exe cwd probe
-  (`read_cwd_into`: raw `readlink`, lowercase in place, joined candidate
-  in a scratch buffer) reuse their path/body buffers — three allocations
-  per bare-exe miss and one per hit removed.
+- **Incremental process table (Linux):** a per-pid classification cache
+  (`crates/adsum-detect/src/cache/procs.rs`) replaces the full re-read of
+  every process each tick. A tick now enumerates `/proc` for liveness,
+  sweeps the dead, revalidates cached hits (one cmdline read per detected
+  game; the matcher re-runs if the argv fingerprint drifts) and classifies
+  only new pids. Cached misses are not re-read; a miss that becomes a hit
+  surfaces as an EXEC event or a watcher-loss flush.
+  - Steady state: zero cmdline reads, automaton walks and allocations.
+    On the bundled database shape (1062 processes): 5.05 → 0.38 ms/tick
+    (−92%), 3152 → 3 allocs/tick, 40.3 KB → 54 B/tick of churn.
+  - Every watcher loss channel (`cn_proc` gaps, backlog sheds, socket
+    overruns, watcher death/resubscribe) forces one full-read tick; bundle
+    swaps invalidate through an epoch in the generation `Arc`.
+  - Watcher disabled/dead, other OSes and one-shot diagnostics keep the
+    classic full sweep, byte-for-byte.
+- **Zero-allocation `/proc` enumeration:** raw `getdents64` into a reused,
+  aligned arena replaces `std::fs::read_dir`. ~3 allocations per entry →
+  0 (~29 MB/h of churn removed at 1000 processes), which also keeps the
+  glibc arenas and the RSS floor low.
+- **Allocation-free snapshot lane:** `ScannedEntry.id`/`.name` and
+  `ProcessDetectedEvent::Removed` now use `AppId`/`Arc<str>`, and the scan
+  loop's snapshot `Vec` is reused across ticks. Per tick: zero
+  allocations; the daemon pump's `ScannedGame` construction is two
+  refcount bumps instead of two deep copies.
 - **Aux-table arena:** the four `SortedIndex` tables (steam/epic/name/
-  nodot) pack their keys into one contiguous per-generation arena with
-  `(start, end, index)` `u32` slots: binary searches probe contiguous
-  bytes instead of ~20k scattered `Box<str>` allocations (13–39% faster
-  miss-heavy lookups, measured over the real key set), and the per-key
-  malloc headers vanish from every generation. Build order, first-wins
-  ties and lookups are byte-identical (pinned by new unit tests).
-- **Slot reuse on Windows/macOS:** the `sysinfo` enumeration refills the
-  caller's high-water `Exec` slots in place (exe path into the slot's own
-  `String`, argv joined into the recycled arguments buffer) instead of
-  rebuilding the `Vec<Exec>` per tick — ~3 allocations per process per
-  tick removed on those targets, which now also get the sustained-drop
-  slot compaction Linux already had (`compact_slots`, shared).
-- `process_start_ms` off Linux refreshes with
-  `ProcessRefreshKind::nothing()` instead of `everything()`: `start_time`
-  is collected unconditionally per process in sysinfo 0.39, so the old
-  call paid cwd/environ/user/root reads per detection to discard them.
+  nodot) pack keys into one contiguous per-generation arena. Miss-heavy
+  lookups are 13–39% faster and per-key malloc headers are gone. Build
+  order, first-wins ties and lookups are unchanged (pinned by tests).
+- **Steam install-tail matching:** `match_install_tail_into` binary-searches
+  a precomputed sorted tail index (rebuilt on `dirs` mutation) instead of
+  walking every install prefix per probe, so large libraries no longer
+  multiply each sweep or EXEC storm. Longest-wins and ambiguity refusal
+  are preserved; a parity oracle test compares it with the old linear
+  walk. `refresh_if_stale` now fingerprints over the map in place.
+- **Borrow pass:** five places that copied where a borrow suffices:
+  - `matching`: the command-line AppId fallback no longer wraps the borrowed
+    `&str` in a fresh `AppId` per process per tick.
+  - `cache/appid`: one `AppId` shared by refcount instead of two copies.
+  - `runtime`: first-sighting inserts are refcount bumps, not `to_string()`.
+  - `types/cmd`: `ActivityCmd.cmd` is `Cow<'static, str>`, so synthesized
+    commands borrow their verb (wire format unchanged).
+  - `bridge/handoff`: `is_process_alive` formats `/proc/<pid>` into a stack
+    buffer.
+- **Hoisted locks and buffers:** the exclusions `RwLock` is read once per
+  tick/event instead of per process; the dead-pid sweep, `is_suspended`
+  and `read_cwd_into` reuse caller-owned sets and buffers.
+- **Windows/macOS:** the snapshot enumerator folds `\`→`/` at fill time so
+  `match_process`'s `Cow` stays `Borrowed`; `sysinfo` slots are refilled in
+  place and gain `compact_slots`; `process_start_ms` refreshes with
+  `ProcessRefreshKind::nothing()` instead of `everything()`.
+- **Minor:** `Exclusions.executables` is an `FxHashSet`; the persist gate
+  swaps its dirty flag with `AcqRel` (was `SeqCst`); `broadcast_raw`
+  answers both encoding questions in one pass.
 
 ### Changed
 - **File organization: one concern per module.** The near-twin module
