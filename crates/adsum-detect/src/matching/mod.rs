@@ -54,7 +54,7 @@ pub(crate) use tiers::finish_direct_hit;
 // reachable from here — the lazy readers (which live in `crate::platform`
 // now), the OS-tag rule (which lives in `crate::types` now) and the
 // corroboration seam.
-#[cfg(test)]
+#[cfg(all(target_os = "linux", test))]
 pub(crate) use crate::platform::is_suspended;
 #[cfg(all(target_os = "linux", test))]
 pub(crate) use crate::platform::{read_exec, read_exec_into, read_steam_app_id};

@@ -1,8 +1,11 @@
 use super::*;
 // The buffer types moved to `crate::scratch` (out of the old scan.rs);
 // the leaf suites reach them through this hub's glob like everything
-// else.
-use crate::scratch::{ExecScratch, MatchScratch, SLOT_LOW_TICKS, ScanScratch};
+// else. Three of them serve only the Linux-gated leaves below, so they
+// ride the same gate; `MatchScratch` is used by the ungated leaves too.
+use crate::scratch::MatchScratch;
+#[cfg(target_os = "linux")]
+use crate::scratch::{ExecScratch, SLOT_LOW_TICKS, ScanScratch};
 
 mod epic;
 mod matching;
