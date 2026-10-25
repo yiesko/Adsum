@@ -158,7 +158,9 @@ pub(crate) fn run_scan_loop(server: ProcessServer, wait_time: Duration) {
   // Idle backoff state: consecutive ticks with no games detected.
   let mut idle_ticks: u32 = 0;
   // Game ids already announced this boot (first-sighting INFO below).
-  let mut seen_ids: HashSet<String> = HashSet::new();
+  // `AppId` keys: first-sighting inserts are refcount bumps off the
+  // entries' own ids (see `first_sightings`), never byte copies.
+  let mut seen_ids: HashSet<AppId> = HashSet::new();
   // Last detection snapshot forwarded to the bridge, as sorted
   // (app id, pid) pairs. The bridge dedups repeats internally, so
   // re-sending an identical table every tick only costs wakeups,

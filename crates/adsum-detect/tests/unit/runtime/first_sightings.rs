@@ -22,7 +22,7 @@ fn hit(id: &str) -> ScannedHit {
 /// after churn — the accepted trade for constant memory.
 #[test]
 fn seen_ids_stay_bounded_across_id_churn() {
-  let mut seen: HashSet<String> = HashSet::new();
+  let mut seen: HashSet<AppId> = HashSet::new();
   // Well past the cap, in distinct batches so the clear is reached
   // repeatedly rather than once.
   for batch in 0..(MAX_SEEN_IDS * 3 / 64 + 2) {
@@ -40,7 +40,7 @@ fn seen_ids_stay_bounded_across_id_churn() {
 /// key just to have the insert discard it.
 #[test]
 fn repeat_ids_are_not_first_sightings() {
-  let mut seen: HashSet<String> = HashSet::new();
+  let mut seen: HashSet<AppId> = HashSet::new();
   let batch = vec![hit("a"), hit("b"), hit("a")];
   let first = first_sightings(&mut seen, &batch);
   assert_eq!(first.len(), 2);

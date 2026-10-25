@@ -192,7 +192,7 @@ pub(crate) const MAX_SEEN_IDS: usize = 1024;
 /// id churn. That is the accepted trade for constant memory — the log
 /// line is diagnostic, never state.
 pub fn first_sightings<'a>(
-  seen: &mut HashSet<String>,
+  seen: &mut HashSet<AppId>,
   detected: &'a [ScannedHit],
 ) -> Vec<&'a ScannedHit> {
   if seen.len() >= MAX_SEEN_IDS {
@@ -200,13 +200,13 @@ pub fn first_sightings<'a>(
   }
   let mut first = Vec::new();
   for game in detected {
-    // `contains` first: the common case is a game already seen this boot,
-    // and building the key only for `insert` to discard it allocated for
-    // nothing.
+    // `contains` first: a seen game skips without building the key. The
+    // lookup borrows (`AppId: Borrow<str>`); a genuine first sighting
+    // inserts a refcount bump off the entry's own id, not a `to_string()`.
     if seen.contains(game.entry.id.as_ref()) {
       continue;
     }
-    seen.insert(game.entry.id.to_string());
+    seen.insert(game.entry.id.clone());
     first.push(game);
   }
   first
