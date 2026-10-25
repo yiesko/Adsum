@@ -28,6 +28,25 @@ fn adsum_worker_tasks() -> Vec<String> {
   tasks
 }
 
+/// Drain a joined `adsum-*` thread out of `/proc`'s task views: a thread
+/// whose `join` already returned can still show its task entry for
+/// microseconds (kernel exit reaping in flight), so the leak check polls
+/// up to the deadline — a real leak never drains and still fails.
+#[cfg(target_os = "linux")]
+fn drain_worker_tasks(deadline_ms: u64) -> Vec<String> {
+  let started = std::time::Instant::now();
+  loop {
+    let tasks = adsum_worker_tasks();
+    if tasks.is_empty() {
+      return Vec::new();
+    }
+    if started.elapsed().as_millis() >= deadline_ms as u128 {
+      return tasks;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(10));
+  }
+}
+
 /// Zero-port config: every listener binds ephemeral for hermetic tests.
 fn ephemeral_config() -> RPCConfig {
   RPCConfig::builder()
@@ -126,10 +145,11 @@ async fn run_with_scanner_completes_and_tears_down() {
   .expect("run returns after shutdown")
   .expect("clean shutdown with scanner on");
   #[cfg(target_os = "linux")]
+  let leaked = drain_worker_tasks(2000);
+  #[cfg(target_os = "linux")]
   assert!(
-    adsum_worker_tasks().is_empty(),
-    "no adsum worker may outlive run_until: {:?}",
-    adsum_worker_tasks()
+    leaked.is_empty(),
+    "no adsum worker may outlive run_until: {leaked:?}"
   );
 }
 
@@ -185,12 +205,15 @@ async fn bind_failure_still_tears_down_scanner() {
     result.is_err(),
     "bridge bind into an occupied range must fail"
   );
-  #[cfg(target_os = "linux")]
-  assert!(
-    adsum_worker_tasks().is_empty(),
-    "no adsum worker may outlive a failed run_until: {:?}",
-    adsum_worker_tasks()
-  );
+  {
+    #[cfg(target_os = "linux")]
+    let leaked = drain_worker_tasks(2000);
+    #[cfg(target_os = "linux")]
+    assert!(
+      leaked.is_empty(),
+      "no adsum worker may outlive a failed run_until: {leaked:?}"
+    );
+  }
 }
 
 /// Dropping the `run_until` future (caller abandonment via abort: the
