@@ -629,9 +629,10 @@ pub struct ThirdPartySku {
 /// matching runs as one `RegexSet` (single pass, linear-time DFA).
 #[derive(Clone, Debug, Default)]
 pub struct Exclusions {
-  /// Lowercased basenames, exact match (hash set: consulted per process
-  /// per tick, so O(1) instead of a linear scan over two dozen names).
-  pub executables: std::collections::HashSet<String>,
+  /// Lowercased basenames, exact match — FxHash like every other hot
+  /// scanner map: consulted once per process per FULL tick, where
+  /// SipHash's DoS resistance buys nothing against a local feed.
+  pub executables: rustc_hash::FxHashSet<String>,
   /// Case-insensitive set over the surviving patterns.
   pub patterns: regex::RegexSet,
 }

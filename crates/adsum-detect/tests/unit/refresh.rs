@@ -1,11 +1,11 @@
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 
 use super::*;
 
 /// Exclusions fixture with one executable and no patterns.
 fn full_exclusions() -> Exclusions {
   Exclusions {
-    executables: HashSet::from(["setup.exe".to_string()]),
+    executables: FxHashSet::from_iter(["setup.exe".to_string()]),
     patterns: regex::RegexSet::empty(),
   }
 }
@@ -13,7 +13,7 @@ fn full_exclusions() -> Exclusions {
 /// Empty exclusions fixture (blocks nothing).
 fn empty_exclusions() -> Exclusions {
   Exclusions {
-    executables: HashSet::new(),
+    executables: FxHashSet::default(),
     patterns: regex::RegexSet::empty(),
   }
 }
