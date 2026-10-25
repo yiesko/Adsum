@@ -322,7 +322,7 @@ pub(crate) const MAX_TRACKED_PIDS: usize = 16;
 pub(crate) fn clear_for_slot(published: &PublishedSlot) -> ActivityCmd {
   ActivityCmd {
     application_id: published.app_id.clone(),
-    cmd: "SET_ACTIVITY".to_string(),
+    cmd: std::borrow::Cow::Borrowed("SET_ACTIVITY"),
     data: None,
     evt: None,
     args: Some(ActivityCmdArgs {

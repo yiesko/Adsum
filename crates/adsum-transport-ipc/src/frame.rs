@@ -207,7 +207,7 @@ fn send_close(stream: &mut impl Write, code: u16, message: &str) {
 pub fn send_empty(sink: &EventSink, pid: u64) {
   tracing::info!("[ipc] Sending empty activity");
   let activity = ActivityCmd {
-    cmd: "SET_ACTIVITY".to_string(),
+    cmd: std::borrow::Cow::Borrowed("SET_ACTIVITY"),
     args: Some(ActivityCmdArgs {
       activity: Some(None),
       code: None,
@@ -400,7 +400,7 @@ fn on_close(ipc: &mut dyn IpcFacilitator) {
   tracing::info!("[ipc] Recieved close");
   let activity_cmd = ActivityCmd {
     application_id: Some(ipc.client_id()),
-    cmd: "SET_ACTIVITY".to_string(),
+    cmd: std::borrow::Cow::Borrowed("SET_ACTIVITY"),
     data: None,
     evt: None,
     args: Some(ActivityCmdArgs {
@@ -458,7 +458,7 @@ fn on_frame(ipc: &mut dyn IpcFacilitator, stream: &mut (impl Read + Write), mess
       return false;
     }
   };
-  match activity_cmd.cmd.as_str() {
+  match activity_cmd.cmd.as_ref() {
     // Subscriptions are acknowledged locally (arRPC parity): there is
     // no voice/guild backend to subscribe to, and forwarding them
     // would fake-subscribe bridge clients. pid 0 on these frames is

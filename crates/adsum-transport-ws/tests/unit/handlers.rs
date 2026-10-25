@@ -11,7 +11,7 @@ use super::*;
 fn a_browser_echo_flattens_args_into_data() {
   let event = ActivityCmd {
     application_id: Some(AppId::from("app-1")),
-    cmd: "INVITE_BROWSER".to_string(),
+    cmd: "INVITE_BROWSER".into(),
     args: Some(ActivityCmdArgs {
       pid: Some(3),
       activity: None,
@@ -42,7 +42,7 @@ fn a_browser_echo_flattens_args_into_data() {
 fn a_browser_echo_without_args_has_no_data() {
   let event = ActivityCmd {
     application_id: None,
-    cmd: "DEEP_LINK".to_string(),
+    cmd: "DEEP_LINK".into(),
     args: None,
     data: None,
     evt: None,
@@ -65,7 +65,7 @@ fn a_browser_echo_without_args_has_no_data() {
 fn a_browser_echo_omits_absent_arg_keys() {
   let event = ActivityCmd {
     application_id: Some(AppId::from("app-1")),
-    cmd: "GIFT_CODE_BROWSER".to_string(),
+    cmd: "GIFT_CODE_BROWSER".into(),
     args: Some(ActivityCmdArgs {
       pid: None,
       activity: None,
@@ -176,7 +176,7 @@ fn fixture_user() -> RpcUser {
 fn get_user_cmd(user_id: Option<String>) -> ActivityCmd {
   ActivityCmd {
     application_id: None,
-    cmd: "GET_USER".to_string(),
+    cmd: "GET_USER".into(),
     args: Some(ActivityCmdArgs {
       pid: None,
       activity: None,

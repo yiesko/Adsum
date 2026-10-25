@@ -23,7 +23,10 @@ pub struct ActivityPayload {
 #[serde(rename_all = "snake_case")]
 pub struct ActivityCmd {
   pub application_id: Option<AppId>,
-  pub cmd: String,
+  /// Command verb (`SET_ACTIVITY`, `DISPATCH`, …). `Cow<'static, str>`:
+  /// network-parsed commands own their verb; every command the daemon
+  /// SYNTHESIZES borrows a `&'static str` instead of copying it per event.
+  pub cmd: std::borrow::Cow<'static, str>,
   pub args: Option<ActivityCmdArgs>,
   pub data: Option<HashMap<String, Value>>,
   pub evt: Option<String>,
@@ -35,7 +38,7 @@ impl ActivityCmd {
   pub fn empty() -> Self {
     Self {
       application_id: None,
-      cmd: "".to_string(),
+      cmd: std::borrow::Cow::Borrowed(""),
       args: None,
       data: None,
       evt: None,

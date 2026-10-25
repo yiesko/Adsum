@@ -52,7 +52,7 @@ fn slot(pid: u64) -> handlers::PublishedSlot {
 fn big_publish(pid: u64) -> ActivityCmd {
   ActivityCmd {
     application_id: Some(AppId::from("app-1")),
-    cmd: "SET_ACTIVITY".to_string(),
+    cmd: "SET_ACTIVITY".into(),
     data: None,
     evt: None,
     args: Some(ActivityCmdArgs {

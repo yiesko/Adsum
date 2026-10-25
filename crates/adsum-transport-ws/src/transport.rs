@@ -93,7 +93,7 @@ impl PendingClear {
   fn into_cmd(self) -> ActivityCmd {
     ActivityCmd {
       application_id: self.app_id,
-      cmd: "SET_ACTIVITY".to_string(),
+      cmd: std::borrow::Cow::Borrowed("SET_ACTIVITY"),
       data: None,
       evt: None,
       args: Some(ActivityCmdArgs {
@@ -1110,7 +1110,7 @@ async fn on_message(
     if event.cmd == "SET_ACTIVITY" {
       return;
     }
-    match event.cmd.as_str() {
+    match event.cmd.as_ref() {
       "INVITE_BROWSER" | "GUILD_TEMPLATE_BROWSER" | "GIFT_CODE_BROWSER" => {
         if !secondary_events {
           return;

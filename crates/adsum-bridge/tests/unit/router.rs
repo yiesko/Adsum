@@ -248,7 +248,7 @@ async fn a_clear_does_not_reuse_a_sequence() {
 
   let clear = ActivityCmd {
     application_id: Some(adsum_types::AppId::from("app-1")),
-    cmd: "SET_ACTIVITY".to_string(),
+    cmd: "SET_ACTIVITY".into(),
     data: None,
     evt: None,
     args: Some(adsum_types::cmd::ActivityCmdArgs {
