@@ -26,7 +26,6 @@ use crate::platform::read_cwd_into;
 use crate::scratch::{ProbeBufs, ScanScratch};
 use crate::server::ProcessServer;
 use crate::types::{DetectSource, Exec, ScannedEntry, ScannedHit};
-use adsum_types::AppId;
 
 mod args;
 mod normalize;
@@ -525,17 +524,17 @@ impl ProcessServer {
         // The AppId comes memoized (one environ read per process
         // lifetime); cmdline fallback when environ is unreadable
         // (sandboxed Proton runtimes hide it from service contexts).
-        let app_id = self.cached_app_id(process.pid, &mut scratch.exec_scratch);
-        let (app_id, via_cmdline) = match app_id {
-          Some(id) => (Some(id), false),
-          // Owned copy: only paid when environ is unreadable (sandboxed
-          // Proton), so the common paths stay borrow-only.
-          None => (
-            app_id_from_args(process.arguments.as_deref()).map(AppId::from),
-            true,
-          ),
-        };
-        if via_cmdline && let Some(id) = app_id.as_deref() {
+        let memoized = self.cached_app_id(process.pid, &mut scratch.exec_scratch);
+        // The fallback stays a BORROW: `app_id_from_args` already hands
+        // back a &str — wrapping it in an `AppId` (old shape) copied bytes
+        // per Proton process per tick for nothing; one `Option<&str>` below.
+        let from_args = memoized
+          .is_none()
+          .then(|| app_id_from_args(process.arguments.as_deref()))
+          .flatten();
+        let via_cmdline = memoized.is_none() && from_args.is_some();
+        let app_id: Option<&str> = memoized.as_deref().or(from_args);
+        if via_cmdline && let Some(id) = app_id {
           tracing::debug!(
             "[Process Scanner] AppId {} for pid {} from command line (environ unreadable)",
             id,
@@ -545,7 +544,7 @@ impl ProcessServer {
         // Independent install-dir evidence: the path sits under the AppId's
         // own `steamapps/common/<installdir>/`. Skipped without an AppId,
         // and the comparison stays under the lock, so nothing is cloned.
-        let install_dir_corroborated = app_id.as_deref().is_some_and(|id| {
+        let install_dir_corroborated = app_id.is_some_and(|id| {
           self.steam_install_tail_matches_app_id_into(
             lowered,
             id,
@@ -558,7 +557,7 @@ impl ProcessServer {
           process.pid,
           &mut scratch.match_scratch.stat,
           &SteamIdLookup {
-            app_id: app_id.as_deref(),
+            app_id,
             process_path: lowered,
             source: DetectSource::SteamAppId,
             steam_map: &bundle.steam_map,
@@ -620,7 +619,7 @@ impl ProcessServer {
         // game, so its own exe/folder name beats install location; a
         // small unknown id is a real game missing from the DB, where
         // location (Steam's ground truth) still beats name guessing.
-        let non_steam = app_id.as_deref().is_some_and(is_shortcut_id);
+        let non_steam = app_id.is_some_and(is_shortcut_id);
         // A refusal already happened: an automaton saw a declared name in
         // this path that did not name it. The name rules are deliberately
         // looser, and answering after one would hand the hit back over the

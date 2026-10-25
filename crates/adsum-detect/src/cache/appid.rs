@@ -71,17 +71,20 @@ impl ProcessServer {
       None if seq0 == 0 => true,
       _ => false,
     };
+    // One refcounted id for BOTH the memo and the caller: the fresh read
+    // used to build two `AppId`s (one for `Present`, one for the return),
+    // paying the byte copy twice per process lifetime.
+    let app = id.map(AppId::from);
     if fresh {
-      let memo = match id.as_ref() {
-        Some(id) => AppIdMemo::Present(seq0, AppId::from(id.as_str())),
+      let memo = match &app {
+        Some(id) => AppIdMemo::Present(seq0, id.clone()),
         None => AppIdMemo::Absent(seq0),
       };
       cache.insert(pid, memo);
     }
-    // The miss path still owns a `String` from the environ read; wrap it
-    // for the caller rather than changing the reader's shape. A hit that
-    // reached here (not `fresh`) re-wraps its own `String` once.
-    id.map(AppId::from)
+    // Wrapping here (not in the reader) keeps the platform seam a plain
+    // `Option<String>`; a non-`fresh` hit returns this single wrap.
+    app
   }
 
   /// Drop memoized AppIds of pids that died since the last tick: pid
