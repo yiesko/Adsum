@@ -163,12 +163,33 @@ only while the event watcher is live). On top of that, a netlink `cn_proc`
 watcher receives `EXEC` and `EXIT` events from the kernel, so a game appears
 the moment it starts and clears the moment it exits.
 
+While the watcher is live, polling runs **incrementally**: each pid's
+classification is computed once — by the `EXEC` fast path or by the tick
+that first sees the process — and cached. A tick then enumerates `/proc`
+for liveness (a raw `getdents64` sweep, zero allocations), drops entries
+whose process died, revalidates the handful of cached *hits* with one
+cmdline read each (so a process that zombied between ticks can never hold
+a card), and re-reads + reclassifies only pids whose cache entry is missing
+or was classified against an older database generation. A steady tick
+performs no cmdline reads, no automaton walks and no allocations at all.
+
+The cache is never trusted past its evidence. Every channel that can lose
+an `EXEC`/`EXIT` invalidates it wholesale: kernel sequence gaps, backlog
+sheds and socket overruns flag the next tick to re-read everything, the
+watcher flags both its death and its resubscribe, and a database refresh
+(or override edit) invalidates by generation — each case costs exactly one
+full-read tick, then the cache rebuilds itself. When the watcher is
+disabled, not live, or the platform has no watcher at all (Windows,
+macOS), every tick is the classic full sweep: enumerate, read every
+cmdline, classify every process. Liveness itself always comes from the
+fresh enumeration, never from the cache.
+
 The kernel delivery is officially lossy, so the watcher is best-effort: it
 can rarely go silent for stretches. When its self-test fails it resubscribes
 instead of dying, and polling backstops everything either way. Use
 `--no-proc-events` / `ADSUM_NO_PROC_EVENTS=1` to disable the watcher and
-run polling only, or `-n` / `--no-process-scan` to disable detection
-entirely.
+run polling only (which also disables the incremental cache), or `-n` /
+`--no-process-scan` to disable detection entirely.
 
 ## IPC-wins handoff (generic card vs. companion)
 
