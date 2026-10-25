@@ -77,7 +77,24 @@ pub fn is_process_alive(pid: u64) -> bool {
   }
   #[cfg(target_os = "linux")]
   {
-    std::path::Path::new(&format!("/proc/{pid}")).exists()
+    use std::os::unix::ffi::OsStrExt;
+    // The pid renders into a stack buffer ("/proc/" + ≤20 digits fits in
+    // 32): the probe can fire several times per clear/resume sequence,
+    // and the old `format!` was its only allocation.
+    let mut buf = [0u8; 32];
+    let mut end = buf.len();
+    let mut rest = pid;
+    loop {
+      end -= 1;
+      buf[end] = b'0' + (rest % 10) as u8;
+      rest /= 10;
+      if rest == 0 {
+        break;
+      }
+    }
+    end -= 6;
+    buf[end..end + 6].copy_from_slice(b"/proc/");
+    std::path::Path::new(std::ffi::OsStr::from_bytes(&buf[end..])).exists()
   }
   #[cfg(all(unix, not(target_os = "linux")))]
   {
