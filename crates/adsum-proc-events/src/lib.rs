@@ -540,7 +540,11 @@ fn self_test(fd: i32, stop: &AtomicBool) -> SelfTestReport {
 /// Linux only: other platforms get a stub that always refuses (the
 /// periodic scan is the only path there).
 #[cfg(target_os = "linux")]
-pub fn watch(events: &GaugeSender<ProcEvent>, stop: &AtomicBool) -> Result<(), String> {
+pub fn watch(
+  events: &GaugeSender<ProcEvent>,
+  stop: &AtomicBool,
+  invalidate: &AtomicBool,
+) -> Result<(), String> {
   // Preset stop skips subscribe, self-test and the blocking receive
   // entirely: shutdown before the first watch must not touch netlink.
   if stop.load(Ordering::Acquire) {
@@ -610,8 +614,12 @@ pub fn watch(events: &GaugeSender<ProcEvent>, stop: &AtomicBool) -> Result<(), S
         continue;
       }
       // Overrun under burst load drops events but the socket stays valid:
-      // stay subscribed, polling backstops the gap.
+      // stay subscribed, polling backstops the gap. The drop means
+      // EXEC/EXIT invalidations were lost, so any per-pid classification
+      // cache the caller keeps must be flushed — the flag is exactly that
+      // signal (the periodic full sweep remains the source of truth).
       if err.raw_os_error() == Some(libc::ENOBUFS) {
+        invalidate.store(true, Ordering::Release);
         continue;
       }
       unsafe {
@@ -643,17 +651,30 @@ pub fn watch(events: &GaugeSender<ProcEvent>, stop: &AtomicBool) -> Result<(), S
     // whole (usually single-message) datagram costs nothing measurable.
     let bytes = &buf[..received as usize];
     let mut gone = false;
+    let missed_before = seqs.missed();
     forward_proc_events(bytes, &mut seqs, &mut |event| {
       // Shed under burst load stays subscribed (counted upstream, polling
-      // backstops it); only a gone receiver ends the watch.
+      // backstops it); only a gone receiver ends the watch. A shed event
+      // is a LOST invalidation, though: flag the caller's cache dirty so
+      // the next sweep re-reads everything instead of trusting the gap.
       match events.send_checked(event, MAX_WATCH_BACKLOG) {
         SendChecked::Closed => {
           gone = true;
           false
         }
-        SendChecked::Sent | SendChecked::Shed => true,
+        SendChecked::Shed => {
+          invalidate.store(true, Ordering::Release);
+          true
+        }
+        SendChecked::Sent => true,
       }
     });
+    // A sequence gap is the kernel's own drop signal (silent loss under
+    // memory pressure): same consequence as a shed — invalidations may
+    // have vanished, so the cache must not be trusted next tick.
+    if seqs.missed() > missed_before {
+      invalidate.store(true, Ordering::Release);
+    }
     if gone {
       // Receiver gone (daemon shutting down): quiet exit.
       unsafe {
@@ -670,6 +691,7 @@ pub fn watch(events: &GaugeSender<ProcEvent>, stop: &AtomicBool) -> Result<(), S
 pub fn watch(
   _events: &adsum_telemetry::GaugeSender<ProcEvent>,
   stop: &AtomicBool,
+  _invalidate: &AtomicBool,
 ) -> Result<(), String> {
   if stop.load(Ordering::Acquire) {
     return Ok(());

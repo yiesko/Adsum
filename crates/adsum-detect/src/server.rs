@@ -17,8 +17,10 @@ use sysinfo::System;
 
 use crate::bundle::{DetectablesBundle, initial_bundle};
 use crate::cache::AppIdMemo;
+use crate::cache::ProcCache;
 use crate::db::{DetectableActivity, Exclusions};
 use crate::heroic::HeroicApps;
+use crate::platform::memory::release_parse_arenas;
 use crate::refresh::RefreshConfig;
 use crate::types::{ProcessDetectedEvent, ProcessEventListeners};
 
@@ -116,9 +118,9 @@ pub struct ProcessServer {
   /// on/off. Plain bool (no lock needed: written once via
   /// [`ProcessServer::set_proc_events`] before [`ProcessServer::start`],
   /// read once there). `true` unless `--no-proc-events` opted out.
-  /// Linux-only read (other platforms have no watcher); the allow keeps
-  /// cross-platform builds warning-free.
-  #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+  /// Read on every target: it gates `cache_mode_live`, which is what
+  /// keeps the incremental mode (and thus the cache) off wherever no
+  /// watcher exists to invalidate it.
   pub enable_proc_events: bool,
   /// Whether the watcher socket is currently believed up. Set around the
   /// blocking `watch()` call (Linux only); read every scan tick to gate
@@ -133,65 +135,24 @@ pub struct ProcessServer {
   /// and without the watcher having to mirror anything. `None` until
   /// `start` runs a Linux watcher.
   pub(crate) watch_gauge: Arc<Mutex<Option<adsum_telemetry::QueueGauge>>>,
+  /// Per-pid classification cache of the incremental scan mode: one
+  /// entry per live pid, swept against the enumerated set every tick,
+  /// flushed on any watcher loss signal (see the `cache::procs` module
+  /// docs for the full invalidation matrix). Consulted on every target
+  /// by the shared tick orchestration; only Linux can currently reach
+  /// the incremental branch (`cache_mode_live` needs the netlink
+  /// watcher), so elsewhere it simply stays empty.
+  pub(crate) proc_cache: Arc<Mutex<ProcCache>>,
+  /// Invalidation flag set by the watcher on every loss channel it can
+  /// observe (sequence gap, backlog shed, socket overrun, death and
+  /// resubscribe): the next tick consumes it and flushes the cache, so
+  /// a lost EXEC can never leave a stale classification trusted. Plain
+  /// flag (set from one thread, consumed by the scan loop).
+  pub(crate) cache_dirty: Arc<AtomicBool>,
 
   #[cfg(not(target_os = "linux"))]
   pub(crate) sysinfo: Arc<Mutex<System>>,
 }
-
-/// Return one-time parse arenas (fetch body, JSON DOM, trimmed copy,
-/// automaton build scratch) to the OS. Steady state is the lean
-/// structures only; without this, the allocator holds the startup spike
-/// as RSS indefinitely. Called after the initial build and every hourly
-/// rebuild (refresh cadence itself is unchanged). Shared with the
-/// database module, which rebuilds generations on the same path.
-pub(crate) fn release_parse_arenas() {
-  release_platform_arenas();
-}
-
-/// Linux (glibc/musl).
-#[cfg(target_os = "linux")]
-fn release_platform_arenas() {
-  // SAFETY: malloc_trim only advises the allocator to release free pages;
-  // it cannot invalidate live allocations, so it is always safe to call.
-  unsafe {
-    libc::malloc_trim(0);
-  }
-}
-
-/// macOS: drain purgeable memory in all zones.
-#[cfg(target_os = "macos")]
-fn release_platform_arenas() {
-  // Declared locally: libc 0.2 exposes only the zone-struct field, not
-  // this stable Darwin function (malloc/malloc.h, present since 10.6).
-  // `core::ffi` types keep this branch dependency-free (`libc` is only a
-  // Linux dependency of this crate).
-  unsafe extern "C" {
-    /// Advisory purge of malloc zones (NULL zone = all zones, goal 0 = no target).
-    fn malloc_zone_pressure_relief(zone: *mut core::ffi::c_void, goal: usize) -> usize;
-  }
-  // SAFETY: (NULL, 0) means "all zones, no goal" and is advisory-only;
-  // it cannot invalidate live allocations.
-  unsafe {
-    malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
-  }
-}
-
-/// Windows: compact our own process heap.
-#[cfg(target_os = "windows")]
-fn release_platform_arenas() {
-  // SAFETY: HeapCompact with flags=0 only coalesces free blocks of the
-  // given heap; it cannot invalidate live allocations.
-  unsafe {
-    let heap = winapi::um::heapapi::GetProcessHeap();
-    if !heap.is_null() {
-      winapi::um::heapapi::HeapCompact(heap, 0);
-    }
-  }
-}
-
-/// Other platforms: nothing to release through a stable API.
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn release_platform_arenas() {}
 
 impl Clone for ProcessServer {
   /// Share every handle (generation pointer, channels, caches, locks).
@@ -221,6 +182,8 @@ impl Clone for ProcessServer {
       enable_proc_events: self.enable_proc_events,
       watcher_live: Arc::clone(&self.watcher_live),
       watch_gauge: Arc::clone(&self.watch_gauge),
+      proc_cache: Arc::clone(&self.proc_cache),
+      cache_dirty: Arc::clone(&self.cache_dirty),
       #[cfg(not(target_os = "linux"))]
       sysinfo: Arc::clone(&self.sysinfo),
     }
@@ -277,6 +240,8 @@ impl ProcessServer {
       enable_proc_events: true,
       watcher_live: Arc::new(AtomicBool::new(false)),
       watch_gauge: Arc::new(Mutex::new(None)),
+      proc_cache: Arc::new(Mutex::new(ProcCache::default())),
+      cache_dirty: Arc::new(AtomicBool::new(false)),
       exclusions: Arc::new(RwLock::new(Exclusions::default())),
       steam_libraries: Arc::new(RwLock::new(SteamLibraries::discover())),
       heroic_apps: Arc::new(RwLock::new(HeroicApps::discover())),
@@ -301,6 +266,15 @@ impl ProcessServer {
   /// before [`ProcessServer::start`]). Polling continues either way.
   pub fn set_proc_events(&mut self, enable: bool) {
     self.enable_proc_events = enable;
+  }
+
+  /// Read guard over the current exclusion set, poison-tolerant like
+  /// every other hot-path lock. Callers hoist it: one guard per scan
+  /// tick (or per EXEC event) instead of one per process — the set is
+  /// rewritten hourly at most, so nothing observable can move under a
+  /// held guard.
+  pub fn exclusions_read(&self) -> std::sync::RwLockReadGuard<'_, Exclusions> {
+    self.exclusions.read().unwrap_or_else(|e| e.into_inner())
   }
 }
 

@@ -6,6 +6,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use adsum_types::AppId;
+
 use crate::db::DetectableActivity;
 
 #[derive(Default, Clone)]
@@ -41,8 +43,12 @@ pub enum ProcessDetectedEvent {
   /// Carries the last-known app id + pid so the bridge can clear exactly
   /// that card without flapping co-running games.
   Removed {
-    /// Application id of the vanished slot.
-    id: Box<str>,
+    /// Application id of the vanished slot. `AppId` (an `Arc<str>`
+    /// newtype): the snapshot lane already holds the id refcounted, so
+    /// the event clones a refcount instead of copying the bytes (the
+    /// old `Box<str>` copied per removal), and the bridge's
+    /// `ProcInput::Removed(AppId, _)` adopts it without conversion.
+    id: AppId,
     /// Last-known pid (for the empty payload + logs).
     pid: u64,
   },
@@ -64,7 +70,7 @@ impl ProcessDetectedEvent {
 
   /// A per-slot clear for a vanished snapshot entry.
   #[must_use]
-  pub fn removed(id: Box<str>, pid: u64) -> Self {
+  pub fn removed(id: AppId, pid: u64) -> Self {
     Self::Removed { id, pid }
   }
 }
@@ -152,8 +158,15 @@ impl OsName {
 /// matchers read them.
 #[derive(Clone, Debug)]
 pub struct ScannedEntry {
-  pub id: Box<str>,
-  pub name: Box<str>,
+  /// Refcounted like the bridge's `ScannedGame.id`: the detection
+  /// boundary (`daemon.rs` pump) clones a refcount instead of copying
+  /// the bytes out of a `Box<str>` per detection, and the snapshot lane
+  /// reuses the same allocation per tick (see `AppId`).
+  pub id: AppId,
+  /// Refcounted for the same reason (`ScannedGame.name` adopts it by
+  /// clone). Both fields stay 16 bytes: `Arc<str>` and `Box<str>` are
+  /// both fat pointers, so the layout assert below is unchanged.
+  pub name: Arc<str>,
   /// Boxed slices, not `Vec`: the generation is built once and then never
   /// grows, shrinks or mutates these. `Box<[T]>` drops the excess capacity
   /// a `Vec` may carry and shrinks each field by a pointer on 64-bit,
@@ -172,8 +185,8 @@ impl ScannedEntry {
   /// [`from_owned`](ScannedEntry::from_owned) for owned batches.
   pub fn from_activity(activity: &DetectableActivity) -> Self {
     Self {
-      id: activity.id.clone().into_boxed_str(),
-      name: activity.name.clone().into_boxed_str(),
+      id: AppId::from(activity.id.clone()),
+      name: Arc::from(activity.name.as_str()),
       executables: activity
         .executables
         .as_ref()
@@ -250,8 +263,11 @@ impl ScannedEntry {
       }
     }
     Self {
-      id: activity.id.into_boxed_str(),
-      name: activity.name.into_boxed_str(),
+      // `Arc<str>` from `String` copies into the refcounted layout (one
+      // small copy per entry per generation, build-time only); every
+      // later hop — hit, event, bridge — is a refcount bump.
+      id: AppId::from(activity.id),
+      name: Arc::from(activity.name.as_str()),
       executables: activity
         .executables
         .unwrap_or_default()
@@ -274,6 +290,16 @@ impl ScannedEntry {
         .collect::<Vec<_>>()
         .into_boxed_slice(),
     }
+  }
+}
+
+/// Whether a database `os` tag applies on this build (unknown platforms match all).
+pub(crate) fn os_matches(os: &str) -> bool {
+  match std::env::consts::OS {
+    "windows" => os == "win32",
+    "macos" => os == "darwin",
+    "linux" => os == "linux",
+    _ => true,
   }
 }
 

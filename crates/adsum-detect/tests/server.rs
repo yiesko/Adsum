@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use adsum_detect::db::DetectableActivity;
 use adsum_detect::refresh::RefreshConfig;
-use adsum_detect::scan::ScanScratch;
+use adsum_detect::scratch::ScanScratch;
 use adsum_detect::server::ProcessServer;
 use adsum_detect::types::{Exec, ProcessEventListeners};
 
@@ -44,8 +44,7 @@ fn append_swaps_in_a_new_classifying_generation() {
   // A new Arc: readers holding `before` keep a consistent old snapshot.
   assert!(!Arc::ptr_eq(&before, &after));
 
-  let mut variant_bufs: [String; 5] = Default::default();
-  let mut reversed = String::with_capacity(256);
+  let excl = server.exclusions_read();
   let mut obs_open = false;
   let mut scratch = ScanScratch::default();
   let hit = server
@@ -56,8 +55,7 @@ fn append_swaps_in_a_new_classifying_generation() {
         arguments: None,
       },
       &after,
-      &mut variant_bufs,
-      &mut reversed,
+      &excl,
       &mut obs_open,
       &mut scratch,
     )
@@ -72,8 +70,7 @@ fn remove_by_name_drops_the_generation_entry() {
   server.append_detectables(custom_db());
   server.remove_detectable_by_name("Swap Game");
   let bundle = server.bundle();
-  let mut variant_bufs: [String; 5] = Default::default();
-  let mut reversed = String::with_capacity(256);
+  let excl = server.exclusions_read();
   let mut obs_open = false;
   let mut scratch = ScanScratch::default();
   assert!(
@@ -85,8 +82,7 @@ fn remove_by_name_drops_the_generation_entry() {
           arguments: None
         },
         &bundle,
-        &mut variant_bufs,
-        &mut reversed,
+        &excl,
         &mut obs_open,
         &mut scratch,
       )
@@ -110,8 +106,7 @@ fn match_scratch_reuses_lowered_buffer() {
     vec![],
   );
   let bundle = server.bundle();
-  let mut variant_bufs: [String; 5] = Default::default();
-  let mut reversed = String::with_capacity(256);
+  let excl = server.exclusions_read();
   let mut obs_open = false;
   let mut scratch = ScanScratch::default();
   // AC misses (`othergame.exe` ≠ `swapgame.exe`); the folder fallback
@@ -125,20 +120,18 @@ fn match_scratch_reuses_lowered_buffer() {
   let classify = |server: &ProcessServer,
                   exec: &Exec,
                   bundle: &std::sync::Arc<adsum_detect::bundle::DetectablesBundle>,
-                  variant_bufs: &mut [String; 5],
-                  reversed: &mut String,
+                  excl: &adsum_detect::db::Exclusions,
                   obs_open: &mut bool,
                   scratch: &mut ScanScratch| {
     server
-      .match_process(exec, bundle, variant_bufs, reversed, obs_open, scratch)
+      .match_process(exec, bundle, excl, obs_open, scratch)
       .is_some()
   };
   assert!(classify(
     &server,
     &exec,
     &bundle,
-    &mut variant_bufs,
-    &mut reversed,
+    &excl,
     &mut obs_open,
     &mut scratch
   ));
@@ -154,8 +147,7 @@ fn match_scratch_reuses_lowered_buffer() {
     &server,
     &exec,
     &bundle,
-    &mut variant_bufs,
-    &mut reversed,
+    &excl,
     &mut obs_open,
     &mut scratch
   ));

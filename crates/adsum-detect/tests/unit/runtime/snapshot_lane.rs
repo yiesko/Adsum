@@ -66,13 +66,13 @@ fn a_gone_receiver_reports_closed() {
 /// slipped straight past them.
 #[test]
 fn a_shed_tick_keeps_the_recorded_table() {
-  let mut recorded: Vec<(String, u64)> = vec![("a".into(), 1)];
-  let snapshot: Vec<(String, u64)> = vec![("b".into(), 2)];
+  let mut recorded: Vec<(AppId, u64)> = vec![("a".into(), 1)];
+  let mut snapshot: Vec<(AppId, u64)> = vec![("b".into(), 2)];
 
-  let delivery = advance_snapshot_lane(&mut recorded, snapshot.clone(), |removed| {
+  let delivery = advance_snapshot_lane(&mut recorded, &mut snapshot, |removed| {
     assert_eq!(
       removed,
-      &[("a".to_string(), 1)],
+      &[(AppId::from("a"), 1)],
       "delta from the recorded table"
     );
     SnapshotDelivery::Shed
@@ -81,8 +81,13 @@ fn a_shed_tick_keeps_the_recorded_table() {
   assert_eq!(delivery, SnapshotDelivery::Shed);
   assert_eq!(
     recorded,
-    vec![("a".to_string(), 1)],
+    vec![(AppId::from("a"), 1)],
     "a shed tick must not advance the recorded table"
+  );
+  assert_eq!(
+    snapshot,
+    vec![(AppId::from("b"), 2)],
+    "a shed tick must keep the undelivered table in the scratch buffer"
   );
 }
 
@@ -90,15 +95,21 @@ fn a_shed_tick_keeps_the_recorded_table() {
 /// next tick's delta starts from what the consumer actually holds.
 #[test]
 fn a_complete_tick_records_the_new_table() {
-  let mut recorded: Vec<(String, u64)> = vec![("a".into(), 1)];
-  let snapshot: Vec<(String, u64)> = vec![("b".into(), 2)];
+  let mut recorded: Vec<(AppId, u64)> = vec![("a".into(), 1)];
+  let mut snapshot: Vec<(AppId, u64)> = vec![("b".into(), 2)];
 
-  let delivery = advance_snapshot_lane(&mut recorded, snapshot.clone(), |_| {
-    SnapshotDelivery::Complete
-  });
+  let delivery =
+    advance_snapshot_lane(&mut recorded, &mut snapshot, |_| SnapshotDelivery::Complete);
 
   assert_eq!(delivery, SnapshotDelivery::Complete);
-  assert_eq!(recorded, snapshot, "a delivered tick must be recorded");
+  assert_eq!(
+    recorded,
+    vec![(AppId::from("b"), 2)],
+    "a delivered tick must be recorded"
+  );
+  // The swap handed the old table back to the scratch buffer: the loop
+  // clears it on the next build, so the reuse allocates nothing.
+  assert_eq!(snapshot, vec![(AppId::from("a"), 1)]);
 }
 
 /// A shed delivery must leave the delta reproducible: with the previous
@@ -107,8 +118,8 @@ fn a_complete_tick_records_the_new_table() {
 /// duplicate storm.
 #[test]
 fn a_shed_tick_recomputes_the_same_delta() {
-  let previous = vec![("a".to_string(), 1u64), ("b".to_string(), 2)];
-  let current = vec![("a".to_string(), 1u64)];
+  let previous = vec![(AppId::from("a"), 1u64), (AppId::from("b"), 2)];
+  let current = vec![(AppId::from("a"), 1u64)];
   let mut first = removed_slots(&previous, &current);
   let mut second = removed_slots(&previous, &current);
   first.sort();

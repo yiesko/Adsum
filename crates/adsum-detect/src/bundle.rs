@@ -9,7 +9,8 @@ use std::sync::Arc;
 use aho_corasick::AhoCorasick;
 
 use crate::db::DetectableActivity;
-use crate::scan::{name_matchable, normalize_name, os_matches};
+use crate::matching::{name_matchable, normalize_name};
+use crate::types::os_matches;
 use crate::types::{OsName, ScannedEntry};
 
 /// 64-bit markers a process path may carry (parity with arrpc/pog5-adsum).
@@ -24,18 +25,33 @@ const MARKERS: [&str; 4] = ["64", ".x64", "x64", "_64"];
 /// buckets (~33B each in SwissTable), no hashing, no per-key `String`
 /// capacity field. Lookups happen only on match misses (rare per tick),
 /// where O(log n) binary search over ~20k short keys is noise next to a
-/// single `/proc` read. First-inserted index wins ties — identical to the
-/// `or_insert` it replaces (callers insert canonical entries before
+/// single `/proc` read. First-inserted index wins ties — identical to
+/// the `or_insert` it replaces (callers insert canonical entries before
 /// aliases, preserving canonical-first ties).
+///
+/// Keys are packed into ONE contiguous per-generation arena, and the
+/// slots hold `(start, end, index)` `u32` triples: the binary search
+/// probes contiguous bytes instead of chasing ~20k scattered `Box<str>`
+/// allocations (measured 13–39% faster lookups on a miss-heavy workload
+/// over the real database's keys), and the per-key allocation headers
+/// disappear (~24B of malloc overhead each, across four tables per
+/// generation). Same build order and tie rules as the boxed form:
+/// stable sort by key, first of each duplicate run wins, then one
+/// packing pass into exact-size tables.
 #[derive(Clone, Debug, Default)]
 pub struct SortedIndex {
-  entries: Vec<(Box<str>, usize)>,
+  /// Every key's bytes, concatenated in slot order (one allocation).
+  arena: Box<str>,
+  /// `(arena start, arena end, entry index)`, sorted by key.
+  slots: Box<[(u32, u32, u32)]>,
 }
 
 impl SortedIndex {
   /// Build from `(key, index)` pairs: stable-sorts by key and keeps the
   /// first index per duplicate key (canonical-first ties, like the
-  /// `or_insert` this replaces), then shrinks to fit.
+  /// `or_insert` this replaces), then packs arena and slots — both
+  /// exactly sized, since the tables outlive the build inside the
+  /// bundle (the packed form IS the shrink-to-fit).
   pub(crate) fn build(mut entries: Vec<(Box<str>, usize)>) -> Self {
     // Stable sort: equal keys keep insertion order, so `dedup_by` below
     // (which keeps the FIRST of each run) preserves first-wins.
@@ -44,27 +60,51 @@ impl SortedIndex {
       ka.cmp(kb)
     });
     entries.dedup_by(|curr, prev| curr.0 == prev.0);
-    entries.shrink_to_fit();
-    Self { entries }
+
+    let total: usize = entries.iter().map(|(key, _)| key.len()).sum();
+    let mut arena = String::with_capacity(total);
+    let mut slots: Vec<(u32, u32, u32)> = Vec::with_capacity(entries.len());
+    for (key, index) in entries {
+      let start = arena.len() as u32;
+      arena.push_str(&key);
+      let end = arena.len() as u32;
+      // Same bound rule as `pattern_index`: the fetched database is
+      // structurally capped far below `u32::MAX` (64 MiB body, bounded
+      // entry/key counts), so a build that could overflow was already
+      // rejected upstream. A correct build never saturates.
+      let index = u32::try_from(index).unwrap_or(u32::MAX);
+      debug_assert!(index < u32::MAX, "aux index too large for the arena table");
+      slots.push((start, end, index));
+    }
+    Self {
+      arena: arena.into_boxed_str(),
+      slots: slots.into_boxed_slice(),
+    }
+  }
+
+  /// One slot's key bytes (always char-aligned: keys are packed whole).
+  #[inline]
+  fn key(&self, slot: &(u32, u32, u32)) -> &str {
+    &self.arena[slot.0 as usize..slot.1 as usize]
   }
 
   /// Look up one key by binary search: O(log n), only used on match
-  /// misses (rare per tick).
+  /// misses (rare per tick). The packed table hands back the index by
+  /// value — there is no stable `&usize` to borrow from a `(u32,u32,u32)`
+  /// slot, and a copy is what every caller wanted anyway (`Some(&idx)`
+  /// destructuring at all five sites).
   #[inline]
-  pub fn get(&self, key: &str) -> Option<&usize> {
+  pub fn get(&self, key: &str) -> Option<usize> {
     self
-      .entries
-      .binary_search_by(|(k, _)| {
-        let ka: &str = k;
-        ka.cmp(key)
-      })
+      .slots
+      .binary_search_by(|slot| self.key(slot).cmp(key))
       .ok()
-      .map(|idx| &self.entries[idx].1)
+      .map(|at| self.slots[at].2 as usize)
   }
 
   /// Number of indexed keys (boot diagnostics).
   pub(crate) fn len(&self) -> usize {
-    self.entries.len()
+    self.slots.len()
   }
 
   /// Membership probe (test-only; production only needs [`get`](SortedIndex::get)).
@@ -72,9 +112,13 @@ impl SortedIndex {
     self.get(key).is_some()
   }
 
-  /// Iterate all entries (used to derive the de-dotted twin table).
-  pub(crate) fn iter(&self) -> impl Iterator<Item = &(Box<str>, usize)> + '_ {
-    self.entries.iter()
+  /// Iterate all entries as `(key, index)` (used to derive the de-dotted
+  /// twin table).
+  pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, usize)> + '_ {
+    self
+      .slots
+      .iter()
+      .map(|slot| (self.key(slot), slot.2 as usize))
   }
 }
 
@@ -135,6 +179,20 @@ fn pattern_index(activity_index: usize, exe_index: usize) -> PatternIndex {
 /// event) and can only ever observe a self-consistent snapshot; the
 /// writer builds the next generation off-thread and swaps the pointer.
 pub struct DetectablesBundle {
+  /// Monotonic generation counter, stamped at build time from a process-
+  /// wide atomic (see [`next_bundle_epoch`]). The per-pid classification
+  /// cache records the epoch its entries were classified against, so a
+  /// bundle swap (hourly refresh, override edit) invalidates every cached
+  /// classification without the writers touching the cache at all: the
+  /// next tick sees a foreign epoch and re-reads. Travels INSIDE the
+  /// generation on purpose — a reader that loaded the `Arc` can never
+  /// observe an epoch that belongs to a different bundle than the one it
+  /// is classifying against (no torn read across the swap).
+  ///
+  /// Read by the incremental scan mode, whose orchestration is shared
+  /// across targets (only Linux can currently reach it — the gate needs
+  /// the netlink watcher — but the counter is platform-neutral).
+  pub(crate) epoch: u64,
   /// Refcounted, not `Vec`: a rebuild clones this once (an Arc bump) instead
   /// of bumping every entry's refcount individually — ~24k of them on each
   /// database refresh or override append.
@@ -167,12 +225,23 @@ pub struct DetectablesBundle {
   pub(crate) custom_indexes: Vec<PatternIndex>,
 }
 
+/// Process-wide generation counter for [`DetectablesBundle::epoch`].
+/// Starts at 1 so the default/empty generation (0) can never alias a
+/// real build; wraps only after 2^64 builds (unreachable).
+static BUNDLE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The next unique bundle epoch (see [`DetectablesBundle::epoch`]).
+pub(crate) fn next_bundle_epoch() -> u64 {
+  BUNDLE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
 impl DetectablesBundle {
   /// Blind-but-valid generation for catastrophic automaton build
   /// failures (network-supplied DB exceeds builder limits): detection
   /// misses everything instead of panicking the daemon.
   fn empty() -> Self {
     Self {
+      epoch: next_bundle_epoch(),
       list: Arc::from(Vec::new()),
       ac: build_ac_automaton(&[]).expect("[bug] empty automaton always builds"),
       indexes: Vec::new(),
@@ -288,14 +357,14 @@ pub(crate) fn dedot(name: &str) -> String {
 }
 
 /// De-dotted twin of the name map, for the folder-walk fallback (see
-/// [`match_name_or_folder`](crate::scan::match_name_or_folder)): only keys that actually contain dots, so
+/// [`match_name_or_folder`](crate::matching::match_name_or_folder)): only keys that actually contain dots, so
 /// the extra table stays tiny. Built in canonical order (lowest index
 /// wins ties), exactly like the main map.
 pub fn undotted_names(name_map: &SortedIndex) -> SortedIndex {
   let mut dotted: Vec<(usize, Box<str>)> = name_map
     .iter()
     .filter(|(key, _)| key.contains('.'))
-    .map(|(key, index)| (*index, key.clone()))
+    .map(|(key, index)| (index, Box::<str>::from(key)))
     .collect();
   // Lowest index first: `SortedIndex::build` keeps the first of each
   // duplicate key, so canonical entries win ties exactly like before.
@@ -490,6 +559,7 @@ pub(crate) fn build_bundle(
     (Some(ac), idx)
   };
   Ok(DetectablesBundle {
+    epoch: next_bundle_epoch(),
     list: detectable,
     ac,
     indexes: idx,

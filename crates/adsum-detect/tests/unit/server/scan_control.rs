@@ -3,11 +3,12 @@ use super::*;
 /// Vanished slots (including pid rotations) report once; survivors never do.
 #[test]
 fn removed_slots_reports_only_vanished_ids() {
-  let previous = vec![("a".to_string(), 1), ("b".to_string(), 2)];
-  let current = vec![("b".to_string(), 2)];
+  use adsum_types::AppId;
+  let previous = vec![(AppId::from("a"), 1), (AppId::from("b"), 2)];
+  let current = vec![(AppId::from("b"), 2)];
   assert_eq!(
     removed_slots(&previous, &current),
-    vec![("a".to_string(), 1)]
+    vec![(AppId::from("a"), 1)]
   );
   // Identical tables: nothing to clear (downstream dedups repeats).
   assert!(removed_slots(&current, &current).is_empty());
@@ -17,10 +18,10 @@ fn removed_slots_reports_only_vanished_ids() {
   assert_eq!(removed_slots(&previous, &[]).len(), 2);
   // Pid replacement rotates the card: same id, new pid reports the old
   // pair as removed so the bridge clears before republishing.
-  let restarted = vec![("a".to_string(), 9), ("b".to_string(), 2)];
+  let restarted = vec![(AppId::from("a"), 9), (AppId::from("b"), 2)];
   assert_eq!(
     removed_slots(&previous, &restarted),
-    vec![("a".to_string(), 1)]
+    vec![(AppId::from("a"), 1)]
   );
 }
 

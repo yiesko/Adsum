@@ -52,7 +52,11 @@ fn sweep_releases_spike_capacity_after_a_collapse() {
 
   // Collapse: most pids die, the sweep keeps only the survivors.
   let survivors: Vec<u64> = spike[..20].to_vec();
-  server.sweep_dead_appids(&survivors.iter().map(|pid| exec(*pid)).collect::<Vec<_>>());
+  let mut live = rustc_hash::FxHashSet::default();
+  server.sweep_dead_appids(
+    &survivors.iter().map(|pid| exec(*pid)).collect::<Vec<_>>(),
+    &mut live,
+  );
 
   let cache = server.appid_cache.lock().unwrap_or_else(|e| e.into_inner());
   assert_eq!(cache.len(), survivors.len());
@@ -82,7 +86,8 @@ fn sweep_drops_dead_pids_and_keeps_live_ones() {
     memoize(&server, pid);
   }
 
-  server.sweep_dead_appids(&[exec(10), exec(30)]);
+  let mut live = rustc_hash::FxHashSet::default();
+  server.sweep_dead_appids(&[exec(10), exec(30)], &mut live);
 
   let cache = server.appid_cache.lock().unwrap_or_else(|e| e.into_inner());
   assert!(cache.contains_key(&10));

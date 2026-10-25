@@ -1096,9 +1096,21 @@ fn mount_library_roots() -> Vec<PathBuf> {
   Vec::new()
 }
 
-/// Conventional home locations: a few cheap stats, always consulted.
-/// Kept because Steam's own `~/.steam/steam` symlink contract is stable —
+/// Conventional locations: a few cheap stats, always consulted. Kept
+/// because Steam's own `~/.steam/steam` symlink contract is stable —
 /// a discovered secondary library must never shadow the primary root.
+///
+/// Per-OS shapes:
+/// - Linux (and other unixy targets): the `$HOME` conventions plus the
+///   Flatpak layout — unchanged.
+/// - macOS: `~/Library/Application Support/Steam`, the one conventional
+///   location Valve's client uses there.
+/// - Windows: the registry's `SteamPath` first (authoritative, and the
+///   only source that knows custom installs), then the installer's
+///   default under `Program Files (x86)` / `Program Files`. Without
+///   these the whole Steam-library tier was silently dead on Windows:
+///   the `$HOME` conventions never exist there (`USERPROFILE`, not
+///   `HOME`, and a different layout).
 fn fallback_steam_roots() -> Vec<PathBuf> {
   let mut roots = Vec::new();
   if let Ok(home) = std::env::var("HOME") {
@@ -1108,13 +1120,70 @@ fn fallback_steam_roots() -> Vec<PathBuf> {
       format!("{home}/.steam/root"),
       format!("{home}/.var/app/com.valvesoftware.Steam/data/Steam"),
     ] {
-      let path = PathBuf::from(candidate);
-      if path.join("steamapps").is_dir() && !roots.contains(&path) {
-        roots.push(path);
+      push_if_steam_root(&mut roots, PathBuf::from(candidate));
+    }
+  }
+  #[cfg(target_os = "macos")]
+  if let Ok(home) = std::env::var("HOME") {
+    push_if_steam_root(
+      &mut roots,
+      PathBuf::from(home).join("Library/Application Support/Steam"),
+    );
+  }
+  #[cfg(target_os = "windows")]
+  {
+    // The registry knows the real install (including secondary drives);
+    // the Program Files defaults are the fallback for a hand-copied or
+    // registry-less install. One valid root already lists every library
+    // through `libraryfolders.vdf`, so order here only picks the primary.
+    if let Some(root) = registry_steam_root() {
+      push_if_steam_root(&mut roots, root);
+    }
+    for var in ["ProgramFiles(x86)", "ProgramFiles"] {
+      if let Ok(base) = std::env::var(var)
+        && !base.is_empty()
+      {
+        push_if_steam_root(&mut roots, PathBuf::from(base).join("Steam"));
       }
     }
   }
   roots
+}
+
+/// Keep `path` when it holds a Steam layout and is not already listed
+/// (`collect_roots` canonicalizes and revalidates afterwards).
+fn push_if_steam_root(roots: &mut Vec<PathBuf>, path: PathBuf) {
+  if path.join("steamapps").is_dir() && !roots.contains(&path) {
+    roots.push(path);
+  }
+}
+
+/// Steam's install location from `HKCU\Software\Valve\Steam\SteamPath` —
+/// the value the client itself keeps current, custom drives included.
+///
+/// Read through `reg query` rather than an FFI registry call: no new
+/// dependency, no unsafe, and discovery runs at startup plus every 120th
+/// tick, where one short-lived helper process is noise next to the VDF
+/// parses. The value commonly carries forward slashes (`d:/steam`),
+/// which `PathBuf` and the Win32 file APIs accept as-is.
+#[cfg(target_os = "windows")]
+fn registry_steam_root() -> Option<PathBuf> {
+  let output = std::process::Command::new("reg")
+    .args(["query", r"HKCU\Software\Valve\Steam", "/v", "SteamPath"])
+    .output()
+    .ok()?;
+  if !output.status.success() {
+    return None;
+  }
+  // Shape: `    SteamPath    REG_SZ    d:/steam` (locale-independent:
+  // the type token is fixed). Anything after REG_SZ on the line is the
+  // value; an empty or absent one simply yields no root.
+  let text = String::from_utf8_lossy(&output.stdout);
+  text.lines().find_map(|line| {
+    let (_, value) = line.split_once("REG_SZ")?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| PathBuf::from(value))
+  })
 }
 
 /// On-disk cache: per-library prefix maps with fingerprints. Best-effort

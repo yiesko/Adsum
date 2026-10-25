@@ -6,6 +6,7 @@ use crate::types::{OsName, ScannedExe};
 mod epic_sku;
 mod matching;
 mod pattern_index;
+mod sorted_index;
 
 /// Slim entry fixture with caller-chosen executable names.
 fn entry_with_exes(id: &str, os: OsName, names: &[&str]) -> Arc<ScannedEntry> {

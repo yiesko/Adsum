@@ -173,13 +173,47 @@ fn candidate_paths(
 
 /// Discover the cached library file from the environment, if it exists.
 fn discover_path() -> Option<PathBuf> {
+  // The explicit override stays EXCLUSIVE (documented contract): when
+  // set, nothing else is consulted, exactly like the previous
+  // `candidate_paths` short-circuit.
+  if let Some(root) = std::env::var_os(HEROIC_ROOT_ENV).filter(|root| !root.is_empty()) {
+    let path = PathBuf::from(root).join(LIBRARY_FILE);
+    return path.is_file().then_some(path);
+  }
   candidate_paths(
-    std::env::var_os(HEROIC_ROOT_ENV).as_deref(),
+    None,
     std::env::var_os("XDG_CONFIG_HOME").as_deref(),
     std::env::var_os("HOME").as_deref(),
   )
   .into_iter()
+  .chain(platform_candidate_paths())
   .find(|path| path.is_file())
+}
+
+/// Conventional per-OS locations the XDG/`$HOME` shapes cannot express:
+/// Heroic is an Electron app, so its Legendary cache lives under the
+/// platform appData root — `%APPDATA%\heroic` on Windows and
+/// `~/Library/Application Support/heroic` on macOS. Without these the
+/// `-epicapp` fallback tier was silently dead off Linux (neither
+/// `XDG_CONFIG_HOME` nor `$HOME/.config/heroic` exists on Windows, and
+/// macOS keeps it under Application Support). Linux and the Flatpak
+/// layout are already covered by [`candidate_paths`].
+fn platform_candidate_paths() -> Vec<PathBuf> {
+  #[cfg(target_os = "windows")]
+  if let Some(appdata) = std::env::var_os("APPDATA").filter(|value| !value.is_empty()) {
+    return vec![PathBuf::from(appdata).join("heroic").join(LIBRARY_FILE)];
+  }
+  #[cfg(target_os = "macos")]
+  if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
+    return vec![
+      PathBuf::from(home)
+        .join("Library/Application Support/heroic")
+        .join(LIBRARY_FILE),
+    ];
+  }
+  // Linux/Flatpak (and a Windows/macOS with the variable unset): the
+  // XDG shapes above are the whole story.
+  Vec::new()
 }
 
 /// Read the library with a hard byte cap: the post-read length check also

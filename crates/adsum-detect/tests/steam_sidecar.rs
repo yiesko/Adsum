@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use adsum_detect::db::DetectableActivity;
 use adsum_detect::refresh::RefreshConfig;
-use adsum_detect::scan::ScanScratch;
+use adsum_detect::scratch::ScanScratch;
 use adsum_detect::server::ProcessServer;
 use adsum_detect::types::{DetectSource, Exec, ProcessEventListeners};
 
@@ -51,7 +51,7 @@ const UNLISTED_HELPERS: &[&str] = &[
 
 /// Every helper the policy names, plus the ones it does not.
 fn helpers() -> impl Iterator<Item = &'static str> {
-  adsum_detect::scan::STEAM_SIDECAR_BASENAMES
+  adsum_detect::matching::STEAM_SIDECAR_BASENAMES
     .into_iter()
     .chain(UNLISTED_HELPERS.iter().copied())
 }
@@ -104,8 +104,7 @@ fn a_steam_helper_carrying_the_games_app_id_is_not_the_game() {
   let server = server();
   let bundle = server.bundle();
   let mut scratch = ScanScratch::default();
-  let mut variants: [String; 5] = Default::default();
-  let mut reversed = String::new();
+  let excl = server.exclusions_read();
   let mut obs_open = false;
 
   for helper in helpers() {
@@ -115,14 +114,7 @@ fn a_steam_helper_carrying_the_games_app_id_is_not_the_game() {
       &format!("/usr/lib/steam/bin/{helper}"),
       &format!("{helper} AppId={APP_ID}"),
     );
-    let hit = server.match_process(
-      &process,
-      &bundle,
-      &mut variants,
-      &mut reversed,
-      &mut obs_open,
-      &mut scratch,
-    );
+    let hit = server.match_process(&process, &bundle, &excl, &mut obs_open, &mut scratch);
     assert!(
       hit.is_none(),
       "{helper} carrying AppId {APP_ID} was announced as the game: \
@@ -142,8 +134,7 @@ fn the_games_own_process_still_reads_as_the_game() {
   let server = server();
   let bundle = server.bundle();
   let mut scratch = ScanScratch::default();
-  let mut variants: [String; 5] = Default::default();
-  let mut reversed = String::new();
+  let excl = server.exclusions_read();
   let mut obs_open = false;
 
   for argv0 in [
@@ -158,14 +149,7 @@ fn the_games_own_process_still_reads_as_the_game() {
   ] {
     let process = process(argv0, &format!("hl2.exe AppId={APP_ID}"));
     let hit = server
-      .match_process(
-        &process,
-        &bundle,
-        &mut variants,
-        &mut reversed,
-        &mut obs_open,
-        &mut scratch,
-      )
+      .match_process(&process, &bundle, &excl, &mut obs_open, &mut scratch)
       .unwrap_or_else(|| panic!("{argv0} should read as the game"));
     assert_eq!(hit.entry.name, "Garry's Mod".into());
     // The tier under test, not just the outcome. Which tier answers
@@ -246,16 +230,14 @@ fn a_rejected_match_does_not_hide_the_one_that_names_the_path() {
   let server = colliding_exe_server();
   let bundle = server.bundle();
   let mut scratch = ScanScratch::default();
-  let mut variants: [String; 5] = Default::default();
-  let mut reversed = String::new();
+  let excl = server.exclusions_read();
   let mut obs_open = false;
 
   let hit = server
     .match_process(
       &process("/opt/illarion/jre/bin/java.exe", ""),
       &bundle,
-      &mut variants,
-      &mut reversed,
+      &excl,
       &mut obs_open,
       &mut scratch,
     )
@@ -285,8 +267,7 @@ fn the_short_declared_name_still_matches_a_path_ending_with_it() {
   let server = colliding_exe_server();
   let bundle = server.bundle();
   let mut scratch = ScanScratch::default();
-  let mut variants: [String; 5] = Default::default();
-  let mut reversed = String::new();
+  let excl = server.exclusions_read();
   let mut obs_open = false;
 
   for argv0 in ["/opt/minecraft/java", "/opt/minecraft/jre/bin/java"] {
@@ -294,8 +275,7 @@ fn the_short_declared_name_still_matches_a_path_ending_with_it() {
       .match_process(
         &process(argv0, ""),
         &bundle,
-        &mut variants,
-        &mut reversed,
+        &excl,
         &mut obs_open,
         &mut scratch,
       )
@@ -350,16 +330,14 @@ fn a_launcher_process_carrying_the_games_app_id_is_not_the_game() {
   let server = launcher_entry_server();
   let bundle = server.bundle();
   let mut scratch = ScanScratch::default();
-  let mut variants: [String; 5] = Default::default();
-  let mut reversed = String::new();
+  let excl = server.exclusions_read();
   let mut obs_open = false;
 
   for argv0 in ["/opt/games/larilauncher.exe", "/opt/games/LariLauncher.exe"] {
     let hit = server.match_process(
       &process(argv0, "larilauncher.exe AppId=1086940"),
       &bundle,
-      &mut variants,
-      &mut reversed,
+      &excl,
       &mut obs_open,
       &mut scratch,
     );
@@ -378,8 +356,7 @@ fn a_launcher_process_carrying_the_games_app_id_is_not_the_game() {
       .match_process(
         &process(argv0, "bg3.exe AppId=1086940"),
         &bundle,
-        &mut variants,
-        &mut reversed,
+        &excl,
         &mut obs_open,
         &mut scratch,
       )
@@ -443,8 +420,7 @@ fn a_refused_exe_match_is_not_overruled_by_the_folder_heuristic() {
   let server = portal_entry_server();
   let bundle = server.bundle();
   let mut scratch = ScanScratch::default();
-  let mut variants: [String; 5] = Default::default();
-  let mut reversed = String::new();
+  let excl = server.exclusions_read();
   let mut obs_open = false;
 
   // `xportal2.exe` is a no-match, not a refusal: the `x` breaks the
@@ -456,8 +432,7 @@ fn a_refused_exe_match_is_not_overruled_by_the_folder_heuristic() {
     let hit = server.match_process(
       &process(argv0, ""),
       &bundle,
-      &mut variants,
-      &mut reversed,
+      &excl,
       &mut obs_open,
       &mut scratch,
     );
@@ -477,8 +452,7 @@ fn a_refused_exe_match_is_not_overruled_by_the_folder_heuristic() {
       .match_process(
         &process(argv0, ""),
         &bundle,
-        &mut variants,
-        &mut reversed,
+        &excl,
         &mut obs_open,
         &mut scratch,
       )
@@ -565,15 +539,13 @@ fn a_refusal_survives_a_later_probe_that_simply_misses() {
   let server = portal_entry_with_custom_override_server();
   let bundle = server.bundle();
   let mut scratch = ScanScratch::default();
-  let mut variants: [String; 5] = Default::default();
-  let mut reversed = String::new();
+  let excl = server.exclusions_read();
   let mut obs_open = false;
 
   let hit = server.match_process(
     &process("/opt/Portal 2/portal2.exe.txt", ""),
     &bundle,
-    &mut variants,
-    &mut reversed,
+    &excl,
     &mut obs_open,
     &mut scratch,
   );
@@ -593,8 +565,7 @@ fn a_proton_refusal_is_settled_before_the_tier_after_it() {
   let server = portal_win32_entry_server();
   let bundle = server.bundle();
   let mut scratch = ScanScratch::default();
-  let mut variants: [String; 5] = Default::default();
-  let mut reversed = String::new();
+  let excl = server.exclusions_read();
   let mut obs_open = false;
 
   // The native automaton holds no pattern for this entry, so it reports a
@@ -604,8 +575,7 @@ fn a_proton_refusal_is_settled_before_the_tier_after_it() {
   let hit = server.match_process(
     &process("/opt/Portal 2/bin/portal2.exe.txt", ""),
     &bundle,
-    &mut variants,
-    &mut reversed,
+    &excl,
     &mut obs_open,
     &mut scratch,
   );
@@ -702,8 +672,7 @@ fn a_native_refusal_does_not_stop_the_proton_probe() {
   let server = hoi4_server();
   let bundle = server.bundle();
   let mut scratch = ScanScratch::default();
-  let mut variants: [String; 5] = Default::default();
-  let mut reversed = String::new();
+  let excl = server.exclusions_read();
   let mut obs_open = false;
 
   // The folder is named like the game on purpose: without the hit from
@@ -713,8 +682,7 @@ fn a_native_refusal_does_not_stop_the_proton_probe() {
     .match_process(
       &process("/games/Hearts of Iron IV/hoi4.exe", ""),
       &bundle,
-      &mut variants,
-      &mut reversed,
+      &excl,
       &mut obs_open,
       &mut scratch,
     )
@@ -755,16 +723,14 @@ fn the_reconstructed_path_reaches_the_probe_that_needs_it() {
   let server = bare_exe_win32_server(&format!("{dir}/game.exe"));
   let bundle = server.bundle();
   let mut scratch = ScanScratch::default();
-  let mut variants: [String; 5] = Default::default();
-  let mut reversed = String::new();
+  let excl = server.exclusions_read();
   let mut obs_open = false;
 
   let hit = server
     .match_process(
       &process("game.exe", ""),
       &bundle,
-      &mut variants,
-      &mut reversed,
+      &excl,
       &mut obs_open,
       &mut scratch,
     )
@@ -801,20 +767,12 @@ fn an_entry_with_no_executables_stands_on_the_id_alone() {
   );
   let bundle = server.bundle();
   let mut scratch = ScanScratch::default();
-  let mut variants: [String; 5] = Default::default();
-  let mut reversed = String::new();
+  let excl = server.exclusions_read();
   let mut obs_open = false;
 
   let process = process("/opt/whatever/some-launcher", "some-launcher AppId=777");
   let hit = server
-    .match_process(
-      &process,
-      &bundle,
-      &mut variants,
-      &mut reversed,
-      &mut obs_open,
-      &mut scratch,
-    )
+    .match_process(&process, &bundle, &excl, &mut obs_open, &mut scratch)
     .expect("an entry with no executables still wins on the id alone");
   assert_eq!(hit.entry.name, "No Exes".into());
 }
@@ -872,8 +830,7 @@ fn a_path_that_merely_contains_a_declared_exe_name_is_not_the_game() {
   let server = exe_only_server();
   let bundle = server.bundle();
   let mut scratch = ScanScratch::default();
-  let mut variants: [String; 5] = Default::default();
-  let mut reversed = String::new();
+  let excl = server.exclusions_read();
   let mut obs_open = false;
 
   for argv0 in [
@@ -884,8 +841,7 @@ fn a_path_that_merely_contains_a_declared_exe_name_is_not_the_game() {
     let hit = server.match_process(
       &process(argv0, ""),
       &bundle,
-      &mut variants,
-      &mut reversed,
+      &excl,
       &mut obs_open,
       &mut scratch,
     );
@@ -911,8 +867,7 @@ fn the_automaton_still_names_the_games_own_process() {
   let server = exe_only_server();
   let bundle = server.bundle();
   let mut scratch = ScanScratch::default();
-  let mut variants: [String; 5] = Default::default();
-  let mut reversed = String::new();
+  let excl = server.exclusions_read();
   let mut obs_open = false;
 
   for argv0 in [
@@ -927,8 +882,7 @@ fn the_automaton_still_names_the_games_own_process() {
       .match_process(
         &process(argv0, ""),
         &bundle,
-        &mut variants,
-        &mut reversed,
+        &excl,
         &mut obs_open,
         &mut scratch,
       )

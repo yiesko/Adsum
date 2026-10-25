@@ -11,8 +11,9 @@ use std::sync::Arc;
 
 use super::bundle::{DetectablesBundle, build_bundle};
 use super::db::{DetectableActivity, Exclusions};
-use super::server::{ProcessServer, release_parse_arenas};
+use super::server::ProcessServer;
 use super::types::ScannedEntry;
+use crate::platform::memory::release_parse_arenas;
 
 impl ProcessServer {
   /// Apply `edit` to the current custom list and swap the rebuilt bundle

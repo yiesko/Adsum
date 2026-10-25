@@ -123,7 +123,7 @@ fn steam_app_id_read_reuses_the_exec_scratch() {
 #[test]
 fn process_list_into_reuses_slots_across_ticks() {
   let mut processes = Vec::new();
-  let mut scratch = ExecScratch::default();
+  let mut scratch = ScanScratch::default();
   let filled =
     ProcessServer::process_list_into(&mut processes, &mut scratch).expect("first tick lists");
   assert!(filled > 0, "some process must be visible");

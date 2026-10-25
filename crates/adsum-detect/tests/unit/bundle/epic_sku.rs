@@ -27,7 +27,7 @@ fn an_epic_sku_lowercases_into_the_map() {
     "b0cd075465c44f87be3b505ac04a2e46"
   );
   let (_, epic, _) = build_aux_maps(&[entry]);
-  assert_eq!(epic.get("b0cd075465c44f87be3b505ac04a2e46"), Some(&0));
+  assert_eq!(epic.get("b0cd075465c44f87be3b505ac04a2e46"), Some(0));
 }
 
 /// A Steam-only SKU contributes nothing to the epic map.

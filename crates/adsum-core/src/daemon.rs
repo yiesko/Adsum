@@ -141,10 +141,10 @@ impl Daemon {
     // One-shot diagnostic: throwaway reuse buffers (no hot loop here,
     // so nothing is retained — diagnostics observe production behavior).
     let mut processes = Vec::new();
-    let mut scratch = adsum_detect::scan::ScanScratch::default();
+    let mut scratch = adsum_detect::scratch::ScanScratch::default();
     let mut found = server.scan_for_processes(&mut processes, &mut scratch)?;
     let ignored: HashSet<String> = self.config.ignored_ids.iter().cloned().collect();
-    found = adsum_detect::scan::apply_ignore_list(found, &ignored);
+    found = adsum_detect::runtime::apply_ignore_list(found, &ignored);
     Ok(
       found
         .iter()
@@ -415,8 +415,12 @@ impl Daemon {
         while let Ok(event) = scan_rx.recv() {
           let input = match event {
             adsum_detect::ProcessDetectedEvent::Detected(hit) => ProcInput::Detected(ScannedGame {
-              id: adsum_types::AppId::from(&*hit.entry.id),
-              name: Arc::from(hit.entry.name.as_ref()),
+              // Refcount clones, not byte copies: the slim entry carries
+              // the same `AppId`/`Arc<str>` shapes the bridge wants, so
+              // the boundary hop shares the allocation (the deep copies
+              // here were the last per-detection string allocations).
+              id: hit.entry.id.clone(),
+              name: hit.entry.name.clone(),
               pid: hit.pid,
               start: hit.start,
               // Provenance travels per event (rare by construction): one
@@ -425,9 +429,7 @@ impl Daemon {
               process_start_ms: adsum_detect::proc_start::process_start_ms(hit.pid),
             }),
             adsum_detect::ProcessDetectedEvent::Cleared => ProcInput::Cleared,
-            adsum_detect::ProcessDetectedEvent::Removed { id, pid } => {
-              ProcInput::Removed(adsum_types::AppId::from(&*id), pid)
-            }
+            adsum_detect::ProcessDetectedEvent::Removed { id, pid } => ProcInput::Removed(id, pid),
           };
           if proc_tx.blocking_send(input).is_err() {
             break;

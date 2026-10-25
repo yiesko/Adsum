@@ -1,7 +1,10 @@
 use super::*;
+// The buffer types moved to `crate::scratch` (out of the old scan.rs);
+// the leaf suites reach them through this hub's glob like everything
+// else.
+use crate::scratch::{ExecScratch, MatchScratch, SLOT_LOW_TICKS, ScanScratch};
 
 mod epic;
-mod first_sightings;
 mod matching;
 mod name_matching;
 

@@ -5,7 +5,8 @@
 
 use rustc_hash::FxHashSet;
 
-use crate::scan::{ExecScratch, read_steam_app_id};
+use crate::platform::read_steam_app_id;
+use crate::scratch::ExecScratch;
 use crate::server::ProcessServer;
 use crate::types::Exec;
 use adsum_types::AppId;
@@ -84,19 +85,31 @@ impl ProcessServer {
   }
 
   /// Drop memoized AppIds of pids that died since the last tick: pid
-  /// reuse must never serve a stale id. One set build + retain per tick.
-  /// Recovers from a poisoned lock like every other cache access (a dead
-  /// pid set is still better than no sweep at all).
+  /// reuse must never serve a stale id. The liveness set is the
+  /// caller's reuse buffer (cleared and refilled per tick — the sweep
+  /// used to build a fresh `FxHashSet` every tick, one allocation per
+  /// tick for a table that only ever lives for the call).
+  ///
+  /// `Exec`-table convenience wrapper for the sweeps that have a filled
+  /// process list at hand (the full-sweep mode on every target, and the
+  /// tests); the incremental mode derives the set from the enumerated
+  /// pids and calls the `_by_live` form directly.
+  pub(crate) fn sweep_dead_appids(&self, processes: &[Exec], live: &mut FxHashSet<u64>) {
+    live.clear();
+    live.extend(processes.iter().map(|process| process.pid));
+    self.sweep_dead_appids_by_live(live);
+  }
+
+  /// The sweep proper, against an already-built liveness set. Recovers
+  /// from a poisoned lock like every other cache access (a dead pid set
+  /// is still better than no sweep at all).
   ///
   /// Capacity is trimmed when the live set collapses (a build storm's
   /// thousands of pids dropping back to a few hundred): `retain` alone
   /// keeps the high-water bucket count, so the table would pin that
   /// memory for the rest of the session. `len`/`capacity` are read before
   /// the lock so the rehash happens outside it.
-  pub(crate) fn sweep_dead_appids(&self, processes: &[Exec]) {
-    let mut live = FxHashSet::with_capacity_and_hasher(processes.len(), Default::default());
-    live.extend(processes.iter().map(|process| process.pid));
-
+  pub(crate) fn sweep_dead_appids_by_live(&self, live: &FxHashSet<u64>) {
     let mut cache = self.appid_cache.lock().unwrap_or_else(|e| e.into_inner());
     cache.retain(|pid, _| live.contains(pid));
     let (len, capacity) = (cache.len(), cache.capacity());
@@ -135,5 +148,5 @@ impl ProcessServer {
 }
 
 #[cfg(test)]
-#[path = "../tests/unit/cache.rs"]
+#[path = "../../tests/unit/cache/appid.rs"]
 mod tests;

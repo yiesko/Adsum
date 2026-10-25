@@ -1,9 +1,12 @@
-//! Process start times for detection-latency attribution.
+//! Process start times for detection-latency attribution — one public
+//! function, two backends behind it (the unified shape the `platform`
+//! module exists for): Linux parses `/proc/<pid>/stat` directly (no new
+//! dependency); other targets use a call-scoped `sysinfo` refresh.
 //!
 //! The scan tick never pays for this: the start time is read once per
-//! newly detected game (a rare event), never per process per tick.
-//! Linux parses `/proc/<pid>/stat` directly (no new dependency);
-//! other targets use the `sysinfo` handle the scanner already keeps.
+//! newly detected game (a rare event), never per process per tick. The
+//! public path stays `adsum_detect::proc_start` (re-exported from
+//! `lib.rs`), so embedders never see the move.
 
 /// Start time of `pid` as epoch millis (`None` for vanished pids and
 /// unreadable tables).
@@ -39,6 +42,11 @@ pub fn process_start_ms(pid: u64) -> Option<u64> {
 
 /// Start time of `pid` as epoch millis via a single-process refresh
 /// (rare event only — never on the scan tick).
+///
+/// `nothing()` is enough: `sysinfo` fills `start_time` unconditionally
+/// when it lists a process (it is not behind an `UpdateKind` field), so
+/// the old `everything()` was paying for cwd, environ, user and root
+/// reads per detection to throw all of them away.
 #[cfg(not(target_os = "linux"))]
 pub fn process_start_ms(pid: u64) -> Option<u64> {
   use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
@@ -48,7 +56,7 @@ pub fn process_start_ms(pid: u64) -> Option<u64> {
   sys.refresh_processes_specifics(
     ProcessesToUpdate::Some(&[pid]),
     true,
-    ProcessRefreshKind::everything(),
+    ProcessRefreshKind::nothing(),
   );
   sys
     .process(pid)
@@ -74,5 +82,5 @@ fn start_ms_from_ticks(boot_ms: u64, ticks: u64, clk_tck: u64) -> u64 {
 }
 
 #[cfg(test)]
-#[path = "../tests/unit/proc_start.rs"]
+#[path = "../../tests/unit/proc_start.rs"]
 mod tests;

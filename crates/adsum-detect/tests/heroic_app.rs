@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use adsum_detect::db::DetectableActivity;
 use adsum_detect::refresh::RefreshConfig;
-use adsum_detect::scan::ScanScratch;
+use adsum_detect::scratch::ScanScratch;
 use adsum_detect::server::ProcessServer;
 use adsum_detect::types::{DetectSource, Exec, ProcessEventListeners, ScannedHit};
 
@@ -76,8 +76,7 @@ fn server() -> ProcessServer {
 /// Classify one process against the server's current generation.
 fn classify_at(server: &ProcessServer, path: &str, arguments: &str) -> Option<ScannedHit> {
   let bundle = server.bundle();
-  let mut variant_bufs: [String; 5] = Default::default();
-  let mut reversed = String::with_capacity(256);
+  let excl = server.exclusions_read();
   let mut obs_open = false;
   let mut scratch = ScanScratch::default();
   server.match_process(
@@ -87,8 +86,7 @@ fn classify_at(server: &ProcessServer, path: &str, arguments: &str) -> Option<Sc
       arguments: Some(arguments.to_string()),
     },
     &bundle,
-    &mut variant_bufs,
-    &mut reversed,
+    &excl,
     &mut obs_open,
     &mut scratch,
   )

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use adsum_detect::db::{DetectableActivity, parse_exclusions};
 use adsum_detect::refresh::RefreshConfig;
-use adsum_detect::scan::ScanScratch;
+use adsum_detect::scratch::ScanScratch;
 use adsum_detect::server::ProcessServer;
 use adsum_detect::types::{DetectSource, Exec, ProcessEventListeners};
 use adsum_steam::SteamLibraries;
@@ -140,8 +140,7 @@ fn classify(
   arguments: &str,
 ) -> Option<adsum_detect::types::ScannedHit> {
   let bundle = server.bundle();
-  let mut variants: [String; 5] = Default::default();
-  let mut reversed = String::new();
+  let excl = server.exclusions_read();
   let mut obs_open = false;
   let mut scratch = ScanScratch::default();
   server.match_process(
@@ -151,8 +150,7 @@ fn classify(
       arguments: Some(arguments.to_string()),
     },
     &bundle,
-    &mut variants,
-    &mut reversed,
+    &excl,
     &mut obs_open,
     &mut scratch,
   )

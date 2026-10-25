@@ -12,7 +12,8 @@ fn watch_returns_promptly_when_stop_preset() {
   let (tx, _rx) = adsum_telemetry::QueueGauge::pair();
   let stop = AtomicBool::new(true);
   let start = Instant::now();
-  let result = adsum_proc_events::watch(&tx, &stop);
+  let invalidate = std::sync::atomic::AtomicBool::new(false);
+  let result = adsum_proc_events::watch(&tx, &stop, &invalidate);
   assert!(
     result.is_ok(),
     "preset stop must exit quietly, got {result:?}"

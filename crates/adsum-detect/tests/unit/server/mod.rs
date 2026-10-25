@@ -1,7 +1,9 @@
 use super::*;
 use std::time::Duration;
 
-use crate::runtime::{exec_hit_ignored, removed_slots, scan_cadence, unpark_scan_wake};
+use crate::runtime::cadence::scan_cadence;
+use crate::runtime::lanes::{exec_hit_ignored, removed_slots};
+use crate::runtime::workers::unpark_scan_wake;
 use crate::types::{DetectSource, ScannedEntry, ScannedHit};
 
 mod generation;
