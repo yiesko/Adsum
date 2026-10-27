@@ -26,11 +26,35 @@ use super::proc_readers::read_exec_into;
 /// silence costs one cheap timeout per interval.
 const DISPATCH_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// First retry wait after a failed watch; doubles per consecutive failure.
+const RETRY_INITIAL: Duration = Duration::from_secs(5);
+/// Retry wait ceiling: a persistent failure settles into this cadence.
+const RETRY_CEILING: Duration = Duration::from_secs(300);
+/// Exponent cap: 5s doubled six times is already past the ceiling.
+const RETRY_MAX_SHIFT: u32 = 6;
+
+/// Wait before the next watch, after `failures` consecutive failures.
+fn retry_delay(failures: u32) -> Duration {
+  let shift = failures.saturating_sub(1).min(RETRY_MAX_SHIFT);
+  RETRY_INITIAL
+    .saturating_mul(1u32 << shift)
+    .min(RETRY_CEILING)
+}
+
+/// Next failure count: a watch that proved delivery starts a new streak.
+fn next_failures(failures: u32, was_live: bool) -> u32 {
+  if was_live {
+    1
+  } else {
+    failures.saturating_add(1)
+  }
+}
+
 /// Spawn the netlink watcher + dispatch threads. Returns the watcher's
 /// backlog gauge so the caller can store it where the census reads depth
 /// and shed totals (see `ProcessServer::watch_gauge`).
 pub(crate) fn spawn_proc_watcher(server: &ProcessServer) -> adsum_telemetry::QueueGauge {
-  use adsum_proc_events::{ProcEvent, in_initial_user_namespace, watch};
+  use adsum_proc_events::{ProcEvent, in_initial_pid_namespace, in_initial_user_namespace, watch};
   use adsum_telemetry::QueueGauge;
 
   let (tx, rx) = QueueGauge::pair();
@@ -171,12 +195,12 @@ pub(crate) fn spawn_proc_watcher(server: &ProcessServer) -> adsum_telemetry::Que
     Arc::clone(&server.worker_handles),
     "adsum-watch",
     move || {
-      // cn_proc delivers only from the initial user namespace: inside a
-      // user namespace the kernel silently ignores the subscription,
-      // so no probe could ever prove anything and the retry loop would
-      // spin through failed self-tests forever. Detect the sandbox
-      // once, warn, and leave the watcher off — polling alone drives
-      // detection (nothing was ever believed, so there is no cache
+      // cn_proc delivers only from the initial user and PID namespaces:
+      // inside either namespace kind the kernel silently ignores the
+      // subscription, so no probe could ever prove anything and the retry
+      // loop would spin through failed self-tests forever. Detect the
+      // sandbox once, warn, and leave the watcher off — polling alone
+      // drives detection (nothing was ever believed, so there is no cache
       // edge to invalidate here either).
       if !in_initial_user_namespace() {
         tracing::warn!(
@@ -184,14 +208,21 @@ pub(crate) fn spawn_proc_watcher(server: &ProcessServer) -> adsum_telemetry::Que
         );
         return;
       }
+      if !in_initial_pid_namespace() {
+        tracing::warn!(
+          "[Process Scanner] cn_proc unavailable: running in a non-initial PID namespace (sandbox), polling only; watcher disabled"
+        );
+        return;
+      }
       // Register once: `shutdown` unparks this thread out of the retry
       // park below, so teardown never waits out the backoff ceiling.
       track_shutdown_thread(&watcher_state.shutdown_wake);
-      let mut attempts = 0u32;
+      let mut failures = 0u32;
+      let mut warned = false;
       // Exponential retry backoff: a first failure is likely a
       // transient kernel stall worth retrying soon, while a persistent
-      // one settles into the old five-minute cadence.
-      let mut backoff = Duration::from_secs(5);
+      // one settles at five minutes. A watch that proved delivery starts
+      // a fresh streak, so a late failure retries soon too.
       loop {
         // Directed shutdown before blocking in `watch()`: with the flag
         // set the call below returns at once (preset-stop fast path).
@@ -225,8 +256,9 @@ pub(crate) fn spawn_proc_watcher(server: &ProcessServer) -> adsum_telemetry::Que
             // Poll once now: the watcher just died, so the scan loop must
             // not sit out its whole backoff on possibly stale state.
             unpark_scan_wake(&watcher_state.scan_wake);
-            attempts = attempts.saturating_add(1);
-            if attempts == 1 {
+            failures = next_failures(failures, err.was_live);
+            if !warned {
+              warned = true;
               tracing::warn!(
                 "[Process Scanner] proc-events unavailable ({err}), polling only; retrying"
               );
@@ -238,13 +270,11 @@ pub(crate) fn spawn_proc_watcher(server: &ProcessServer) -> adsum_telemetry::Que
             // Interruptible park (not `sleep`): the pre-park check exits
             // at once when shutdown is already requested, otherwise the
             // unpark bounds the current backoff and the loop-top check
-            // exits. Doubling happens AFTER the park: the wait that just
-            // ended is the one the previous failure paid for.
+            // exits.
             if is_shutting_down(&watcher_state.shutdown) {
               break;
             }
-            std::thread::park_timeout(backoff);
-            backoff = backoff.saturating_mul(2).min(Duration::from_secs(300));
+            std::thread::park_timeout(retry_delay(failures));
           }
         }
       }
@@ -252,3 +282,7 @@ pub(crate) fn spawn_proc_watcher(server: &ProcessServer) -> adsum_telemetry::Que
   );
   gauge
 }
+
+#[cfg(test)]
+#[path = "../../../tests/unit/platform/proc_events.rs"]
+mod tests;

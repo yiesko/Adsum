@@ -37,9 +37,16 @@ If that line is missing, the event watcher did not start:
 - `ADSUM_NO_PROC_EVENTS=1` disables it on purpose, or
 - the unit restricts address families without `AF_NETLINK` (the shipped
   unit includes it: `RestrictAddressFamilies=... AF_NETLINK`), or
-- the service runs in a user namespace (`cn_proc` only delivers from the
-  initial user namespace; the watcher logs that once and stays off), or
+- the service runs in a non-initial user or PID namespace (`cn_proc` only
+  delivers from the initial namespaces; the watcher logs that once and
+  stays off), or
 - you are not on Linux.
+
+In a user unit the watcher stays off by design because the sandbox creates a
+user namespace. Section 4 of
+[systemd-user-units.md](systemd-user-units.md#enabling-the-event-watcher-opt-in-weaker-sandbox)
+shows an opt-in drop-in that removes the namespace-creating sandbox, with
+its trade-off.
 
 Polling keeps working either way — games are detected at the scan cadence
 (`ADSUM_SCAN_INTERVAL`) instead of instantly. Verify with

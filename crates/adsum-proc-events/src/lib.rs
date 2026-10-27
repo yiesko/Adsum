@@ -43,9 +43,16 @@ const CN_IDX_PROC: u32 = 0x1;
 const CN_VAL_PROC: u32 = 0x1;
 /// `struct cn_msg` header size: idx + val + seq + ack (u32) + len + flags (u16).
 const SIZE_CN_MSG: usize = 20;
+/// One framed multicast request: `nlmsghdr` + `cn_msg` + the `u32` op.
+#[cfg(target_os = "linux")]
+const MCAST_REQUEST_LEN: usize = SIZE_NLMSGHDR + SIZE_CN_MSG + 4;
 /// Multicast ops (`linux/cn_proc.h`).
 #[cfg(target_os = "linux")]
 const PROC_CN_MCAST_LISTEN: u32 = 0x1;
+/// Unsubscribe. The kernel decrements its global listener count only on
+/// this message, not when the socket closes, so every exit must send it.
+#[cfg(target_os = "linux")]
+const PROC_CN_MCAST_IGNORE: u32 = 0x2;
 /// `proc_event.what` bitmask values (`linux/cn_proc.h` — NOT sequential).
 const PROC_EVENT_EXEC: u32 = 0x0000_0002;
 const PROC_EVENT_EXIT: u32 = 0x8000_0000;
@@ -55,6 +62,41 @@ const PROC_EVENT_EXIT: u32 = 0x8000_0000;
 #[cfg(target_os = "linux")]
 const PROC_EVENT_NONE: u32 = 0x0000_0000;
 
+/// Why `watch()` returned, and whether delivery had been proven first.
+#[derive(Debug)]
+pub struct WatchError {
+  /// Refusal or receive failure.
+  pub reason: Cow<'static, str>,
+  /// True when the self-test had passed before this failure.
+  pub was_live: bool,
+}
+
+impl WatchError {
+  fn new(reason: impl Into<Cow<'static, str>>, was_live: bool) -> Self {
+    Self {
+      reason: reason.into(),
+      was_live,
+    }
+  }
+}
+
+impl std::fmt::Display for WatchError {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.write_str(&self.reason)
+  }
+}
+
+impl std::error::Error for WatchError {}
+
+/// Clears the liveness flag when the watch ends, on every exit path.
+struct LiveGuard<'a>(&'a AtomicBool);
+
+impl Drop for LiveGuard<'_> {
+  fn drop(&mut self) {
+    self.0.store(false, Ordering::Release);
+  }
+}
+
 /// Whether this process is in the initial user namespace — the only place
 /// `cn_proc` delivers (inside one the kernel silently ignores the
 /// subscription). Unreadable procfs fails open to the self-test.
@@ -63,8 +105,9 @@ const PROC_EVENT_NONE: u32 = 0x0000_0000;
 pub fn in_initial_user_namespace() -> bool {
   // `uid_map` beats the `/proc/*/ns/user` inode comparison: a sandboxed
   // PID namespace renumbers `/proc/1` (enslavement looks like "initial")
-  // and reading `/proc/1/ns/user` from a userns can EACCES. The initial
-  // namespace is DEFINED by the full identity map — exactly `0 0 u32::MAX`.
+  // and reading `/proc/1/ns/user` from a userns can EACCES. The full
+  // identity map is a proxy: a child namespace can repeat it, so the
+  // self-test remains the final word.
   match std::fs::read_to_string("/proc/self/uid_map") {
     Ok(map) => is_initial_uid_map(&map),
     // Unknown states (procfs unreadable): do not gate — self-test decides.
@@ -72,9 +115,9 @@ pub fn in_initial_user_namespace() -> bool {
   }
 }
 
-/// Whether `map` IS the initial namespace's identity mapping: exactly one
-/// full-range line (`0 0 u32::MAX`, whitespace-agnostic). Unparsable,
-/// short or EXTRA tokens mean some non-identity mapping — `false`.
+/// Whether `map` has the initial namespace's identity-map shape: exactly
+/// one full-range line (`0 0 u32::MAX`). A child namespace can repeat it;
+/// unparsable, short or extra tokens are `false`.
 #[cfg(target_os = "linux")]
 fn is_initial_uid_map(map: &str) -> bool {
   // `/proc/self/uid_map` lines are `inner outer count`; the initial
@@ -89,6 +132,35 @@ fn is_initial_uid_map(map: &str) -> bool {
     && parse(&mut tokens) == Some(u32::MAX)
     // Any further line maps another range — not the initial namespace.
     && tokens.next().is_none()
+}
+
+/// Whether this process looks like it is in the initial PID namespace,
+/// where `cn_proc` reports events. Unreadable procfs fails open to the
+/// self-test, which remains the final word.
+#[must_use]
+#[cfg(target_os = "linux")]
+pub fn in_initial_pid_namespace() -> bool {
+  match std::fs::read_to_string("/proc/self/status") {
+    Ok(status) => is_initial_nspid(&status),
+    Err(_) => true,
+  }
+}
+
+/// Whether `status` shows one `NSpid` value: several values mean a nested
+/// PID namespace, while one can also come from a procfs mounted inside
+/// that namespace. A missing line (older procfs) fails open.
+#[cfg(target_os = "linux")]
+fn is_initial_nspid(status: &str) -> bool {
+  // The initial namespace shows one value; a nested one shows one per
+  // visible level. A procfs mounted inside the nested namespace hides the
+  // outer levels, so one value is a hint, not proof.
+  status
+    .lines()
+    .find_map(|line| line.strip_prefix("NSpid:"))
+    .is_none_or(|rest| {
+      let mut pids = rest.split_whitespace();
+      pids.next().is_some() && pids.next().is_none()
+    })
 }
 
 /// Lifecycle event worth waking up for.
@@ -289,13 +361,85 @@ impl SeqTracker {
   }
 }
 
+/// One framed multicast request: `nlmsghdr` + `cn_msg` + the op payload.
+#[cfg(target_os = "linux")]
+fn mcast_request(op: u32) -> [u8; MCAST_REQUEST_LEN] {
+  let mut message = [0u8; MCAST_REQUEST_LEN];
+  message[0..4].copy_from_slice(&(MCAST_REQUEST_LEN as u32).to_le_bytes());
+  message[4..6].copy_from_slice(&NLMSG_MIN_TYPE.to_le_bytes());
+  message[6..8].copy_from_slice(&NLM_F_REQUEST.to_le_bytes());
+  message[8..12].copy_from_slice(&0u32.to_le_bytes());
+  message[12..16].copy_from_slice(&std::process::id().to_le_bytes());
+  let cn = SIZE_NLMSGHDR;
+  message[cn..cn + 4].copy_from_slice(&CN_IDX_PROC.to_le_bytes());
+  message[cn + 4..cn + 8].copy_from_slice(&CN_VAL_PROC.to_le_bytes());
+  message[cn + 8..cn + 12].copy_from_slice(&0u32.to_le_bytes());
+  message[cn + 12..cn + 16].copy_from_slice(&0u32.to_le_bytes());
+  message[cn + 16..cn + 18].copy_from_slice(&(4u16).to_le_bytes());
+  message[cn + 18..cn + 20].copy_from_slice(&0u16.to_le_bytes());
+  message[cn + 20..cn + 24].copy_from_slice(&op.to_le_bytes());
+  message
+}
+
+/// Send one multicast op on an open connector socket.
+#[cfg(target_os = "linux")]
+fn send_mcast_op(fd: i32, op: u32) -> std::io::Result<()> {
+  let message = mcast_request(op);
+  // SAFETY: `fd` is an open socket and `message` outlives the call.
+  let sent = unsafe {
+    libc::send(
+      fd,
+      message.as_ptr() as *const libc::c_void,
+      message.len(),
+      0,
+    )
+  };
+  if sent == message.len() as isize {
+    Ok(())
+  } else {
+    Err(std::io::Error::last_os_error())
+  }
+}
+
+/// Owns a subscribed netlink socket. Drop sends `IGNORE` then closes: the
+/// kernel keeps the global listener count until that message arrives, and a
+/// leaked count lets sandboxed sockets receive broadcasts they never got.
+#[cfg(target_os = "linux")]
+struct Subscription {
+  fd: i32,
+}
+
+#[cfg(target_os = "linux")]
+impl Subscription {
+  fn new(fd: i32) -> Self {
+    Self { fd }
+  }
+
+  fn fd(&self) -> i32 {
+    self.fd
+  }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Subscription {
+  fn drop(&mut self) {
+    if let Err(err) = send_mcast_op(self.fd, PROC_CN_MCAST_IGNORE) {
+      tracing::debug!("[Process Scanner] cn_proc unsubscribe failed: {err}");
+    }
+    // SAFETY: this guard owns the fd and Drop runs exactly once.
+    unsafe {
+      libc::close(self.fd);
+    }
+  }
+}
+
 /// Subscribe a netlink socket to `cn_proc` and read the kernel ACK; returns
-/// `(fd, ack_seen)` or the refusal reason (nonzero `NLMSG_ERROR` or `ack.err`).
+/// the owning subscription or the refusal reason.
 /// The caller falls back to polling on any error.
 #[cfg(target_os = "linux")]
-fn subscribe() -> Result<(i32, bool), Cow<'static, str>> {
-  // SAFETY: socket/bind/sendmsg/recv/close are called with valid
-  // arguments; the fd is closed by the caller on every path (see `watch`).
+fn subscribe() -> Result<(Subscription, bool), Cow<'static, str>> {
+  // SAFETY: socket and bind are called with valid arguments; failures
+  // close the fd here, and success hands it to `subscribe_bound`.
   let fd = unsafe {
     libc::socket(
       libc::AF_NETLINK,
@@ -346,36 +490,18 @@ fn subscribe() -> Result<(i32, bool), Cow<'static, str>> {
     }
     return Err(Cow::Owned(format!("bind failed: {err}")));
   }
-  // Framed subscription: nlmsghdr + cn_msg + one u32 payload.
-  let payload_len = 4;
-  let total_len = SIZE_NLMSGHDR + SIZE_CN_MSG + payload_len;
-  let mut message = vec![0u8; total_len];
-  message[0..4].copy_from_slice(&(total_len as u32).to_le_bytes());
-  message[4..6].copy_from_slice(&NLMSG_MIN_TYPE.to_le_bytes());
-  message[6..8].copy_from_slice(&NLM_F_REQUEST.to_le_bytes());
-  message[8..12].copy_from_slice(&0u32.to_le_bytes());
-  message[12..16].copy_from_slice(&std::process::id().to_le_bytes());
-  let cn = SIZE_NLMSGHDR;
-  message[cn..cn + 4].copy_from_slice(&CN_IDX_PROC.to_le_bytes());
-  message[cn + 4..cn + 8].copy_from_slice(&CN_VAL_PROC.to_le_bytes());
-  message[cn + 8..cn + 12].copy_from_slice(&0u32.to_le_bytes());
-  message[cn + 12..cn + 16].copy_from_slice(&0u32.to_le_bytes());
-  message[cn + 16..cn + 18].copy_from_slice(&(payload_len as u16).to_le_bytes());
-  message[cn + 18..cn + 20].copy_from_slice(&0u16.to_le_bytes());
-  message[cn + 20..cn + 24].copy_from_slice(&PROC_CN_MCAST_LISTEN.to_le_bytes());
-  let sent = unsafe {
-    libc::send(
-      fd,
-      message.as_ptr() as *const libc::c_void,
-      message.len(),
-      0,
-    )
-  };
-  if sent != message.len() as isize {
-    let err = last_os_error();
-    unsafe {
-      libc::close(fd);
-    }
+  subscribe_bound(fd)
+}
+
+/// Subscribe an already-bound socket and read the ACK. Split out so the
+/// refusal path is testable over a socketpair; the caller falls back to
+/// polling.
+#[cfg(target_os = "linux")]
+fn subscribe_bound(fd: i32) -> Result<(Subscription, bool), Cow<'static, str>> {
+  // From here on the socket may hold a kernel listener slot: wrap it
+  // before LISTEN so every error path sends IGNORE on drop.
+  let subscription = Subscription::new(fd);
+  if let Err(err) = send_mcast_op(fd, PROC_CN_MCAST_LISTEN) {
     return Err(Cow::Owned(format!("subscribe failed: {err}")));
   }
   // Read the kernel's ACK (bounded: this must not hang boot when the
@@ -399,13 +525,10 @@ fn subscribe() -> Result<(i32, bool), Cow<'static, str>> {
       // POSITIVE (PROC_EVENT_NONE ack): the errno table only knows the
       // positive spelling, so normalize or the operator loses the reason.
       let err = std::io::Error::from_raw_os_error(code.saturating_abs());
-      unsafe {
-        libc::close(fd);
-      }
       return Err(Cow::Owned(format!("subscribe refused: {err}")));
     }
   }
-  Ok((fd, ack_seen))
+  Ok((subscription, ack_seen))
 }
 
 /// First subscription-refusal code inside one ack datagram, if any: a
@@ -599,41 +722,33 @@ fn self_test(fd: i32, stop: &AtomicBool) -> SelfTestReport {
 }
 
 /// Block on `cn_proc`, forwarding events; returns on error, stop or receiver
-/// loss, closing the fd. `live` is claimed only after the self-test passes and
-/// cleared on every exit; off-Linux the stub always refuses (polling only).
+/// loss after unsubscribing (IGNORE) and closing, as `WatchError`. `live` is
+/// true only after the self-test passes and always cleared on exit.
 #[cfg(target_os = "linux")]
 pub fn watch(
   events: &GaugeSender<ProcEvent>,
   stop: &AtomicBool,
   invalidate: &AtomicBool,
   live: &AtomicBool,
-) -> Result<(), Cow<'static, str>> {
+) -> Result<(), WatchError> {
+  // Clears `live` on every return below, including the preset-stop and
+  // subscribe failures: a caller that passed a stale `true` must not keep it.
+  let _live = LiveGuard(live);
   // Preset stop skips subscribe, self-test and the blocking receive
   // entirely: shutdown before the first watch must not touch netlink.
-  // `live` stays untouched: it is claimed only further down (the caller
-  // initializes it false, so claiming can never leave stale state).
   if stop.load(Ordering::Acquire) {
     return Ok(());
   }
-  let (fd, ack_seen) = subscribe()?;
+  let (subscription, ack_seen) = subscribe().map_err(|reason| WatchError::new(reason, false))?;
+  let fd = subscription.fd();
   let report = self_test(fd, stop);
   // Directed shutdown during the self-test: exit quietly instead of
   // reporting stale liveness from a socket we are abandoning.
   if stop.load(Ordering::Acquire) {
     tracing::debug!("[Process Scanner] watcher stopping on shutdown (self-test cut)");
-    live.store(false, Ordering::Release);
-    // SAFETY: `fd` is the netlink socket owned by this function; this
-    // return ends ownership (same discipline as the paths below).
-    unsafe {
-      libc::close(fd);
-    }
     return Ok(());
   }
   if !report.live() {
-    live.store(false, Ordering::Release);
-    unsafe {
-      libc::close(fd);
-    }
     let ack = if ack_seen {
       "subscribe acked"
     } else {
@@ -643,10 +758,13 @@ pub fn watch(
       || "none".to_string(),
       |errno| std::io::Error::from_raw_os_error(errno).to_string(),
     );
-    return Err(Cow::Owned(format!(
-      "self-test saw {} datagram(s), {} parsed, {} timeouts, fatal errno {} in ~10s ({})",
-      report.datagrams, report.parsed, report.timeouts, fatal, ack
-    )));
+    return Err(WatchError::new(
+      format!(
+        "self-test saw {} datagram(s), {} parsed, {} timeouts, fatal errno {} in ~10s ({})",
+        report.datagrams, report.parsed, report.timeouts, fatal, ack
+      ),
+      false,
+    ));
   }
   // Delivery proven — only here is the watcher believed up. Claiming
   // after the self-test (instead of the caller presetting it) means a
@@ -677,10 +795,6 @@ pub fn watch(
       if err.kind() == std::io::ErrorKind::WouldBlock {
         if stop.load(Ordering::Acquire) {
           tracing::debug!("[Process Scanner] watcher stopping on shutdown");
-          live.store(false, Ordering::Release);
-          unsafe {
-            libc::close(fd);
-          }
           return Ok(());
         }
         continue;
@@ -694,14 +808,10 @@ pub fn watch(
         invalidate.store(true, Ordering::Release);
         continue;
       }
-      live.store(false, Ordering::Release);
-      unsafe {
-        libc::close(fd);
-      }
-      return Err(Cow::Owned(format!(
-        "recv failed: {err} ({} seq gap(s) seen)",
-        seqs.missed()
-      )));
+      return Err(WatchError::new(
+        format!("recv failed: {err} ({} seq gap(s) seen)", seqs.missed()),
+        true,
+      ));
     }
     if received == 0 {
       continue;
@@ -711,12 +821,6 @@ pub fn watch(
     // (the receiver-drop chain only fires once dispatch exits).
     if stop.load(Ordering::Acquire) {
       tracing::debug!("[Process Scanner] watcher stopping on shutdown (flood cut)");
-      live.store(false, Ordering::Release);
-      // SAFETY: `fd` is the netlink socket owned by this function; this
-      // return ends ownership (same discipline as the error paths below).
-      unsafe {
-        libc::close(fd);
-      }
       return Ok(());
     }
     // One shared walk feeds both continuity tracking and forwarding:
@@ -751,35 +855,39 @@ pub fn watch(
     }
     if gone {
       // Receiver gone (daemon shutting down): quiet exit.
-      live.store(false, Ordering::Release);
-      unsafe {
-        libc::close(fd);
-      }
       return Ok(());
     }
   }
 }
 
 /// Non-Linux stub: `cn_proc` does not exist there, so watching always
-/// refuses and the periodic scan stays the only path. `_live` is only
-/// signature parity: nothing here is ever believed.
+/// refuses and the periodic scan stays the only path. The liveness guard
+/// still clears the flag on every exit.
 #[cfg(not(target_os = "linux"))]
 pub fn watch(
   _events: &adsum_telemetry::GaugeSender<ProcEvent>,
   stop: &AtomicBool,
   _invalidate: &AtomicBool,
-  _live: &AtomicBool,
-) -> Result<(), Cow<'static, str>> {
+  live: &AtomicBool,
+) -> Result<(), WatchError> {
+  let _live = LiveGuard(live);
   if stop.load(Ordering::Acquire) {
     return Ok(());
   }
-  Err(Cow::Borrowed("proc-events unsupported on this platform"))
+  Err(WatchError::new(
+    Cow::Borrowed("proc-events unsupported on this platform"),
+    false,
+  ))
 }
 
 #[cfg(all(test, target_os = "linux"))]
 #[path = "../tests/unit/ack.rs"]
-mod tests;
+mod ack_tests;
 
 #[cfg(all(test, target_os = "linux"))]
 #[path = "../tests/unit/namespace.rs"]
 mod namespace_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../tests/unit/subscription.rs"]
+mod subscription_tests;

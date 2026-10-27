@@ -1,4 +1,5 @@
-//! `uid_map` identity tests (Linux only — procfs only exists there).
+//! `uid_map` and `NSpid` identity tests (Linux only: procfs only exists
+//! there).
 
 use super::*;
 
@@ -41,4 +42,25 @@ fn missing_tokens_are_not_initial() {
 fn mapping_beyond_identity_is_not_initial() {
   // A second line maps another range: identity head, non-initial whole.
   assert!(!is_initial_uid_map("0 0 4294967295\n1000 1000 1\n"));
+}
+
+#[test]
+fn single_nspid_value_is_initial() {
+  // The initial PID namespace has one pid value; older procfs omits the
+  // line entirely, which is also the initial namespace.
+  assert!(is_initial_nspid("Name:\tadsum\nNSpid:\t1234\n"));
+  assert!(is_initial_nspid("Name:\tadsum\n"));
+}
+
+#[test]
+fn nested_pid_namespace_is_not_initial() {
+  // A process in a nested PID namespace has one pid per visible level.
+  assert!(!is_initial_nspid("NSpid:\t1234\t42\n"));
+  assert!(!is_initial_nspid("NSpid: 1234 42 7"));
+}
+
+#[test]
+fn empty_or_malformed_nspid_is_not_initial() {
+  assert!(!is_initial_nspid("NSpid:\n"));
+  assert!(!is_initial_nspid("NSpid:   \n"));
 }

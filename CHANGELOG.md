@@ -105,6 +105,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enabled AND live), which today can only hold on Linux. No behavior
   change: the full test suite passes untouched, and the `parse_proc_pid`
   suite moved with its function.
+- **Watcher opt-in under systemd:** the user-unit guide now shows a drop-in
+  that resets the namespace-creating sandbox directives so `cn_proc` can
+  deliver, with the filesystem and device isolation loss stated explicitly.
+  The default unit keeps its sandbox and polling.
 
 ### Added
 - **SteamAppId tier on Windows and macOS:** `read_steam_app_id` was a
@@ -136,13 +140,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loop sets it on both edges of the watch.
 
 ### Fixed
-- **Proc-events watcher:** a non-initial user namespace now turns the
-  watcher off with one warning instead of retrying a self-test the kernel
-  can never satisfy. `watcher_live` is set only after the self-test parses
-  an event and cleared on every exit. A refusal is recognized both as a
-  nonzero `NLMSG_ERROR` and as a `PROC_EVENT_NONE` ack with an error in the
-  event body, and retries back off from 5 seconds to a 5-minute cap instead
-  of waiting a fixed 5 minutes.
+- **Proc-events watcher:** a non-initial user or PID namespace now turns
+  the watcher off with one warning instead of retrying a self-test the
+  kernel can never satisfy. `watcher_live` is set only after the self-test
+  parses an event and cleared on every exit. A refusal is recognized both
+  as a nonzero `NLMSG_ERROR` and as a `PROC_EVENT_NONE` ack with an error
+  in the event body, and retries back off from 5 seconds to a 5-minute cap
+  instead of waiting a fixed 5 minutes. A watch that proved delivery resets
+  that backoff, so a late failure retries soon instead of inheriting a stale
+  cap.
+- **Proc-events listener leak:** every exit after a successful subscription
+  now sends `PROC_CN_MCAST_IGNORE` before closing the netlink socket. The
+  kernel decrements its global listener count only on that message, so a
+  stopped watcher, a failed self-test or a lost receiver no longer leaves
+  the count positive. A leaked count let sandboxed sockets receive events
+  they were never granted.
+- **PID namespace gate:** the watcher also reads `NSpid` from
+  `/proc/self/status` and stays off when it sees several values, which
+  means a nested PID namespace. A procfs mounted inside that namespace
+  collapses the line to one value, so the self-test remains the final word.
 - Steam demos whose executable is not in the database (VEIN Demo is the
   motivating case) are now detected when the process runs under the AppId's
   own install dir (`steamapps/common/<installdir>/`). The install dir is

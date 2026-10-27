@@ -186,9 +186,10 @@ fresh enumeration, never from the cache.
 
 The kernel delivery is officially lossy, so the watcher is best-effort: it
 can rarely go silent for stretches. When its self-test fails it resubscribes
-instead of dying, except in a non-initial user namespace, where `cn_proc`
-can never deliver: the watcher logs that once and stays off. Polling covers
-everything either way. Use
+instead of dying. A detected non-initial user or PID namespace turns the
+watcher off with one warning; a procfs mounted inside a nested PID
+namespace can hide the nesting, so the self-test remains the final word.
+Polling covers everything either way. Use
 `--no-proc-events` / `ADSUM_NO_PROC_EVENTS=1` to disable the watcher and
 run polling only (which also disables the incremental cache), or `-n` /
 `--no-process-scan` to disable detection entirely.

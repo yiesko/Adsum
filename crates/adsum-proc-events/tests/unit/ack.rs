@@ -3,20 +3,25 @@
 
 use super::*;
 
+/// `nlmsg_flags` bit marking a multipart reply.
+const NLM_F_MULTI: u16 = 0x2;
+/// `nlmsg_type` of the marker that wraps a kernel `cn_proc` reply.
+const NLMSG_DONE: u16 = 0x3;
+
 /// One netlink frame: `nlmsghdr` framing `body` under `msg_type`.
 fn frame(msg_type: u16, body: &[u8]) -> Vec<u8> {
   let total = SIZE_NLMSGHDR + body.len();
   let mut buf = vec![0u8; total];
   buf[0..4].copy_from_slice(&(total as u32).to_le_bytes());
   buf[4..6].copy_from_slice(&msg_type.to_le_bytes());
-  buf[6..8].copy_from_slice(&2u16.to_le_bytes());
+  buf[6..8].copy_from_slice(&NLM_F_MULTI.to_le_bytes());
   buf[SIZE_NLMSGHDR..].copy_from_slice(body);
   buf
 }
 
 /// One kernel ack datagram in a given refusal shape; `NLMSG_DONE`
-/// (type 3) wraps the cn_proc data message, `proc_event` holds
-/// `what` with `ack.err` at the pid offset (union base).
+/// wraps the cn_proc data message, `proc_event` holds `what` with
+/// `ack.err` at the pid offset (union base).
 fn ack_frame(what: u32, ack_err: i32) -> Vec<u8> {
   let mut body = vec![0u8; SIZE_CN_MSG + 24];
   body[0..4].copy_from_slice(&CN_IDX_PROC.to_le_bytes());
@@ -24,7 +29,7 @@ fn ack_frame(what: u32, ack_err: i32) -> Vec<u8> {
   let event = SIZE_CN_MSG;
   body[event..event + 4].copy_from_slice(&what.to_le_bytes());
   body[event + 16..event + 20].copy_from_slice(&ack_err.to_le_bytes());
-  frame(3, &body)
+  frame(NLMSG_DONE, &body)
 }
 
 #[test]
@@ -63,7 +68,7 @@ fn early_event_winning_the_ack_race_is_not_a_refusal() {
 fn foreign_connector_traffic_is_not_a_refusal() {
   let mut body = vec![0u8; SIZE_CN_MSG + 24];
   body[0..4].copy_from_slice(&9u32.to_le_bytes());
-  let datagram = frame(3, &body);
+  let datagram = frame(NLMSG_DONE, &body);
   assert_eq!(subscribe_ack_error(&datagram), None);
 }
 

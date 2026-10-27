@@ -149,7 +149,9 @@ What matters:
   `MemoryDenyWriteExecute`, all verified against a live boot.
 - **User namespaces and the overflow UID**: in a *user* unit,
   `PrivateDevices=yes` and `ProtectKernelTunables=yes` enable `PrivateUsers`
-  implicitly. The unit then runs in a user namespace where host UID 0 (and
+  implicitly. That namespace also makes `cn_proc` unavailable, so the event
+  watcher stays on polling (section 4 shows the opt-in drop-in). The unit
+  then runs in a user namespace where host UID 0 (and
   every other unmapped UID) appears as the overflow UID
   (`/proc/sys/kernel/overflowuid`, usually `65534`). Adsum accepts that UID
   only for ancestor mount points and canonical temp roots, only when
@@ -219,6 +221,51 @@ A drop-in only replaces what it defines. Inspect the result with
 systemctl --user daemon-reload   # ALWAYS after editing units or drop-ins
 systemctl --user restart adsum.service
 ```
+
+### Enabling the event watcher (opt-in, weaker sandbox)
+
+The default unit's sandbox creates a user namespace, where the kernel
+ignores `cn_proc`; the watcher logs one warning and stays on polling. A
+user unit can enable the watcher without a system unit by removing every
+directive that creates a user namespace. This stays a user unit: no root,
+no system manager, and no username in any file.
+
+Create `~/.config/systemd/user/adsum.service.d/watcher.conf`:
+
+```ini
+[Service]
+ProtectSystem=no
+ProtectHome=no
+BindPaths=
+ReadWritePaths=
+PrivateDevices=no
+ProtectKernelTunables=no
+ProtectKernelModules=no
+ProtectKernelLogs=no
+ProtectClock=no
+ProtectHostname=no
+ProtectControlGroups=no
+```
+
+Apply and confirm:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user restart adsum.service
+journalctl --user -u adsum.service -b | grep "watcher live"
+```
+
+**Trade-off:** these resets remove the filesystem and device isolation. The
+service can read and write everything your account can, including `~/.ssh`
+and shell startup files, and it can access the devices your account can.
+`NoNewPrivileges`, the `@system-service` syscall allowlist,
+`RestrictAddressFamilies` (with `AF_NETLINK`), `LockPersonality`,
+`RestrictSUIDSGID`, `RestrictRealtime`, `SystemCallArchitectures` and
+`MemoryDenyWriteExecute` stay enabled. Use this only if instant detection is
+worth that trade-off.
+
+Do not add `PrivateUsers=yes` or `PrivatePIDs=yes` back: either namespace
+makes the kernel ignore `cn_proc` again.
 
 ## 5. Lifecycle
 
