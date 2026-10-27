@@ -186,7 +186,9 @@ fresh enumeration, never from the cache.
 
 The kernel delivery is officially lossy, so the watcher is best-effort: it
 can rarely go silent for stretches. When its self-test fails it resubscribes
-instead of dying, and polling backstops everything either way. Use
+instead of dying, except in a non-initial user namespace, where `cn_proc`
+can never deliver: the watcher logs that once and stays off. Polling covers
+everything either way. Use
 `--no-proc-events` / `ADSUM_NO_PROC_EVENTS=1` to disable the watcher and
 run polling only (which also disables the incremental cache), or `-n` /
 `--no-process-scan` to disable detection entirely.

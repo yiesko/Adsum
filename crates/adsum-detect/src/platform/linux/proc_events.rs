@@ -30,7 +30,7 @@ const DISPATCH_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// backlog gauge so the caller can store it where the census reads depth
 /// and shed totals (see `ProcessServer::watch_gauge`).
 pub(crate) fn spawn_proc_watcher(server: &ProcessServer) -> adsum_telemetry::QueueGauge {
-  use adsum_proc_events::{ProcEvent, watch};
+  use adsum_proc_events::{ProcEvent, in_initial_user_namespace, watch};
   use adsum_telemetry::QueueGauge;
 
   let (tx, rx) = QueueGauge::pair();
@@ -162,18 +162,36 @@ pub(crate) fn spawn_proc_watcher(server: &ProcessServer) -> adsum_telemetry::Que
   // Best-effort watcher with periodic resubscribe: a failed self-test
   // (or a mid-run socket death) falls back to polling, but a transient
   // kernel stall must not pin polling until the next daemon restart —
-  // delivery has been observed to resume on its own. First failure warns
-  // (the documented sandbox diagnosis), later ones stay in debug so
-  // genuinely unsupported systems do not log every 5 minutes forever.
+  // delivery has been observed to resume on its own. First failure
+  // warns, later ones stay in debug so genuinely unsupported systems do
+  // not log every 5 minutes forever (the sandbox case never reaches
+  // this loop: it is diagnosed once, before it).
   let watcher_state = server.clone();
   spawn_worker(
     Arc::clone(&server.worker_handles),
     "adsum-watch",
     move || {
+      // cn_proc delivers only from the initial user namespace: inside a
+      // user namespace the kernel silently ignores the subscription,
+      // so no probe could ever prove anything and the retry loop would
+      // spin through failed self-tests forever. Detect the sandbox
+      // once, warn, and leave the watcher off — polling alone drives
+      // detection (nothing was ever believed, so there is no cache
+      // edge to invalidate here either).
+      if !in_initial_user_namespace() {
+        tracing::warn!(
+          "[Process Scanner] cn_proc unavailable: running in a non-initial user namespace (sandbox), polling only; watcher disabled"
+        );
+        return;
+      }
       // Register once: `shutdown` unparks this thread out of the retry
-      // park below, so teardown never waits out the five minutes.
+      // park below, so teardown never waits out the backoff ceiling.
       track_shutdown_thread(&watcher_state.shutdown_wake);
       let mut attempts = 0u32;
+      // Exponential retry backoff: a first failure is likely a
+      // transient kernel stall worth retrying soon, while a persistent
+      // one settles into the old five-minute cadence.
+      let mut backoff = Duration::from_secs(5);
       loop {
         // Directed shutdown before blocking in `watch()`: with the flag
         // set the call below returns at once (preset-stop fast path).
@@ -189,24 +207,21 @@ pub(crate) fn spawn_proc_watcher(server: &ProcessServer) -> adsum_telemetry::Que
         watcher_state
           .cache_dirty
           .store(true, std::sync::atomic::Ordering::Release);
-        // Believed up while the blocking watch runs; a fast failure flips
-        // back before the retry sleep, so polling-only windows never back
-        // off (see `scan_cadence`).
-        watcher_state
-          .watcher_live
-          .store(true, std::sync::atomic::Ordering::Release);
-        match watch(&tx, &watcher_state.shutdown, &watcher_state.cache_dirty) {
-          // Receiver gone: daemon shutting down.
+        // Liveness (the scan-cadence hint) is owned by `watch()` — the
+        // worker stores nothing: it is claimed only after a proven
+        // self-test and cleared on every exit path (see `scan_cadence`).
+        match watch(
+          &tx,
+          &watcher_state.shutdown,
+          &watcher_state.cache_dirty,
+          &watcher_state.watcher_live,
+        ) {
+          // Receiver gone: daemon shutting down. `watch()` already
+          // cleared `watcher_live` on the way out.
           Ok(()) => {
-            watcher_state
-              .watcher_live
-              .store(false, std::sync::atomic::Ordering::Release);
             break;
           }
           Err(err) => {
-            watcher_state
-              .watcher_live
-              .store(false, std::sync::atomic::Ordering::Release);
             // Poll once now: the watcher just died, so the scan loop must
             // not sit out its whole backoff on possibly stale state.
             unpark_scan_wake(&watcher_state.scan_wake);
@@ -222,11 +237,14 @@ pub(crate) fn spawn_proc_watcher(server: &ProcessServer) -> adsum_telemetry::Que
             }
             // Interruptible park (not `sleep`): the pre-park check exits
             // at once when shutdown is already requested, otherwise the
-            // unpark bounds the five minutes and the loop-top check exits.
+            // unpark bounds the current backoff and the loop-top check
+            // exits. Doubling happens AFTER the park: the wait that just
+            // ended is the one the previous failure paid for.
             if is_shutting_down(&watcher_state.shutdown) {
               break;
             }
-            std::thread::park_timeout(std::time::Duration::from_secs(5 * 60));
+            std::thread::park_timeout(backoff);
+            backoff = backoff.saturating_mul(2).min(Duration::from_secs(300));
           }
         }
       }

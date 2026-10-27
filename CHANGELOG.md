@@ -136,6 +136,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loop sets it on both edges of the watch.
 
 ### Fixed
+- **Proc-events watcher:** a non-initial user namespace now turns the
+  watcher off with one warning instead of retrying a self-test the kernel
+  can never satisfy. `watcher_live` is set only after the self-test parses
+  an event and cleared on every exit. A refusal is recognized both as a
+  nonzero `NLMSG_ERROR` and as a `PROC_EVENT_NONE` ack with an error in the
+  event body, and retries back off from 5 seconds to a 5-minute cap instead
+  of waiting a fixed 5 minutes.
 - Steam demos whose executable is not in the database (VEIN Demo is the
   motivating case) are now detected when the process runs under the AppId's
   own install dir (`steamapps/common/<installdir>/`). The install dir is

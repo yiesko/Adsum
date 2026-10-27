@@ -1,39 +1,8 @@
 //! Linux process-event watcher (netlink `cn_proc`): EXEC/EXIT in real time.
-//!
-//! The periodic `/proc` scan stays as the source of truth (and the only
-//! path off-Linux), but it is blind between ticks: game START waits up to
-//! a full interval, game EXIT waits just as long to clear. This watcher
-//! closes both gaps without polling:
-//!
-//! - `EXEC(pid)`: classify that ONE process immediately (same matcher as
-//!   the scan loop) and emit hits at once — cards appear in milliseconds.
-//! - `EXIT(pid)`: when a tracked game pid dies, wake the scan loop early
-//!   so the natural full scan clears the slot at once instead of waiting
-//!   out the interval.
-//!
-//! Protocol notes (validated against the kernel headers via the
-//! `proc-connector` reference implementation):
-//! - Every datagram is `nlmsghdr` (16B) + `cn_msg` (20B) + payload —
-//!   sending a bare `cn_msg` is silently dropped by the kernel.
-//! - `proc_event.what` is a bitmask (`EXEC = 0x2`, `EXIT = 0x80000000`;
-//!   NOT sequential), pid sits at the exec/exit union base.
-//! - Subscribe is acknowledged with `NLMSG_ERROR` (code 0); event flow
-//!   itself is proven by the boot self-test below.
-//!
-//! Best-effort by design: setup failure (hardened kernel, containers,
-//! missing caps) logs once and leaves pure polling in charge — never an
-//! error, never a panic. Steady-state cost is ~zero syscalls (one
-//! blocking `recv`); per-EXEC cost is one cmdline read plus the normal
-//! classify chain, misses included. Build storms (`cargo build` forks
-//! thousands of short-lived processes) only cost cmdline reads + AC
-//! probes, still orders of magnitude below a full `/proc` sweep.
-//!
-//! Loss accounting: netlink delivery is officially lossy (`connector.rst`:
-//! memory pressure, queue overruns), so every observed message feeds a
-//! [`SeqTracker`] over the kernel per-CPU `cn_msg.seq` counter — silent
-//! drops surface as debug-level gap lines plus a counter instead of
-//! vanishing without a trace.
+//! The periodic `/proc` scan stays the source of truth; watcher setup failure
+//! falls back to pure polling — never an error, never a panic.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -80,6 +49,47 @@ const PROC_CN_MCAST_LISTEN: u32 = 0x1;
 /// `proc_event.what` bitmask values (`linux/cn_proc.h` — NOT sequential).
 const PROC_EVENT_EXEC: u32 = 0x0000_0002;
 const PROC_EVENT_EXIT: u32 = 0x8000_0000;
+/// `PROC_EVENT_NONE`: the plain ACK variant a subscription answer may
+/// ride as (its refusal field sits at the pid offset — see
+/// `subscribe_ack_error`).
+#[cfg(target_os = "linux")]
+const PROC_EVENT_NONE: u32 = 0x0000_0000;
+
+/// Whether this process is in the initial user namespace — the only place
+/// `cn_proc` delivers (inside one the kernel silently ignores the
+/// subscription). Unreadable procfs fails open to the self-test.
+#[must_use]
+#[cfg(target_os = "linux")]
+pub fn in_initial_user_namespace() -> bool {
+  // `uid_map` beats the `/proc/*/ns/user` inode comparison: a sandboxed
+  // PID namespace renumbers `/proc/1` (enslavement looks like "initial")
+  // and reading `/proc/1/ns/user` from a userns can EACCES. The initial
+  // namespace is DEFINED by the full identity map — exactly `0 0 u32::MAX`.
+  match std::fs::read_to_string("/proc/self/uid_map") {
+    Ok(map) => is_initial_uid_map(&map),
+    // Unknown states (procfs unreadable): do not gate — self-test decides.
+    Err(_) => true,
+  }
+}
+
+/// Whether `map` IS the initial namespace's identity mapping: exactly one
+/// full-range line (`0 0 u32::MAX`, whitespace-agnostic). Unparsable,
+/// short or EXTRA tokens mean some non-identity mapping — `false`.
+#[cfg(target_os = "linux")]
+fn is_initial_uid_map(map: &str) -> bool {
+  // `/proc/self/uid_map` lines are `inner outer count`; the initial
+  // namespace carries exactly one line. Token-by-token in order (no blind
+  // `filter_map`): any parse miss or missing token is not identity.
+  let mut tokens = map.split_whitespace();
+  let parse = |tokens: &mut std::str::SplitWhitespace<'_>| -> Option<u32> {
+    tokens.next().and_then(|tok| tok.parse::<u32>().ok())
+  };
+  parse(&mut tokens) == Some(0)
+    && parse(&mut tokens) == Some(0)
+    && parse(&mut tokens) == Some(u32::MAX)
+    // Any further line maps another range — not the initial namespace.
+    && tokens.next().is_none()
+}
 
 /// Lifecycle event worth waking up for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -279,14 +289,11 @@ impl SeqTracker {
   }
 }
 
-/// Subscribe a netlink connector socket to `cn_proc` broadcasts: socket,
-/// bind (kernel-assigned pid, group member), framed LISTEN request, then
-/// read the kernel's ACK. Returns the fd plus whether any ack datagram
-/// arrived (an ACK proves the LISTEN registered; its absence with later
-/// silence points at registration, not traffic), or a message when the
-/// kernel refuses (caller falls back to polling).
+/// Subscribe a netlink socket to `cn_proc` and read the kernel ACK; returns
+/// `(fd, ack_seen)` or the refusal reason (nonzero `NLMSG_ERROR` or `ack.err`).
+/// The caller falls back to polling on any error.
 #[cfg(target_os = "linux")]
-fn subscribe() -> Result<(i32, bool), String> {
+fn subscribe() -> Result<(i32, bool), Cow<'static, str>> {
   // SAFETY: socket/bind/sendmsg/recv/close are called with valid
   // arguments; the fd is closed by the caller on every path (see `watch`).
   let fd = unsafe {
@@ -297,7 +304,7 @@ fn subscribe() -> Result<(i32, bool), String> {
     )
   };
   if fd < 0 {
-    return Err(format!("socket failed: {}", last_os_error()));
+    return Err(Cow::Owned(format!("socket failed: {}", last_os_error())));
   }
   // Room for exec storms: a burst overflowing the default ~200KB rcvbuf
   // surfaces as ENOBUFS (a dropped event, not a dead socket) — size up
@@ -337,7 +344,7 @@ fn subscribe() -> Result<(i32, bool), String> {
     unsafe {
       libc::close(fd);
     }
-    return Err(format!("bind failed: {err}"));
+    return Err(Cow::Owned(format!("bind failed: {err}")));
   }
   // Framed subscription: nlmsghdr + cn_msg + one u32 payload.
   let payload_len = 4;
@@ -369,41 +376,101 @@ fn subscribe() -> Result<(i32, bool), String> {
     unsafe {
       libc::close(fd);
     }
-    return Err(format!("subscribe failed: {err}"));
+    return Err(Cow::Owned(format!("subscribe failed: {err}")));
   }
   // Read the kernel's ACK (bounded: this must not hang boot when the
   // kernel takes the message yet answers nothing). A timeout is NOT a
   // refusal — quiet systems emit nothing to answer with — so only an
-  // explicit nonzero ERROR aborts; delivery itself is proven by the
-  // self-test below.
+  // explicit refusal aborts (either shape `subscribe_ack_error`
+  // detects); delivery itself is proven by the self-test below.
   set_recv_timeout(fd, Some(std::time::Duration::from_secs(2)));
   let mut ack = [0u8; 4096];
   let received = unsafe { libc::recv(fd, ack.as_mut_ptr() as *mut libc::c_void, ack.len(), 0) };
   let mut ack_seen = false;
   if received > 0 {
+    // Any datagram counts as heard (delivery itself is proven by the
+    // self-test below) — but the kernel may REFUSE the subscription in
+    // either shape `subscribe_ack_error` detects, and proceeding then
+    // means an idle socket claiming liveness forever.
     ack_seen = true;
-    // A nonzero ERROR code refuses us; anything else (zero-ack, an early
-    // event that won the race) means proceed.
     let ack = &ack[..received as usize];
-    if ack.len() >= SIZE_NLMSGHDR + 4 {
-      let msg_type = u16::from_le_bytes(ack[4..6].try_into().unwrap_or([0, 0]));
-      if msg_type == NLMSG_ERROR {
-        let code = i32::from_le_bytes(
-          ack[SIZE_NLMSGHDR..SIZE_NLMSGHDR + 4]
-            .try_into()
-            .unwrap_or([0, 0, 0, 0]),
-        );
-        if code != 0 {
-          let err = std::io::Error::from_raw_os_error(code);
-          unsafe {
-            libc::close(fd);
-          }
-          return Err(format!("subscribe refused: {err}"));
-        }
+    if let Some(code) = subscribe_ack_error(ack) {
+      // Refusals arrive NEGATIVE (netlink `nlmsgerr.error` convention) or
+      // POSITIVE (PROC_EVENT_NONE ack): the errno table only knows the
+      // positive spelling, so normalize or the operator loses the reason.
+      let err = std::io::Error::from_raw_os_error(code.saturating_abs());
+      unsafe {
+        libc::close(fd);
       }
+      return Err(Cow::Owned(format!("subscribe refused: {err}")));
     }
   }
   Ok((fd, ack_seen))
+}
+
+/// First subscription-refusal code inside one ack datagram, if any: a
+/// nonzero `NLMSG_ERROR` code, or a `PROC_EVENT_NONE` ack with a nonzero
+/// `ack.err` at the union base (offset `event[16..20]`, like the pid).
+#[cfg(target_os = "linux")]
+fn subscribe_ack_error(buf: &[u8]) -> Option<i32> {
+  // Walk-style like `walk_proc_messages`: its visitor API carries no place
+  // for the ack code, so this is a second, terse walk over the same
+  // framing. Some kernels answer an unauthorized LISTEN through the
+  // `PROC_EVENT_NONE` ack instead of a plain error — treating that as
+  // "heard, proceed" left the watcher idle forever on a subscription
+  // that was never granted. `None` proceeds; a refusal closes the
+  // socket with the wrapped errno.
+  let mut offset = 0;
+  while buf.len() - offset >= SIZE_NLMSGHDR {
+    let len = u32::from_le_bytes([
+      buf[offset],
+      buf[offset + 1],
+      buf[offset + 2],
+      buf[offset + 3],
+    ]) as usize;
+    let msg_type = u16::from_le_bytes([buf[offset + 4], buf[offset + 5]]);
+    if len < SIZE_NLMSGHDR || buf.len() - offset < len {
+      return None;
+    }
+    let body = &buf[offset + SIZE_NLMSGHDR..offset + len];
+    match msg_type {
+      NLMSG_NOOP | NLMSG_OVERRUN => {}
+      NLMSG_ERROR => {
+        // Error acks carry the code in the first 4 bytes; a zero code
+        // is the subscription acknowledgement — both skipped.
+        if body.len() >= 4 {
+          let code = i32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+          if code != 0 {
+            return Some(code);
+          }
+        }
+      }
+      _ => {
+        // Data messages: kernel connector traffic is always idx/val
+        // 1/1; the `PROC_EVENT_NONE` ack rides like any event.
+        if body.len() >= SIZE_CN_MSG + 20 {
+          let idx = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+          let val = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+          if idx == CN_IDX_PROC && val == CN_VAL_PROC {
+            let event = &body[SIZE_CN_MSG..];
+            let what = u32::from_le_bytes([event[0], event[1], event[2], event[3]]);
+            if what == PROC_EVENT_NONE {
+              let err = i32::from_le_bytes([event[16], event[17], event[18], event[19]]);
+              if err != 0 {
+                return Some(err);
+              }
+            }
+          }
+        }
+      }
+    }
+    // Messages are 4-byte aligned; guard against a zero stride.
+    offset += len.max(SIZE_NLMSGHDR);
+    if offset >= buf.len() {
+      break;
+    }
+  }
+  None
 }
 
 #[cfg(target_os = "linux")]
@@ -531,22 +598,20 @@ fn self_test(fd: i32, stop: &AtomicBool) -> SelfTestReport {
   report
 }
 
-/// Block on `cn_proc` broadcasts, forwarding lifecycle events. Returns on
-/// receive errors (the caller logs once and keeps polling), when the
-/// receiver is gone, or when `stop` is set (directed shutdown: the retry
-/// thread must never wait out a blocked receive); the fd is closed on
-/// the way out.
-///
-/// Linux only: other platforms get a stub that always refuses (the
-/// periodic scan is the only path there).
+/// Block on `cn_proc`, forwarding events; returns on error, stop or receiver
+/// loss, closing the fd. `live` is claimed only after the self-test passes and
+/// cleared on every exit; off-Linux the stub always refuses (polling only).
 #[cfg(target_os = "linux")]
 pub fn watch(
   events: &GaugeSender<ProcEvent>,
   stop: &AtomicBool,
   invalidate: &AtomicBool,
-) -> Result<(), String> {
+  live: &AtomicBool,
+) -> Result<(), Cow<'static, str>> {
   // Preset stop skips subscribe, self-test and the blocking receive
   // entirely: shutdown before the first watch must not touch netlink.
+  // `live` stays untouched: it is claimed only further down (the caller
+  // initializes it false, so claiming can never leave stale state).
   if stop.load(Ordering::Acquire) {
     return Ok(());
   }
@@ -556,6 +621,7 @@ pub fn watch(
   // reporting stale liveness from a socket we are abandoning.
   if stop.load(Ordering::Acquire) {
     tracing::debug!("[Process Scanner] watcher stopping on shutdown (self-test cut)");
+    live.store(false, Ordering::Release);
     // SAFETY: `fd` is the netlink socket owned by this function; this
     // return ends ownership (same discipline as the paths below).
     unsafe {
@@ -564,6 +630,7 @@ pub fn watch(
     return Ok(());
   }
   if !report.live() {
+    live.store(false, Ordering::Release);
     unsafe {
       libc::close(fd);
     }
@@ -576,11 +643,15 @@ pub fn watch(
       || "none".to_string(),
       |errno| std::io::Error::from_raw_os_error(errno).to_string(),
     );
-    return Err(format!(
+    return Err(Cow::Owned(format!(
       "self-test saw {} datagram(s), {} parsed, {} timeouts, fatal errno {} in ~10s ({})",
       report.datagrams, report.parsed, report.timeouts, fatal, ack
-    ));
+    )));
   }
+  // Delivery proven — only here is the watcher believed up. Claiming
+  // after the self-test (instead of the caller presetting it) means a
+  // fast rejection leaves no stale "live" liveness behind.
+  live.store(true, Ordering::Release);
   tracing::info!(
     "[Process Scanner] proc-events watcher live (netlink cn_proc; best-effort, may rarely go silent — polling backstops)"
   );
@@ -606,6 +677,7 @@ pub fn watch(
       if err.kind() == std::io::ErrorKind::WouldBlock {
         if stop.load(Ordering::Acquire) {
           tracing::debug!("[Process Scanner] watcher stopping on shutdown");
+          live.store(false, Ordering::Release);
           unsafe {
             libc::close(fd);
           }
@@ -622,13 +694,14 @@ pub fn watch(
         invalidate.store(true, Ordering::Release);
         continue;
       }
+      live.store(false, Ordering::Release);
       unsafe {
         libc::close(fd);
       }
-      return Err(format!(
+      return Err(Cow::Owned(format!(
         "recv failed: {err} ({} seq gap(s) seen)",
         seqs.missed()
-      ));
+      )));
     }
     if received == 0 {
       continue;
@@ -638,6 +711,7 @@ pub fn watch(
     // (the receiver-drop chain only fires once dispatch exits).
     if stop.load(Ordering::Acquire) {
       tracing::debug!("[Process Scanner] watcher stopping on shutdown (flood cut)");
+      live.store(false, Ordering::Release);
       // SAFETY: `fd` is the netlink socket owned by this function; this
       // return ends ownership (same discipline as the error paths below).
       unsafe {
@@ -677,6 +751,7 @@ pub fn watch(
     }
     if gone {
       // Receiver gone (daemon shutting down): quiet exit.
+      live.store(false, Ordering::Release);
       unsafe {
         libc::close(fd);
       }
@@ -686,15 +761,25 @@ pub fn watch(
 }
 
 /// Non-Linux stub: `cn_proc` does not exist there, so watching always
-/// refuses and the periodic scan stays the only path.
+/// refuses and the periodic scan stays the only path. `_live` is only
+/// signature parity: nothing here is ever believed.
 #[cfg(not(target_os = "linux"))]
 pub fn watch(
   _events: &adsum_telemetry::GaugeSender<ProcEvent>,
   stop: &AtomicBool,
   _invalidate: &AtomicBool,
-) -> Result<(), String> {
+  _live: &AtomicBool,
+) -> Result<(), Cow<'static, str>> {
   if stop.load(Ordering::Acquire) {
     return Ok(());
   }
-  Err("proc-events unsupported on this platform".to_string())
+  Err(Cow::Borrowed("proc-events unsupported on this platform"))
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../tests/unit/ack.rs"]
+mod tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../tests/unit/namespace.rs"]
+mod namespace_tests;

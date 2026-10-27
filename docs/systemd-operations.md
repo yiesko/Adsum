@@ -37,6 +37,8 @@ If that line is missing, the event watcher did not start:
 - `ADSUM_NO_PROC_EVENTS=1` disables it on purpose, or
 - the unit restricts address families without `AF_NETLINK` (the shipped
   unit includes it: `RestrictAddressFamilies=... AF_NETLINK`), or
+- the service runs in a user namespace (`cn_proc` only delivers from the
+  initial user namespace; the watcher logs that once and stays off), or
 - you are not on Linux.
 
 Polling keeps working either way — games are detected at the scan cadence
