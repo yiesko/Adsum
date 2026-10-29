@@ -252,7 +252,9 @@ Apply and confirm:
 ```bash
 systemctl --user daemon-reload
 systemctl --user restart adsum.service
-journalctl --user -u adsum.service -b | grep "watcher live"
+invocation=$(systemctl --user show -p InvocationID --value adsum.service)
+journalctl --user -u adsum.service _SYSTEMD_INVOCATION_ID="$invocation" \
+  | grep "watcher live"
 ```
 
 **Trade-off:** these resets remove the filesystem and device isolation. The
