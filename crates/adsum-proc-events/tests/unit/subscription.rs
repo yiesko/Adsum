@@ -3,6 +3,20 @@
 
 use super::*;
 
+use std::sync::{Mutex, MutexGuard};
+
+/// Serializes the tests that open descriptors: `drop_sends_ignore_before_closing`
+/// reads its raw fd after dropping it, and a parallel `socketpair()` could
+/// otherwise reuse that number before the check.
+static FD_TESTS: Mutex<()> = Mutex::new(());
+
+/// Lock for every test in this binary that opens a descriptor.
+fn fd_test_lock() -> MutexGuard<'static, ()> {
+  FD_TESTS
+    .lock()
+    .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// A datagram socketpair whose peer keeps the test from touching netlink.
 fn socketpair() -> (i32, i32) {
   let mut fds = [0i32; 2];
@@ -29,10 +43,9 @@ fn request_carries_the_multicast_operation() {
   let message = mcast_request(PROC_CN_MCAST_IGNORE);
   let total = MCAST_REQUEST_LEN as u32;
   assert_eq!(u32::from_le_bytes(message[0..4].try_into().unwrap()), total);
-  assert_eq!(
-    u16::from_le_bytes(message[4..6].try_into().unwrap()),
-    NLMSG_MIN_TYPE
-  );
+  // Pinned to linux/netlink.h rather than the crate constant: a wrong
+  // NLMSG_MIN_TYPE would otherwise move both sides together.
+  assert_eq!(u16::from_le_bytes(message[4..6].try_into().unwrap()), 16);
   assert_eq!(
     u16::from_le_bytes(message[6..8].try_into().unwrap()),
     NLM_F_REQUEST
@@ -89,6 +102,7 @@ fn recv_frame(fd: i32) -> Vec<u8> {
 
 #[test]
 fn refusal_after_listen_still_unsubscribes() {
+  let _serial = fd_test_lock();
   let (local, peer) = socketpair();
   // The refusal is already queued when the subscription reads its ACK.
   let refusal = error_frame(-libc::EPERM);
@@ -124,11 +138,12 @@ fn refusal_after_listen_still_unsubscribes() {
 
 #[test]
 fn drop_sends_ignore_before_closing() {
+  let _serial = fd_test_lock();
   let (fd, peer) = socketpair();
   drop(Subscription::new(fd));
   // The guard must also close the descriptor, not only unsubscribe:
-  // `fcntl` on a closed fd fails with EBADF. Checked before the recv
-  // below to keep the fd-reuse window as small as possible.
+  // `fcntl` on a closed fd fails with EBADF. The test lock keeps any other
+  // descriptor-opening test from reusing this number before the check.
   // SAFETY: `fd` is a plain integer; `fcntl` on a closed descriptor is safe.
   let closed = unsafe { libc::fcntl(fd, libc::F_GETFD) };
   let err = std::io::Error::last_os_error();
