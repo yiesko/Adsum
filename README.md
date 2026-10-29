@@ -111,7 +111,7 @@ Logs go to stderr. `RUST_LOG` overrides the log level; when investigating detect
 
 ```toml
 [dependencies]
-adsum-core = { git = "https://github.com/yiesko/adsum", tag = "v0.39.0" }
+adsum-core = { git = "https://github.com/yiesko/adsum", tag = "v0.40.0" }
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal"] }
 ```
 
