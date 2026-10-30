@@ -1,109 +1,234 @@
+<div align="center">
+
 # Adsum
+
+**Show what you're playing on Discord, automatically.**<br>
+Rich Presence for Linux gaming and alternative Discord clients: one small Rust service, no Node.js.
 
 [![Latest release](https://img.shields.io/github/v/release/yiesko/adsum)](https://github.com/yiesko/adsum/releases/latest)
 [![Build](https://img.shields.io/github/actions/workflow/status/yiesko/adsum/build.yml?branch=main&label=build)](https://github.com/yiesko/adsum/actions/workflows/build.yml)
 [![Code quality](https://img.shields.io/github/actions/workflow/status/yiesko/adsum/code_quality.yml?branch=main&label=quality)](https://github.com/yiesko/adsum/actions/workflows/code_quality.yml)
 [![License: MIT](https://img.shields.io/github/license/yiesko/adsum)](LICENSE)
 
-**A standalone Discord Rich Presence server, CLI, and Rust library.**
+[Quick start](#quick-start) · [Compatible clients](#compatible-clients) · [Troubleshooting](#troubleshooting) · [Docs](#documentation) · [Releases](https://github.com/yiesko/adsum/releases)
 
-Adsum implements Discord-compatible local RPC endpoints for supported alternative clients. It detects running games, accepts activity from games and companion apps, and forwards presence to clients through a local WebSocket bridge. It continues the work of the original [SpikeHD/rsRPC](https://github.com/SpikeHD/rsRPC) project and is inspired by [OpenAsar/arRPC](https://github.com/OpenAsar/arRPC).
+<img src="assets/rpc_sober_limusic.png" alt="Roblox running through Sober, shown next to a Limusic listening activity, both published through Adsum" width="560">
+
+</div>
+
+Adsum is a background service that notices the games you launch and publishes them as Discord Rich Presence. It also speaks Discord's local RPC protocol, so games and companion apps (music players, launchers) can report their own, richer activity through it.
+
+Alternative Discord clients need a local RPC server to show games. Adsum is one: it detects games, accepts activity from apps, and forwards everything to your client over a local WebSocket bridge.
 
 > [!IMPORTANT]
-> **Adsum does not replace or work alongside the official Discord desktop client's RPC implementation.** Use it with a supported alternative client that can disable its bundled RPC server and consume Adsum's bridge. The OAuth `AUTHORIZE` flow is not supported; see [Known limitations](#known-limitations).
+> **Adsum is for alternative Discord clients.** It does not replace, and does not work alongside, the official Discord desktop client's RPC. Use it with a [supported client](#compatible-clients) that can turn off its bundled RPC server and read Adsum's bridge.
 
-## Features
+## Why Adsum
 
-- **Automatic game detection** — detects native games, Proton/Wine games, Steam titles, Epic/Heroic titles, and non-Steam shortcuts using executable paths, Steam AppIDs, Epic sandbox IDs, and fallback matching.
-- **Fewer misleading detections** — when an entry declares executables, the detected process must match a declared game executable; a Steam AppID alone is not enough for those entries.
-- **Discord-compatible transports** — accepts game RPC over local IPC and WebSocket endpoints.
-- **Local bridge** — publishes activity to WebSocket clients as JSON on port `1337` and MessagePack on port `1338` by default.
-- **Clean activity handoff** — when a game publishes its own activity, that takes priority over the generic activity detected from its process, and the generic activity can return when the richer publisher stops.
-- **Custom game entries** — add or replace detection rules using `overrides.json` or `overrides.d/` without editing the bundled database.
-- **Offline by default** — ships with a game-detection database; refreshing it from Discord's endpoint is optional.
-- **Diagnostics** — inspect detected games and database entries, and trace why a game appeared or disappeared.
-- **Verified releases** — the installer verifies the signed checksum manifest and release artifacts. Background update staging is opt-in.
+- **It recognises what you actually run.** Native Linux games, Windows games under Proton or Wine, Steam titles (by AppID), Epic/Heroic titles, and non-Steam shortcuts.
+- **Fewer wrong "Now playing" cards.** When a database entry declares executables, the running process has to match one of them. A Steam AppID alone isn't enough.
+- **Install once, forget it.** A single command sets up a systemd *user* service. No root, no Node.js, no per-session terminal.
+- **Works offline.** A game database is bundled in the binary. Refreshing it from Discord is optional.
+- **Richer activity wins.** If a game reports its own activity, it takes priority over the generic one detected from its process. The generic card comes back when the richer publisher stops.
+- **Easy to debug.** `adsum --list-detected` shows what the scanner sees, and detection can be traced to explain why a game appeared or disappeared.
+- **Yours to tweak.** Add or replace detection rules with `overrides.json` or `overrides.d/`, and ignore game IDs you don't want shown.
+- **Verified releases.** The installer checks a signed checksum manifest. Background updates are opt-in.
 
-## Screenshots
+## Quick start
 
-A game can report its own activity over IPC while a companion application reports a listening activity, and both can coexist through Adsum:
+### 1. Install
 
-![Roblox running through Sober alongside a Limusic listening activity through Adsum](assets/rpc_sober_limusic.png)
+Adsum's installer needs [`minisign`](https://github.com/jedisct1/minisign) to verify release signatures:
 
-A closer look at the listening activity:
+```bash
+sudo pacman -S minisign     # Arch
+sudo dnf install minisign   # Fedora
+sudo apt install minisign   # Debian / Ubuntu
+```
 
-![Limusic activity card with track progress and YouTube Music buttons](assets/rpc_limusic.png)
-
-## Compatible Discord clients
-
-The following alternative clients have an RPC or bridge integration that Adsum can work with:
-
-- [Equibop](https://github.com/Equicord/Equibop)
-- [Vesktop](https://github.com/Vencord/Vesktop)
-- [Dorion](https://github.com/SpikeHD/Dorion)
-- [GoofCord](https://github.com/Milkshiift/GoofCord)
-
-If a client bundles its own RPC server, disable that server before running Adsum. The client-side plugin or integration must consume Adsum's bridge, which defaults to `ws://127.0.0.1:1337`. The exact configuration depends on the client.
-
-## Install (Linux + systemd)
-
-The installer requires [`minisign`](https://github.com/jedisct1/minisign) to verify release signatures. Review the [installer script](scripts/install.sh) before running it.
+Then run the installer ([read it first](scripts/install.sh) if you like):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/yiesko/adsum/main/scripts/install.sh | bash
 ```
 
-The installer detects your architecture, downloads the latest release binary and systemd user unit, verifies both against the signed checksum manifest, then enables and starts the user service. Running it again updates the installation.
+It detects your architecture, downloads the latest release binary and the systemd user unit, verifies both against the signed manifest, then enables and starts the service. **Run it again any time to update.**
 
-For systems without systemd, download a binary from [Releases](https://github.com/yiesko/adsum/releases) and run it directly. The bundled game database does not require a network connection.
+<details>
+<summary>No systemd?</summary>
 
-See [systemd installation and operations](docs/systemd-user-units.md) for install options, updates, and uninstall instructions.
+Download a binary from [Releases](https://github.com/yiesko/adsum/releases) and run it directly. The bundled game database needs no network connection.
 
-## Quick start and diagnostics
+</details>
 
-After installing, the systemd user service starts automatically. Use the installed binary for one-shot diagnostics; these commands do not start a second long-running server:
+### 2. Connect your Discord client
+
+1. **Turn off the client's built-in RPC server** (for example a bundled arRPC), so the two don't compete.
+2. **Point the client at Adsum's bridge:** `ws://127.0.0.1:1337`.
+   - Vencord-based clients can use the optional [`plugin/adsum.js`](plugin/adsum.js), which registers itself as a plugin named **Adsum**.
+   - Any other arRPC-compatible WebSocket client can connect to the bridge directly.
+
+The exact steps depend on the client. See [Compatible clients](#compatible-clients) and the [web client guide](docs/web-client.md).
+
+<!-- TODO(maintainer): add a verified, step-by-step setup per client (Equibop, Vesktop, Dorion, GoofCord), including the client version tested. This is the highest-value section for new users. -->
+
+### 3. Launch a game
+
+Your game should show up on your Discord profile within a few seconds. To check what Adsum sees:
 
 ```bash
-~/.local/bin/adsum --list-detected
-~/.local/bin/adsum --list-database
+~/.local/bin/adsum --list-detected     # one scan, then exit
+~/.local/bin/adsum --list-database     # entries in the game database
+journalctl --user -u adsum.service -f  # follow the service logs
 ```
 
-Follow the running service's logs:
+`--list-detected` applies your overrides and ignore list, so its output is exactly what the scanner would publish. These commands don't start a second server.
 
-```bash
-journalctl --user -u adsum.service -f
+## Compatible clients
+
+These alternative clients have an RPC or bridge integration Adsum can work with:
+
+| Client | Notes |
+|---|---|
+| [Equibop](https://github.com/Equicord/Equibop) | Disable the built-in RPC, then consume the bridge |
+| [Vesktop](https://github.com/Vencord/Vesktop) | Disable the built-in RPC, then consume the bridge |
+| [Dorion](https://github.com/SpikeHD/Dorion) | Disable the built-in RPC, then consume the bridge |
+| [GoofCord](https://github.com/Milkshiift/GoofCord) | Disable the built-in RPC, then consume the bridge |
+
+Using a client that isn't listed? If it can read an arRPC-style WebSocket bridge, it should work. Tell us how it went in [Discussions](https://github.com/yiesko/adsum/discussions).
+
+## What Adsum detects
+
+| Source | How it's recognised |
+|---|---|
+| Native Linux games | Executable paths and names matched against the game database |
+| Proton / Wine games | Windows executables running under Proton or Wine |
+| Steam titles | Steam AppID, plus an executable check when the entry declares executables |
+| Epic / Heroic titles | Epic sandbox IDs |
+| Non-Steam shortcuts | Fallback matching |
+| Games and apps that report their own activity | Discord-compatible IPC and WebSocket endpoints |
+
+Process scanning runs every **5 seconds** by default. The matching rules and their edge cases are in [Process detection](docs/process-detection.md).
+
+## How it works
+
+```text
+ games & apps ── Discord IPC / WebSocket (6463–6472) ──┐
+                                                       ▼
+ running processes ── scanner + bundled game DB ──▶  Adsum  ──▶ JSON         ws://127.0.0.1:1337 ──┐
+ (native · Proton · Steam · Epic)                              └▶ MessagePack ws://127.0.0.1:1338   ├──▶ your Discord client ──▶ Discord
+                                                                                                    ┘
 ```
 
-`--list-detected` runs a single scan and exits. It applies the configured overrides and ignore list, so its output shows what the scanner would publish. For every CLI flag and environment variable, see [CLI options](docs/cli-options.md).
-
-## Platform support
-
-Linux is the primary platform for development and for real-world testing. CI runs tests, Clippy, formatting and documentation checks on Linux, Windows and macOS, and release builds are published for all three. Support on Windows and macOS is therefore tested, but it receives far less real-world validation and should be considered best-effort.
-
-## Known limitations
-
-- **No OAuth / `AUTHORIZE` flow.** Adsum cannot complete authorization that requires the official Discord client and an application's private `client_secret`. Games that depend on this flow may need direct access to the official client; stop Adsum while using them.
-- **Unreadable Linux command lines are skipped.** Detection reads `/proc/<pid>/cmdline`. If the kernel denies access — for example, for another user's process or under a restrictive `hidepid` mount — that process is skipped before game matching runs.
-- **Some database entries have no declared executables.** Those entries can be matched by Steam AppID alone, so a helper process that inherits such an ID can still cause a false positive. Tightening that fallback any further would also lose detections for games that provide no executable names.
-- **Official Discord can win discovery.** When the official Discord client is running at the same official socket path, a client that probes index `0` first may connect to official Discord instead of Adsum. Coexistence is not promised; see [official Discord discovery conflict](docs/protocol.md#official-discord-discovery-conflict).
-- **Local IPC connections are a bounded resource.** Adsum serves at most 16 concurrent IPC pumps with a 1 MiB payload limit. A local client can occupy every pump with idle or incomplete connections; handshake, frame-read, and idle timeouts are deferred. See [residual connection-exhaustion risk](docs/protocol.md#residual-connection-exhaustion-risk).
-
-See [Process detection](docs/process-detection.md) for the matching rules and their edge cases, and [Detection traceability](docs/detection-traceability.md) for diagnosing activity lifecycle events.
+Late-connecting clients immediately receive the cached activities, so restarting your client doesn't lose your current game.
 
 ## Configuration
 
-Most options have both a CLI flag and an environment variable. These are the main settings; the complete reference is in [docs/cli-options.md](docs/cli-options.md).
+Most settings have both a CLI flag and an environment variable. The main ones:
 
 | Setting | Environment variable | Default | Purpose |
 |---|---|---|---|
 | JSON bridge port range | `ADSUM_BRIDGE_PORT` / `ADSUM_BRIDGE_PORT_END` | `1337`–`1347` | WebSocket JSON bridge |
 | MessagePack bridge port | `ADSUM_MSGPACK_PORT` | `1338` | WebSocket MessagePack bridge |
 | Scan interval | `ADSUM_SCAN_INTERVAL` | `5` seconds | Base process-scan cadence |
-| Database refresh | `ADSUM_ENABLE_DB_UPDATE` | Off | Refresh the game database hourly |
-| Ignored game IDs | `ADSUM_IGNORE_IDS` | None | Skip these IDs in process detection |
+| Database refresh | `ADSUM_ENABLE_DB_UPDATE` | Off for the bare binary, **on** in the installed service | Refresh the game database hourly |
+| Ignored game IDs | `ADSUM_IGNORE_IDS` | None | Never publish these IDs |
+| Allowed web origins | `ADSUM_BRIDGE_ALLOWED_ORIGINS` | Discord's web pages only | Let other browser origins use the bridge |
 | Background update staging | `ADSUM_AUTO_UPDATE` | Off | Stage verified updates in the background |
 
-Logs go to stderr. `RUST_LOG` overrides the log level; when investigating detection, prefer a scoped filter such as `RUST_LOG=adsum_detect=debug` instead of enabling debug output for every component.
+For the service, put settings in a drop-in instead of editing the unit. Create `~/.config/systemd/user/adsum.service.d/override.conf`:
+
+```ini
+[Service]
+Environment=ADSUM_IGNORE_IDS=0000000000000000000
+Environment=ADSUM_SCAN_INTERVAL=3
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user restart adsum.service
+```
+
+Custom game entries live in `~/.config/adsum/overrides.json` (or `overrides.d/`). Every flag and variable is in [CLI options](docs/cli-options.md).
+
+## Troubleshooting
+
+<details>
+<summary><strong>My game doesn't show up in Discord</strong></summary>
+
+1. Check the service: `systemctl --user status adsum.service`
+2. Check detection: `~/.local/bin/adsum --list-detected`. If the game is listed, Adsum is working and the problem is on the client side (step 3). If it isn't, see "Adsum doesn't detect my game" below.
+3. Check the client: its built-in RPC must be **off**, and it must be reading the bridge at `ws://127.0.0.1:1337`.
+4. Read the logs: `journalctl --user -u adsum.service -f`
+
+</details>
+
+<details>
+<summary><strong>Adsum doesn't detect my game</strong></summary>
+
+The game may not be in the database, or its executable may not match the entry. Add a custom entry with `overrides.json` (see [Process detection](docs/process-detection.md)), and please [open an issue](https://github.com/yiesko/adsum/issues/new) with the output of `adsum --list-detected` so it can be fixed for everyone.
+
+</details>
+
+<details>
+<summary><strong>Adsum shows the wrong game, or something I don't want shown</strong></summary>
+
+Hide it with `ADSUM_IGNORE_IDS`. If it looks like a false positive, report it with the process path and the `--list-detected` output.
+
+</details>
+
+<details>
+<summary><strong>I need more detail in the logs</strong></summary>
+
+Add a drop-in with a scoped log filter, then reload and restart the service:
+
+```ini
+[Service]
+Environment=RUST_LOG=adsum_detect=debug
+```
+
+</details>
+
+<details>
+<summary><strong>The port is already in use</strong></summary>
+
+The JSON bridge tries ports `1337`–`1347` and the MessagePack port moves forward on collision. To pin them, use `--bridge-port`, `--bridge-port-end` and `--msgpack-port` (or the matching `ADSUM_*` variables).
+
+</details>
+
+<details>
+<summary><strong>The official Discord client is running</strong></summary>
+
+When official Discord is running at the same socket path, a client that probes index `0` first may connect to it instead of Adsum. Coexistence isn't promised. See [official Discord discovery conflict](docs/protocol.md#official-discord-discovery-conflict).
+
+</details>
+
+<details>
+<summary><strong>Can I get instant detection instead of a 5-second scan?</strong></summary>
+
+Adsum can watch process start and exit events from the kernel (`cn_proc`) instead of polling. The default service sandbox runs in a user namespace, where the kernel ignores those events, so it stays on polling. Enabling the watcher means **weakening the sandbox**, which lets the service read and write everything your account can, including `~/.ssh`. The trade-off and the exact drop-in are in the [systemd guide](docs/systemd-user-units.md#enabling-the-event-watcher-opt-in-weaker-sandbox). Most people don't need it.
+
+</details>
+
+## Platform support
+
+**Linux is the primary platform** for development and real-world testing. CI runs tests, Clippy, formatting and documentation checks on Linux, Windows and macOS, and release builds are published for all three. Windows and macOS support is tested but gets far less real-world validation, so treat it as **best-effort**. Reports from those platforms are very welcome.
+
+## Known limitations
+
+- **No OAuth / `AUTHORIZE` flow.** Adsum can't complete authorization that needs the official Discord client and an application's private `client_secret`. Stop Adsum while using games that depend on it.
+- **Unreadable command lines are skipped.** Detection reads `/proc/<pid>/cmdline`. If the kernel denies access (another user's process, or a restrictive `hidepid` mount), that process is skipped.
+- **Some database entries declare no executables.** Those can match on Steam AppID alone, so a helper process that inherits such an ID can cause a false positive. Tightening this further would lose detections for games that provide no executable names.
+- **Official Discord can win discovery.** See the [troubleshooting note](#troubleshooting) above.
+- **Local IPC connections are a bounded resource.** Adsum serves at most 16 concurrent IPC connections with a 1 MiB payload limit. A local client can occupy every slot with idle or incomplete connections, because handshake, frame-read and idle timeouts are still to come. See [residual connection-exhaustion risk](docs/protocol.md#residual-connection-exhaustion-risk).
+
+## Adsum and arRPC
+
+[arRPC](https://github.com/OpenAsar/arrpc) is the reference implementation of this idea, and some clients bundle it. Adsum continues [rsRPC](https://github.com/SpikeHD/rsRPC) in Rust and uses an arRPC-style bridge, so arRPC-compatible WebSocket clients can read it.
+
+**Use Adsum if** you play on Linux (native, Proton, Steam, Heroic) and want accurate detection you can inspect, a service that runs independently of your Discord client, and a single binary with no Node.js.
+
+**You may not need Adsum if** your client's bundled RPC already shows your games correctly. Compatibility with every arRPC command isn't complete either, so check [Protocol](docs/protocol.md) if a specific game or app needs one.
 
 ## Using Adsum as a Rust library
 
@@ -111,7 +236,7 @@ Logs go to stderr. `RUST_LOG` overrides the log level; when investigating detect
 
 ```toml
 [dependencies]
-adsum-core = { git = "https://github.com/yiesko/adsum", tag = "v0.40.0" }
+adsum-core = { git = "https://github.com/yiesko/adsum", tag = "v0.40.0" } # use the latest release tag
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal"] }
 ```
 
@@ -130,54 +255,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`run_until` consumes the daemon. For one-shot inspection, use `detect_once` or `database_summary` before starting it. See [library documentation](docs/library.md) for constructors and details.
+`run_until` consumes the daemon. For one-shot inspection, use `detect_once` or `database_summary` before starting it. More in the [library documentation](docs/library.md).
 
-## Build and test from source
+## Build from source
 
-Requirements: [Rust and Cargo](https://www.rust-lang.org/) 1.95 or newer.
+Requires [Rust and Cargo](https://www.rust-lang.org/) 1.95 or newer.
 
 ```bash
 git clone https://github.com/yiesko/adsum
 cd adsum
 cargo build --release -p adsum-cli
 cargo test --workspace --locked
+```
+
+<details>
+<summary>Full check suite and database regeneration</summary>
+
+```bash
 cargo test --benches --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo fmt --all -- --check
 ```
 
-The detection database is committed to the repository, so a fresh checkout builds without downloading it. To regenerate the snapshot, run:
+The detection database is committed to the repository, so a fresh checkout builds without downloading anything. To regenerate the snapshot:
 
 ```bash
 cargo run --manifest-path tools/updater/Cargo.toml
 ```
 
+</details>
+
 ## Documentation
 
-- [CLI options](docs/cli-options.md) — flags and environment variables
-- [Process detection](docs/process-detection.md) — executable matching, Steam and Epic IDs, Proton/Wine and overrides
-- [Detection traceability](docs/detection-traceability.md) — detection sources, latency and clear reasons
-- [Protocol](docs/protocol.md) — IPC/WebSocket messages and error codes
-- [Web clients](docs/web-client.md) — browser, Vencord and Node clients
-- [Rust library](docs/library.md) — embedding the daemon
-- [Systemd setup](docs/systemd-user-units.md) — installation and service configuration
-- [Systemd operations](docs/systemd-operations.md) — logs, updates and troubleshooting
-- [Self-update](docs/self-update.md) — release verification and update staging
-- [Changelog](CHANGELOG.md) — releases and compatibility notes
+- [CLI options](docs/cli-options.md): flags and environment variables
+- [Process detection](docs/process-detection.md): executable matching, Steam and Epic IDs, Proton/Wine, overrides
+- [Detection traceability](docs/detection-traceability.md): detection sources, latency and clear reasons
+- [Protocol](docs/protocol.md): IPC/WebSocket messages and error codes
+- [Web clients](docs/web-client.md): browser, Vencord and Node clients
+- [Rust library](docs/library.md): embedding the daemon
+- [Systemd setup](docs/systemd-user-units.md) and [operations](docs/systemd-operations.md): installation, logs, updates, uninstall
+- [Self-update](docs/self-update.md): release verification and update staging
+- [Changelog](CHANGELOG.md): releases and compatibility notes
 
-## Project scope and contributions
+## Contributing
 
-The feature scope is frozen. Work focuses on fixing bugs, improving detection accuracy, security, performance, tests and documentation rather than adding new features. Feature requests outside that scope are unlikely to be accepted.
+Adsum is young, and the most useful help right now is real-world coverage:
 
-Useful contributions include reproducible bug reports, false-positive and false-negative examples, regression tests, documentation fixes, and real-world validation on Windows and macOS. When reporting a detection issue, please include the operating system, the affected game's process path if you are comfortable sharing it, and the output of `adsum --list-detected`.
+- **Detection reports**: false positives and false negatives, with your OS, the game's process path (if you're comfortable sharing it) and the output of `adsum --list-detected`.
+- **Client setup guides**: a short, tested walkthrough for Equibop, Vesktop, Dorion, GoofCord or another client.
+- **Validation** on other distributions, on Windows and on macOS.
+- **Packaging** for your distribution.
+- **Bug reports, regression tests and documentation fixes.**
+
+The core feature set is intentionally stable, with the focus on reliability, detection accuracy, security and performance. If you'd like something bigger, please start a [discussion](https://github.com/yiesko/adsum/discussions) before writing code.
 
 [Report a bug or detection issue](https://github.com/yiesko/adsum/issues/new) · [Browse open issues](https://github.com/yiesko/adsum/issues)
 
 ## Credits
 
-- [SpikeHD/rsRPC](https://github.com/SpikeHD/rsRPC) — the original project this repository continues from.
-- [OpenAsar/arRPC](https://github.com/OpenAsar/arRPC) — inspiration for the local RPC server, detectable database format and bridge behavior.
-- [pog5/rsrpc](https://github.com/pog5/rsrpc) — reference for process-detection behavior and test coverage.
+- [SpikeHD/rsRPC](https://github.com/SpikeHD/rsRPC): the original project this repository continues from.
+- [OpenAsar/arRPC](https://github.com/OpenAsar/arRPC): inspiration for the local RPC server, detectable database format and bridge behaviour.
+- [pog5/rsrpc](https://github.com/pog5/rsrpc): reference for process-detection behaviour and test coverage.
 
 ## License
 
