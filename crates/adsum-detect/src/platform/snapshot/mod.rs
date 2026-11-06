@@ -11,4 +11,4 @@ pub(crate) mod enumerator;
 pub(crate) mod readers;
 
 pub(crate) use enumerator::SnapshotEnumerator;
-pub(crate) use readers::{is_suspended, read_cwd_into, read_steam_app_id};
+pub(crate) use readers::{is_suspended, read_cwd_into, read_image_path_into, read_steam_app_id};

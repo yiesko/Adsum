@@ -1,5 +1,5 @@
-use adsum_detect::types::Exec;
 use adsum_detect::resolver::resolve_box64;
+use adsum_detect::types::Exec;
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 

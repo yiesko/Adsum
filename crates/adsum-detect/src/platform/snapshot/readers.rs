@@ -60,6 +60,11 @@ pub(crate) fn read_cwd_into(_pid: u64, _buf: &mut Vec<u8>, _path: &mut String) -
   None
 }
 
+/// Stubbed on non-Linux.
+pub(crate) fn read_image_path_into(_pid: u64, _buf: &mut String) -> Option<&str> {
+  None
+}
+
 /// Stubbed on non-Linux (Steam matching there is already limited).
 pub(crate) fn is_suspended(_pid: u64, _stat: &mut String) -> bool {
   false
