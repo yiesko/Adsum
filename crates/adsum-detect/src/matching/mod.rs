@@ -441,7 +441,53 @@ impl ProcessServer {
     // automata match ASCII case-insensitively). Borrowed until a
     // rewrite is actually needed — the common Linux case (no
     // backslashes, absolute path) allocates nothing at all.
-    let mut process_path: std::borrow::Cow<str> = std::borrow::Cow::Borrowed(&process.path);
+    // Lazy /proc/<pid>/exe read only for candidate emulators.
+    let raw_basename_for_image = process.path.rsplit('/').next().unwrap_or(&process.path);
+    // Reuse the scan scratch buffer for the lazy image path instead of
+    // allocating a new String per candidate emulator.
+    let image_path = if crate::resolver::is_emulator_basename(raw_basename_for_image) {
+      crate::platform::read_image_path_into(process.pid, &mut scratch.match_scratch.stat)
+    } else {
+      None
+    };
+    // Prefer the direct wrapper resolver for the common argv[0] case;
+    // fall back to identity-based resolution for /proc/exe mismatches.
+    let resolved_target = match raw_basename_for_image {
+      name if name.eq_ignore_ascii_case("box64") => crate::resolver::resolve_box64(process),
+      name if name.eq_ignore_ascii_case("fex")
+        || name.eq_ignore_ascii_case("fexinterpreter")
+        || name.eq_ignore_ascii_case("fexloader") =>
+      {
+        crate::resolver::resolve_fex(process)
+      }
+      name if name.eq_ignore_ascii_case("qemu-x86_64")
+        || name.eq_ignore_ascii_case("qemu-x86_64-static") =>
+      {
+        crate::resolver::resolve_qemu_user(process)
+      }
+      name if name.eq_ignore_ascii_case("wine")
+        || name.eq_ignore_ascii_case("wine64")
+        || name.eq_ignore_ascii_case("wine-preloader")
+        || name.eq_ignore_ascii_case("wine64-preloader") =>
+      {
+        crate::resolver::resolve_wine_chain(process)
+      }
+      name if name.eq_ignore_ascii_case("reaper") => crate::resolver::resolve_steam_reaper(process).map(
+        |(_, idx)| crate::resolver::ResolvedTarget {
+          path: process.argument_at(idx.saturating_sub(1)).unwrap_or(""),
+          argument_start: idx,
+          is_windows_binary: false,
+        },
+      ),
+      _ => None,
+    }
+    .or_else(|| crate::resolver::resolve_target(process, image_path));
+    let effective_path: std::borrow::Cow<str> = match &resolved_target {
+      Some(resolved) if resolved.path.starts_with('/') => std::borrow::Cow::Borrowed(resolved.path),
+      Some(resolved) => std::borrow::Cow::Owned(format!("/{}", resolved.path)),
+      None => std::borrow::Cow::Borrowed(&process.path),
+    };
+    let mut process_path: std::borrow::Cow<str> = effective_path;
 
     if process_path.contains('\\') {
       process_path = std::borrow::Cow::Owned(process_path.replace('\\', "/"));

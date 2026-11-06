@@ -52,7 +52,8 @@ pub(crate) mod snapshot;
 // replaced are gone).
 #[cfg(target_os = "linux")]
 pub(crate) use linux::{
-  ProcfsEnumerator as PlatformEnumerator, is_suspended, read_cwd_into, read_steam_app_id,
+  ProcfsEnumerator as PlatformEnumerator, is_suspended, read_cwd_into, read_image_path_into,
+  read_steam_app_id,
 };
 // Test-only conveniences (the in-crate Linux suites reach them through
 // the historical `scan::` re-exports): the whole-`Exec` wrapper and the

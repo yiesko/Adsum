@@ -42,6 +42,7 @@ mod heroic;
 pub mod matching;
 pub mod platform;
 pub mod refresh;
+mod resolver;
 pub mod runtime;
 pub mod scratch;
 pub mod server;

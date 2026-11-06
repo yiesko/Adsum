@@ -7,7 +7,7 @@ use std::sync::Arc;
 use adsum_types::DetectSource;
 
 use crate::bundle::DetectablesBundle;
-use crate::matching::arguments_contain_whole_word;
+
 use crate::matching::live_or_none;
 use crate::types::{Exec, ScannedEntry, ScannedHit};
 
@@ -195,14 +195,27 @@ pub(crate) fn match_compatibility(
   if !basename.eq_ignore_ascii_case("java") {
     return None;
   }
-  let process_args = process.arguments.as_deref();
   let mut matched: Option<&CompatibilityRule> = None;
   for rule in rules {
     let entry = bundle.list.get(rule.entry_index as usize)?;
     let Some(required) = required_arguments(rule, entry) else {
       continue;
     };
-    if !arguments_contain_whole_word(process_args, required) {
+    // Whole-token sequence match anywhere in argv, using the on-demand
+    // Exec helper (no per-token allocation).
+    let mut found_sequence = false;
+    let mut start = 0usize;
+    while process.argument_at(start).is_some() {
+      if process.has_argument_sequence(start, required) {
+        found_sequence = true;
+        break;
+      }
+      start += 1;
+    }
+    if required.split_ascii_whitespace().count() == 0 {
+      found_sequence = true;
+    }
+    if !found_sequence {
       continue;
     }
     match matched {

@@ -28,6 +28,32 @@ pub struct Exec {
   pub arguments: Option<String>,
 }
 
+impl Exec {
+  /// Returns the argument at `index` (zero-based, after argv[0]),
+  /// borrowed from the slot's own buffer. Empty argv entries (NUL
+  /// padding, e.g. from Wine) collapse because the reader joins tokens
+  /// with a single space.
+  pub(crate) fn argument_at(&self, index: usize) -> Option<&str> {
+    self
+      .arguments
+      .as_deref()?
+      .split_ascii_whitespace()
+      .nth(index)
+  }
+
+  /// Whether the contiguous token sequence starting at `start` matches
+  /// `required` token-by-token, without allocation.
+  pub(crate) fn has_argument_sequence(&self, start: usize, required: &str) -> bool {
+    for (offset, expected) in required.split_ascii_whitespace().enumerate() {
+      match self.argument_at(start + offset) {
+        Some(actual) if actual == expected => {}
+        _ => return false,
+      }
+    }
+    true
+  }
+}
+
 /// Scanner event: one game appeared, the whole table went empty, or one
 /// previously-announced slot vanished while others remain.
 ///

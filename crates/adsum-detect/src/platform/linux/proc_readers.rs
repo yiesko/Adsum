@@ -231,3 +231,17 @@ pub fn parse_stat_state(stat: &str) -> Option<char> {
     .and_then(|end| stat[end + 1..].split_whitespace().next())
     .and_then(|state| state.chars().next())
 }
+
+/// Read `/proc/<pid>/exe` into `buffer`, returning the borrowed string.
+/// Strips the ` (deleted)` suffix the kernel appends to unlinked
+/// binaries. Returns `None` off-Linux or on any read failure.
+pub(crate) fn read_image_path_into(pid: u64, buffer: &mut String) -> Option<&str> {
+  buffer.clear();
+  let link = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+  let mut text = link.into_os_string().into_string().ok()?;
+  if let Some(stripped) = text.strip_suffix(" (deleted)") {
+    text = stripped.to_owned();
+  }
+  buffer.push_str(&text);
+  Some(buffer.as_str())
+}

@@ -7,7 +7,9 @@ pub(crate) mod proc_events;
 pub(crate) mod proc_readers;
 
 pub(crate) use enumerator::ProcfsEnumerator;
-pub(crate) use proc_readers::{is_suspended, read_cwd_into, read_steam_app_id};
+pub(crate) use proc_readers::{
+  is_suspended, read_cwd_into, read_image_path_into, read_steam_app_id,
+};
 // Test-only conveniences (parity/regression suites reach them through
 // the historical `scan::` re-exports).
 #[cfg(test)]
