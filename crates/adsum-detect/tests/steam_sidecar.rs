@@ -895,3 +895,18 @@ fn the_automaton_still_names_the_games_own_process() {
     );
   }
 }
+
+#[test]
+fn reaper_end_to_end_resolves_app_id() {
+  let server = server();
+  let bundle = server.bundle();
+  let mut scratch = ScanScratch::default();
+  let excl = server.exclusions_read();
+  let mut obs_open = false;
+  let process = process(
+    "/usr/lib/steam/ubuntu12_32/reaper",
+    "SteamLaunch AppId=4000 -- hl2.exe",
+  );
+  let hit = server.match_process(&process, &bundle, &excl, &mut obs_open, &mut scratch);
+  assert!(hit.is_some(), "reaper target resolves via AppId");
+}

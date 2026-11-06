@@ -485,10 +485,16 @@ impl ProcessServer {
     }
     .or_else(|| crate::resolver::resolve_target(process, image_path));
     // Preserve the target's own arguments when a wrapper was resolved.
-    let process_args: Option<&str> = resolved_target
-      .as_ref()
-      .and_then(|resolved| process.arguments_from(resolved.argument_start))
-      .or(process.arguments.as_deref());
+    // The Steam reaper keeps the original command line so its AppId
+    // reaches the existing Steam AppId tier untouched.
+    let process_args: Option<&str> = if raw_basename_for_image.eq_ignore_ascii_case("reaper") {
+      process.arguments.as_deref()
+    } else {
+      resolved_target
+        .as_ref()
+        .and_then(|resolved| process.arguments_from(resolved.argument_start))
+        .or(process.arguments.as_deref())
+    };
     let effective_path: std::borrow::Cow<str> = match &resolved_target {
       Some(resolved) if resolved.path.starts_with('/') => std::borrow::Cow::Borrowed(resolved.path),
       Some(resolved) => std::borrow::Cow::Owned(format!("/{}", resolved.path)),
