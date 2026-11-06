@@ -47,6 +47,7 @@ pub(crate) use paths::exe_names_path;
 #[cfg(test)]
 pub(crate) use tiers::argv_names_an_executable;
 pub(crate) use tiers::finish_direct_hit;
+pub(crate) use tiers::live_or_none;
 
 // Test-only surfaces: the in-crate suites glob this module (`use
 // super::*`), so everything they drove on the old `scan` module stays
@@ -140,7 +141,7 @@ fn matches_sidecar_family(basename: &str, base: &str) -> bool {
 /// anything the stem and folder tiers can say, so it is carried forward
 /// instead of being flattened into an ordinary miss.
 #[derive(Debug)]
-enum MatchOutcome {
+pub(crate) enum MatchOutcome {
   /// A match that names the probed string on a component boundary.
   Corroborated(Arc<ScannedEntry>, usize),
   /// Declared names were seen in this string, and every one of them was
@@ -182,17 +183,36 @@ impl MatchOutcome {
 ///
 /// Generic in the probe so the three automatons, whose iterators are
 /// different types, share this one corroboration.
-fn first_hit_naming_path(
+///
+/// A candidate that names the path but fails its declared arguments is
+/// skipped the same way, so a later candidate that names the path *and*
+/// carries the arguments can win (issue: the first candidate used to be
+/// selected here and only rejected after the walk, losing the game).
+pub(crate) fn first_hit_naming_path(
   probe: impl Iterator<Item = (Arc<ScannedEntry>, usize)>,
   variant: &str,
+  process_args: Option<&str>,
 ) -> MatchOutcome {
   let mut any_match = false;
   for (obj, exe_index) in probe {
-    if obj
-      .executables
-      .get(exe_index)
-      .is_some_and(|exe| exe_names_path(variant, &exe.name))
-    {
+    let Some(exe) = obj.executables.get(exe_index) else {
+      any_match = true;
+      continue;
+    };
+    if exe_names_path(variant, &exe.name) {
+      // Declared arguments are part of the candidate's identity: reject
+      // them in the walk, not after it, so the next candidate naming the
+      // same path still gets its turn.
+      if let Some(required) = &exe.arguments
+        && !arguments_contain_whole_word(process_args, required)
+      {
+        tracing::debug!(
+          "[Process Scanner] Argument mismatch for {}, skipping to later candidates",
+          obj.name
+        );
+        any_match = true;
+        continue;
+      }
       return MatchOutcome::Corroborated(obj, exe_index);
     }
     any_match = true;
@@ -207,6 +227,35 @@ fn first_hit_naming_path(
   } else {
     MatchOutcome::NoMatch
   }
+}
+
+/// Whether `required` appears in `args` on whole-word boundaries: the
+/// start or end of the command line, or an ASCII space, on both sides.
+/// `"-game hl2"` must match `"-game hl2 -foo"` and refuse
+/// `"-game hl2mp"`. Zero allocation: one scan, no Vec, no per-token
+/// strings.
+pub(crate) fn arguments_contain_whole_word(args: Option<&str>, required: &str) -> bool {
+  // Nothing declared means nothing to require (parity with the old
+  // `contains("")` behaviour an empty database field had).
+  if required.is_empty() {
+    return true;
+  }
+  let Some(args) = args else {
+    return false;
+  };
+  let bytes = args.as_bytes();
+  let mut start = 0;
+  while let Some(at) = args[start..].find(required) {
+    let at = start + at;
+    let end = at + required.len();
+    let before_ok = at == 0 || bytes[at - 1] == b' ';
+    let after_ok = end == bytes.len() || bytes[end] == b' ';
+    if before_ok && after_ok {
+      return true;
+    }
+    start = end.max(at + 1);
+  }
+  false
 }
 
 impl ProcessServer {
@@ -310,6 +359,7 @@ impl ProcessServer {
     probe: &mut ProbeBufs,
     bundle: &DetectablesBundle,
     proton: bool,
+    process_args: Option<&str>,
   ) -> MatchOutcome {
     let variant_count = path_variants_into(path, &mut probe.variants);
     // Automaton passes outer, variants inner (strict precedence). Without
@@ -335,11 +385,23 @@ impl ProcessServer {
         // the three automatons — which yield different iterator types —
         // share the corroboration below instead of repeating it.
         let outcome = if proton {
-          first_hit_naming_path(self.proton_probe(&probe.reversed, bundle), variant)
+          first_hit_naming_path(
+            self.proton_probe(&probe.reversed, bundle),
+            variant,
+            process_args,
+          )
         } else if pass == 0 {
-          first_hit_naming_path(self.main_probe(&probe.reversed, bundle), variant)
+          first_hit_naming_path(
+            self.main_probe(&probe.reversed, bundle),
+            variant,
+            process_args,
+          )
         } else {
-          first_hit_naming_path(self.custom_probe(&probe.reversed, bundle), variant)
+          first_hit_naming_path(
+            self.custom_probe(&probe.reversed, bundle),
+            variant,
+            process_args,
+          )
         };
         refused |= outcome.refused();
         // A corroborated hit ends the walk. A refusal is remembered so the
@@ -438,7 +500,13 @@ impl ProcessServer {
     // Aho-Corasick matching against the path and its 64-bit-stripped
     // variants (so `wow64.exe` also matches a `wow.exe` pattern, like
     // arrpc/pog5-adsum). First hit in variant order wins.
-    let mut found = self.probe_variants(&process_path, &mut scratch.probe, bundle, false);
+    let mut found = self.probe_variants(
+      &process_path,
+      &mut scratch.probe,
+      bundle,
+      false,
+      process.arguments.as_deref(),
+    );
     // Whether any automaton saw a declared name in this path that did not
     // name it. That is specific evidence the process is *not* the game,
     // carried down to the stem and folder tiers so they cannot hand a hit
@@ -498,6 +566,7 @@ impl ProcessServer {
         &mut scratch.probe,
         bundle,
         false,
+        process.arguments.as_deref(),
       );
       refused |= found.refused();
       if found.take_hit().is_some() {
@@ -511,6 +580,22 @@ impl ProcessServer {
     let (obj, exe_index) = match found.take_hit() {
       Some(found) => found,
       None => {
+        // Darwin-Java compatibility: a macOS `>java` entry whose declared
+        // arguments match this command line runs natively on Linux (the
+        // GameDetection rule). Probed before the weaker store-id tiers,
+        // right where the native direct probe gave up.
+        if let Some(hit) = crate::compatibility::match_compatibility(
+          process,
+          bundle,
+          &mut scratch.match_scratch.stat,
+        ) {
+          tracing::debug!(
+            "[Process Scanner] Compatibility match: {} (pid {})",
+            hit.entry.name,
+            process.pid
+          );
+          return Some(hit);
+        }
         // Lowercase copy for the case-sensitive tail below (store-id
         // maps, stem/folder heuristics). Paid only on misses — the hot
         // AC path above never allocates it. Reuses the caller's buffer:
@@ -667,7 +752,13 @@ impl ProcessServer {
         } else {
           &process_path
         };
-        let proton = self.probe_variants(proton_path, &mut scratch.probe, bundle, true);
+        let proton = self.probe_variants(
+          proton_path,
+          &mut scratch.probe,
+          bundle,
+          true,
+          process.arguments.as_deref(),
+        );
         refused |= proton.refused();
         if let Some((obj, exe_index)) = proton.take_hit() {
           return finish_direct_hit(

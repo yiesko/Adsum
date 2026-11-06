@@ -24,7 +24,8 @@ use super::paths::{exe_names_path, exe_stem};
 /// shared slim entry (no clone).
 ///
 /// `stat` is the shared reuse buffer for the suspension read.
-fn live_or_none(
+/// Whether `process` is live (not suspended) and carries the entry.
+pub(crate) fn live_or_none(
   obj: &Arc<ScannedEntry>,
   pid: u64,
   source: DetectSource,
@@ -56,10 +57,8 @@ pub(crate) fn finish_direct_hit(
   let executable = obj.executables.get(exe_index)?;
 
   if let Some(exec_args) = &executable.arguments {
-    let has_args = process
-      .arguments
-      .as_ref()
-      .is_some_and(|args| args.contains(&**exec_args));
+    let has_args =
+      crate::matching::arguments_contain_whole_word(process.arguments.as_deref(), exec_args);
     if !has_args {
       tracing::debug!(
         "[Process Scanner] Argument mismatch for pid {}, skipping",

@@ -7,6 +7,7 @@ use crate::scratch::MatchScratch;
 #[cfg(target_os = "linux")]
 use crate::scratch::{ExecScratch, SLOT_LOW_TICKS, ScanScratch};
 
+mod arguments;
 mod epic;
 mod matching;
 mod name_matching;
