@@ -823,13 +823,19 @@ async fn flood_past_pump_cap_drops_peers() {
   // an already-dropped peer would panic instead of asserting. Only
   // refusal signals (EOF/reset) count as dropped: a timeout would mean
   // an admitted peer went quiet, which must fail loudly instead of
-  // passing silently.
+  // passing silently. Darwin adds one more refusal signal: closing the
+  // peer shuts the client socket down in both directions, and a racing
+  // setsockopt then fails with EINVAL instead of reaching the read.
   let mut dropped = 0;
   for _ in 0..EXTRA {
     let mut client = UnixStream::connect(&path).expect("connect");
-    client
-      .set_read_timeout(Some(Duration::from_secs(5)))
-      .expect("timeout");
+    match client.set_read_timeout(Some(Duration::from_secs(5))) {
+      Err(err) if err.raw_os_error() == Some(libc::EINVAL) => {
+        dropped += 1;
+        continue;
+      }
+      other => other.expect("timeout"),
+    }
     let mut header = [0_u8; 8];
     match client.read_exact(&mut header) {
       Err(e)
