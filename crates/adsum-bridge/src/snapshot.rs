@@ -101,3 +101,7 @@ pub(crate) fn state_activities(cache: &ReplayCache) -> Vec<StateActivity> {
   }));
   out
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/snapshot_population.rs"]
+mod tests;
