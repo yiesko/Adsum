@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Minecraft Java detection on Linux via macOS signatures.** Adsum now
+  reuses the official detectable database's macOS `>java` entries (which
+  carry the game's main class as a required argument) to detect Minecraft
+  and its loaders on Linux, with a `compatibility` provenance. No
+  database edit and no global `darwin` → `linux` remapping.
 - **Discord RPC OAuth over IPC and WebSocket (experimental).** `AUTHORIZE`
   opens the system browser and finishes the loopback callback with state
   validation; PKCE (S256) is supported. `AUTHENTICATE` checks the supplied

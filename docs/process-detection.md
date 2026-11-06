@@ -279,6 +279,38 @@ The library exposes the same capability through
 ignore-list both apply, so the output is exactly what the daemon would
 publish.
 
+## Compatibility: macOS Java entries on Linux
+
+The official detectable database ships one macOS-only Java rule — the
+Minecraft entry declares `>java` with `net.minecraft.client.main.Main`
+as its required argument. Adsum turns that single entry into a set of
+native Linux rules at bundle build time, so a JVM running the game (or
+one of its loaders) is detected as Minecraft with a `compatibility`
+provenance instead of being skipped. The original database is never
+modified.
+
+The rule only fires when all of the following hold:
+
+- the build target is Linux;
+- the entry's executable has `os: darwin`, the exact name `>java`,
+  non-empty arguments, and is not flagged as a launcher;
+- the process runs a `java` executable (basename, case-insensitive) and
+  its command line contains the required signature on whole-word
+  boundaries.
+
+The vanilla signature unlocks thirteen loader and launcher signatures
+(Forge, NeoForge, Fabric, Quilt, LaunchWrapper, PrismLauncher, PolyMC,
+MultiMC, Modrinth). A non-vanilla Java entry contributes only its own
+rule, and two entries sharing a signature are refused as ambiguous
+rather than answered by scan order. Server-side launch targets
+(`fmlserver`, `neoforgeserver`, `net.minecraft.server.Main`) never
+match.
+
+Compatibility is a dedicated tier: it runs after the native Aho-Corasick
+probe and before the weaker stem, folder and steam-library tiers. It does
+not promote arbitrary Darwin entries, does not create a generic `java`
+rule, and does not weaken the existing tiers.
+
 ## Sources
 
 - Epic's [Testing Guide](https://dev.epicgames.com/docs/epic-games-store/testing-guide)
