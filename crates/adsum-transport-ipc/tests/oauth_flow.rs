@@ -808,10 +808,14 @@ fn failed_reply_tears_down_the_connection_and_its_published_presence() {
     let verb = command["cmd"].as_str().unwrap().to_owned();
     peer.send(command);
     let request = fixture.request(&verb, APP);
-    // Leave the write half open: EOF cannot be the reason the pump exits.
+    // A companion that dies without CLEAR closes the socket entirely.
+    // Shutting only the read half keeps the connection writable, and the
+    // platforms disagree about what such a write returns: Linux reports
+    // EPIPE, Darwin accepts and discards. Both must end the pump through
+    // the same path a real death takes: EOF on read.
     peer
       .client
-      .shutdown(Shutdown::Read)
+      .shutdown(Shutdown::Both)
       .expect("stop reading replies");
     request.finish(Ok(result));
     peer.join();
