@@ -210,7 +210,9 @@ fn foreign_entries_are_never_overwritten() {
 }
 
 /// Removal only happens when marker content, marker identity and the alias
-/// symlink identity all still match the ownership record.
+/// symlink identity all still match the ownership record. An alias restored
+/// outside the reconcile cycle keeps a stale record: the next reconcile pass
+/// refreshes it, and only then does the removal take it.
 #[test]
 fn removal_requires_full_identity_match() {
   let dir = fresh_dir("removal");
@@ -227,6 +229,7 @@ fn removal_requires_full_identity_match() {
     now_ms(),
   );
   let alias = dir.join(NAME);
+  let marker = dir.join(format!(".adsum-state-owner-{}-{NAME}", test_euid()));
 
   let record = owned.remove(0);
 
@@ -240,13 +243,67 @@ fn removal_requires_full_identity_match() {
     "divergent alias preserved"
   );
 
+  // Restored to the recorded target by hand: the record still names the
+  // original inode. Whether removal happens with a stale record depends
+  // on the filesystem's inode allocator (ext4 and zram reuse it, APFS
+  // never does), so that state has no portable assertion. Production only
+  // removes through the reconcile pass, which refreshes the record first.
   fs::remove_file(&alias).unwrap();
   std::os::unix::fs::symlink(&target, &alias).unwrap();
-  state_aliases::remove_owned_state_alias(&record, test_euid());
+  let mut owned: Vec<OwnedStateAlias> = Vec::new();
+  assert_eq!(
+    state_aliases::reconcile_state_alias(
+      &dir,
+      NAME,
+      &target,
+      test_euid(),
+      &mut owned,
+      STALE_MS,
+      now_ms()
+    ),
+    StateRecovery::Preserved
+  );
+  assert_eq!(owned.len(), 1, "the restored alias is owned again");
+  state_aliases::remove_owned_state_aliases(&mut owned, test_euid());
   assert!(fs::symlink_metadata(&alias).is_err(), "owned alias removed");
   assert!(
-    fs::symlink_metadata(dir.join(format!(".adsum-state-owner-{}-{NAME}", test_euid()))).is_err(),
+    fs::symlink_metadata(&marker).is_err(),
     "marker removed after the alias"
+  );
+  fs::remove_dir_all(&dir).ok();
+}
+
+/// An alias swapped for a foreign object between publication and shutdown
+/// is preserved: the ownership record no longer matches the entry at the
+/// path, so shutdown leaves it and its marker untouched.
+#[test]
+fn shutdown_preserves_alias_swapped_after_publication() {
+  let dir = fresh_dir("swapped");
+  let target = dir.join(".canonical-0");
+  write_canonical(&target);
+  let mut owned: Vec<OwnedStateAlias> = Vec::new();
+  state_aliases::reconcile_state_alias(
+    &dir,
+    NAME,
+    &target,
+    test_euid(),
+    &mut owned,
+    STALE_MS,
+    now_ms(),
+  );
+
+  fs::remove_file(dir.join(NAME)).unwrap();
+  fs::write(dir.join(NAME), b"swapped by someone else").unwrap();
+
+  state_aliases::remove_owned_state_aliases(&mut owned, test_euid());
+  assert_eq!(
+    fs::read(dir.join(NAME)).unwrap(),
+    b"swapped by someone else",
+    "the swapped entry survives the shutdown removal"
+  );
+  assert!(
+    fs::symlink_metadata(dir.join(format!(".adsum-state-owner-{}-{NAME}", test_euid()))).is_ok(),
+    "the marker stays with the preserved entry"
   );
   fs::remove_dir_all(&dir).ok();
 }

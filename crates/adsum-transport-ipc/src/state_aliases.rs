@@ -429,11 +429,13 @@ pub fn publish_state_alias(
       StatePublish::Linked
     }
     None => {
+      // The verification failing does not prove the entry is still ours:
+      // a concurrent writer may have replaced it. Preserve the entry and
+      // retract only our own marker.
       tracing::debug!(
-        "[state-alias] Alias {} did not verify after creation",
+        "[state-alias] Alias {} did not verify after creation; preserving it",
         alias.display()
       );
-      let _ = std::fs::remove_file(&alias);
       let _ = remove_if_identity(&marker_path, identity);
       StatePublish::Skipped
     }
@@ -502,13 +504,17 @@ pub fn recover_state_alias(
         StateRecovery::Conflict
       }
     }
-    AliasState::Ours(_) => {
+    AliasState::Ours(recorded) => {
       let stale = snapshot_target_age(target, now_ms).is_none_or(|age| age > consumer_stale_ms);
       if !stale {
         return StateRecovery::Preserved;
       }
-      // Provably ours, verified twice: the narrow unlink window matches
-      // the IPC marker recovery contract.
+      // Revalidate immediately before the unlink: the path may have been
+      // swapped after the first classification (TOCTOU narrowing, same
+      // pattern as the IPC marker recovery).
+      if state_symlink_id(&alias, target) != Some(recorded) {
+        return StateRecovery::Conflict;
+      }
       if std::fs::remove_file(&alias).is_ok() {
         let _ = remove_if_identity(&marker.path, marker.identity);
         StateRecovery::Cleaned
@@ -624,6 +630,9 @@ pub fn remove_owned_state_alias(owned: &OwnedStateAlias, euid: u32) {
     );
     return;
   }
+  // Ownership requires the exact recorded symlink identity: any swap at
+  // the path is preserved. Legitimate recreations go through the heal
+  // path, which refreshes the record before removal happens.
   if state_symlink_id(&owned.alias, &owned.target) != Some(owned.alias_id) {
     tracing::debug!(
       "[state-alias] Alias {} changed since publication; preserving it",
