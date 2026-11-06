@@ -49,3 +49,7 @@ adsum-telemetry = { path = "../adsum-telemetry" }
 [[bench]]
 name = "maps"
 harness = false
+
+[[bench]]
+name = "resolver"
+harness = false

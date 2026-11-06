@@ -45,7 +45,7 @@ impl Exec {
   /// `required` token-by-token, without allocation.
   /// Borrow the argument string starting at token `start`, preserving the
   /// remaining tokens (and their separating spaces) without allocation.
-  pub(crate) fn arguments_from(&self, start: usize) -> Option<&str> {
+  pub fn arguments_from(&self, start: usize) -> Option<&str> {
     let storage = self.arguments.as_deref()?;
     let mut pos = 0usize;
     let mut count = 0usize;

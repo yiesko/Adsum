@@ -45,7 +45,7 @@ fn is_reaper(name: &str) -> bool {
 
 /// Result of resolving a wrapped process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ResolvedTarget<'a> {
+pub struct ResolvedTarget<'a> {
   pub path: &'a str,
   pub argument_start: usize,
   pub is_windows_binary: bool,
@@ -69,7 +69,7 @@ fn is_windows_binary(target: &str) -> bool {
 }
 
 /// Resolve a Box64 invocation, including `--` and Wine chains.
-pub(crate) fn resolve_box64(process: &Exec) -> Option<ResolvedTarget<'_>> {
+pub fn resolve_box64(process: &Exec) -> Option<ResolvedTarget<'_>> {
   let name = basename(&process.path)?;
   if !name.eq_ignore_ascii_case("box64") {
     return None;
