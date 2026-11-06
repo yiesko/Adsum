@@ -306,6 +306,164 @@ fn install_dir_corroboration_keeps_id_only_entries_working() {
   }
 }
 
+/// Issue #37 regression: a store id read from the command line (environ
+/// unreadable under a sandboxed Proton runtime) must corroborate the
+/// game's own native executable. The user's process ran
+/// `steamapps/common/<game>/<game>.x86_64` and was skipped as "does not
+/// belong" even though the path named exactly the declared executable.
+#[test]
+fn command_line_app_id_corroborates_native_game_executable() {
+  use crate::bundle::SortedIndex;
+  use crate::types::{DetectSource, OsName, ScannedExe};
+
+  let entry = Arc::new(ScannedEntry {
+    id: "1124358970618953818".into(),
+    name: "Frostpeak".into(),
+    executables: Box::new([
+      ScannedExe {
+        name: "frostpeak.exe".into(),
+        os: OsName::Win32,
+        is_launcher: false,
+        arguments: None,
+      },
+      ScannedExe {
+        name: "frostpeak.x86_64".into(),
+        os: OsName::Linux,
+        is_launcher: false,
+        arguments: None,
+      },
+    ]),
+    steam_ids: Box::new(["892970".into()]),
+    epic_ids: Box::new([]),
+    aliases: Box::new([]),
+  });
+  let steam_map = SortedIndex::build(vec![("892970".into(), 0)]);
+  let hit = match_steam_id(
+    8877,
+    &mut String::new(),
+    &SteamIdLookup {
+      app_id: Some("892970"),
+      // Native Steam install layout, already lowercased the way the
+      // matcher folds it before the steam-id tier runs.
+      process_path: "/home/player/.local/share/steam/steamapps/common/frostpeak/frostpeak.x86_64",
+      source: DetectSource::SteamAppId,
+      steam_map: &steam_map,
+      entries: &[entry],
+      custom: &[],
+      // The path sits under the game's own install dir.
+      install_dir_corroborated: true,
+    },
+  )
+  .expect("the game's own native executable must corroborate its store id");
+  assert_eq!(hit.entry.name, "Frostpeak".into());
+}
+
+/// The `reaper` helper still stays refused: Steam runs it with the
+/// game's id while it wrangles the launch, and the install-dir route
+/// never names a helper outside `steamapps/common/`.
+#[test]
+fn command_line_app_id_refuses_the_reaper_helper() {
+  use crate::bundle::SortedIndex;
+  use crate::types::{DetectSource, OsName, ScannedExe};
+
+  let entry = Arc::new(ScannedEntry {
+    id: "1124358970618953818".into(),
+    name: "Frostpeak".into(),
+    executables: Box::new([
+      ScannedExe {
+        name: "frostpeak.exe".into(),
+        os: OsName::Win32,
+        is_launcher: false,
+        arguments: None,
+      },
+      ScannedExe {
+        name: "frostpeak.x86_64".into(),
+        os: OsName::Linux,
+        is_launcher: false,
+        arguments: None,
+      },
+    ]),
+    steam_ids: Box::new(["892970".into()]),
+    epic_ids: Box::new([]),
+    aliases: Box::new([]),
+  });
+  let steam_map = SortedIndex::build(vec![("892970".into(), 0)]);
+  assert!(
+    match_steam_id(
+      8877,
+      &mut String::new(),
+      &SteamIdLookup {
+        app_id: Some("892970"),
+        process_path: "/home/player/.local/share/steam/steamrt64/reaper",
+        source: DetectSource::SteamAppId,
+        steam_map: &steam_map,
+        entries: &[entry],
+        custom: &[],
+        install_dir_corroborated: false,
+      },
+    )
+    .is_none(),
+    "the steamrt reaper helper is not the game"
+  );
+}
+
+/// The command line carries the store token for sandboxed launches:
+/// `reaper SteamLaunch AppId=<id> ...` must yield the id even when
+/// environ is unreadable.
+#[test]
+fn app_id_from_args_extracts_steam_launch_token() {
+  use crate::matching::args::app_id_from_args;
+
+  let reaper_args = "SteamLaunch AppId=892970 -- /home/player/.local/share/steam/steamapps/common/frostpeak/frostpeak.x86_64";
+  assert_eq!(app_id_from_args(Some(reaper_args)), Some("892970"));
+
+  // A bare executable name must not leak into the extraction (word
+  // boundary rule: the token must stand alone).
+  let sneaky = "/opt/appIdNotReal/frostpeak.x86_64";
+  assert_eq!(app_id_from_args(Some(sneaky)), None);
+  assert_eq!(app_id_from_args(None), None);
+  assert_eq!(app_id_from_args(Some("no token here")), None);
+}
+
+/// Install-dir evidence corroborates a native executable the database
+/// does not declare (Proton renames binaries): the id plus the install
+/// dir are enough, the path names no launcher or installer shelf.
+#[test]
+fn command_line_app_id_with_install_dir_evidence_accepts_undeclared_executable() {
+  use crate::bundle::SortedIndex;
+  use crate::types::{DetectSource, OsName, ScannedExe};
+
+  let entry = Arc::new(ScannedEntry {
+    id: "1124358970618953818".into(),
+    name: "Frostpeak".into(),
+    executables: Box::new([ScannedExe {
+      name: "frostpeak.exe".into(),
+      os: OsName::Win32,
+      is_launcher: false,
+      arguments: None,
+    }]),
+    steam_ids: Box::new(["892970".into()]),
+    epic_ids: Box::new([]),
+    aliases: Box::new([]),
+  });
+  let steam_map = SortedIndex::build(vec![("892970".into(), 0)]);
+  let hit = match_steam_id(
+    8877,
+    &mut String::new(),
+    &SteamIdLookup {
+      app_id: Some("892970"),
+      process_path: "/home/player/.local/share/steam/steamapps/common/frostpeak/frostpeak.x86_64",
+      source: DetectSource::SteamAppId,
+      steam_map: &steam_map,
+      entries: &[entry],
+      custom: &[],
+      install_dir_corroborated: true,
+    },
+  )
+  .expect("install-dir evidence covers the undeclared native binary");
+  assert_eq!(hit.entry.name, "Frostpeak".into());
+}
+
 /// A custom SKU matched through library inheritance reports the
 /// library path, not a direct app-id lookup. (Inline: needs
 /// `SortedIndex::build`, crate-private.)
