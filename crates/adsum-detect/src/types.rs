@@ -43,6 +43,30 @@ impl Exec {
 
   /// Whether the contiguous token sequence starting at `start` matches
   /// `required` token-by-token, without allocation.
+  /// Borrow the argument string starting at token `start`, preserving the
+  /// remaining tokens (and their separating spaces) without allocation.
+  pub(crate) fn arguments_from(&self, start: usize) -> Option<&str> {
+    let storage = self.arguments.as_deref()?;
+    let mut pos = 0usize;
+    let mut count = 0usize;
+    while pos < storage.len() {
+      while pos < storage.len() && storage.as_bytes()[pos] == b' ' {
+        pos += 1;
+      }
+      if pos >= storage.len() {
+        break;
+      }
+      if count == start {
+        return Some(&storage[pos..]);
+      }
+      while pos < storage.len() && storage.as_bytes()[pos] != b' ' {
+        pos += 1;
+      }
+      count += 1;
+    }
+    None
+  }
+
   pub(crate) fn has_argument_sequence(&self, start: usize, required: &str) -> bool {
     for (offset, expected) in required.split_ascii_whitespace().enumerate() {
       match self.argument_at(start + offset) {

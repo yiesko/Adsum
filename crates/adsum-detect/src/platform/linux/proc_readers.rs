@@ -245,3 +245,7 @@ pub(crate) fn read_image_path_into(pid: u64, buffer: &mut String) -> Option<&str
   buffer.push_str(&text);
   Some(buffer.as_str())
 }
+
+#[cfg(test)]
+#[path = "../../../tests/unit/platform/proc_exe.rs"]
+mod proc_exe_tests;

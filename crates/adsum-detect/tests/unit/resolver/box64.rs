@@ -77,3 +77,11 @@ fn box64_rejects_cpu_avx2() {
   let e = exec("box64", Some("-cpu AVX2 ./game"));
   assert!(resolve_box64(&e).is_none());
 }
+
+#[test]
+fn box64_preserves_target_arguments() {
+  let e = exec("box64", Some("./game -windowed -foo"));
+  let r = resolve_box64(&e).expect("resolves");
+  assert_eq!(r.path, "./game");
+  assert_eq!(e.arguments_from(r.argument_start), Some("-windowed -foo"));
+}

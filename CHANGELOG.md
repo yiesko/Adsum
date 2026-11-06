@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Linux emulator awareness.** Adsum now resolves Box64, FEX, QEMU
+  user-mode, Wine/Proton and Steam reaper wrappers to their real target
+  executable before matching, preserving `Exec.path` and the target's own
+  arguments. `/proc/<pid>/exe` is read lazily for candidate emulators.
 - **Minecraft Java detection on Linux via macOS signatures.** Adsum now
   reuses the official detectable database's macOS `>java` entries (which
   carry the game's main class as a required argument) to detect Minecraft

@@ -454,34 +454,41 @@ impl ProcessServer {
     // fall back to identity-based resolution for /proc/exe mismatches.
     let resolved_target = match raw_basename_for_image {
       name if name.eq_ignore_ascii_case("box64") => crate::resolver::resolve_box64(process),
-      name if name.eq_ignore_ascii_case("fex")
-        || name.eq_ignore_ascii_case("fexinterpreter")
-        || name.eq_ignore_ascii_case("fexloader") =>
+      name
+        if name.eq_ignore_ascii_case("fex")
+          || name.eq_ignore_ascii_case("fexinterpreter")
+          || name.eq_ignore_ascii_case("fexloader") =>
       {
         crate::resolver::resolve_fex(process)
       }
-      name if name.eq_ignore_ascii_case("qemu-x86_64")
-        || name.eq_ignore_ascii_case("qemu-x86_64-static") =>
+      name
+        if name.eq_ignore_ascii_case("qemu-x86_64")
+          || name.eq_ignore_ascii_case("qemu-x86_64-static") =>
       {
         crate::resolver::resolve_qemu_user(process)
       }
-      name if name.eq_ignore_ascii_case("wine")
-        || name.eq_ignore_ascii_case("wine64")
-        || name.eq_ignore_ascii_case("wine-preloader")
-        || name.eq_ignore_ascii_case("wine64-preloader") =>
+      name
+        if name.eq_ignore_ascii_case("wine")
+          || name.eq_ignore_ascii_case("wine64")
+          || name.eq_ignore_ascii_case("wine-preloader")
+          || name.eq_ignore_ascii_case("wine64-preloader") =>
       {
         crate::resolver::resolve_wine_chain(process)
       }
-      name if name.eq_ignore_ascii_case("reaper") => crate::resolver::resolve_steam_reaper(process).map(
-        |(_, idx)| crate::resolver::ResolvedTarget {
+      name if name.eq_ignore_ascii_case("reaper") => crate::resolver::resolve_steam_reaper(process)
+        .map(|(_, idx)| crate::resolver::ResolvedTarget {
           path: process.argument_at(idx.saturating_sub(1)).unwrap_or(""),
           argument_start: idx,
           is_windows_binary: false,
-        },
-      ),
+        }),
       _ => None,
     }
     .or_else(|| crate::resolver::resolve_target(process, image_path));
+    // Preserve the target's own arguments when a wrapper was resolved.
+    let process_args: Option<&str> = resolved_target
+      .as_ref()
+      .and_then(|resolved| process.arguments_from(resolved.argument_start))
+      .or(process.arguments.as_deref());
     let effective_path: std::borrow::Cow<str> = match &resolved_target {
       Some(resolved) if resolved.path.starts_with('/') => std::borrow::Cow::Borrowed(resolved.path),
       Some(resolved) => std::borrow::Cow::Owned(format!("/{}", resolved.path)),
@@ -551,7 +558,7 @@ impl ProcessServer {
       &mut scratch.probe,
       bundle,
       false,
-      process.arguments.as_deref(),
+      process_args,
     );
     // Whether any automaton saw a declared name in this path that did not
     // name it. That is specific evidence the process is *not* the game,
@@ -612,7 +619,7 @@ impl ProcessServer {
         &mut scratch.probe,
         bundle,
         false,
-        process.arguments.as_deref(),
+        process_args,
       );
       refused |= found.refused();
       if found.take_hit().is_some() {
@@ -661,7 +668,7 @@ impl ProcessServer {
         // per Proton process per tick for nothing; one `Option<&str>` below.
         let from_args = memoized
           .is_none()
-          .then(|| app_id_from_args(process.arguments.as_deref()))
+          .then(|| app_id_from_args(process_args))
           .flatten();
         let via_cmdline = memoized.is_none() && from_args.is_some();
         let app_id: Option<&str> = memoized.as_deref().or(from_args);
@@ -703,7 +710,7 @@ impl ProcessServer {
         // choice; older Legendary (<0.20.25) passes only `-epicapp`, which
         // Heroic's cached library maps to the same namespace the database
         // stores. Usually already lowercase: borrow it, fold on demand.
-        let epic = epic_launch_args(process.arguments.as_deref());
+        let epic = epic_launch_args(process_args);
         let sandbox_id: Option<std::borrow::Cow<'_, str>> = epic.sandbox_id.map(|id| {
           if id.bytes().any(|b| b.is_ascii_uppercase()) {
             std::borrow::Cow::Owned(id.to_ascii_lowercase())
@@ -798,13 +805,8 @@ impl ProcessServer {
         } else {
           &process_path
         };
-        let proton = self.probe_variants(
-          proton_path,
-          &mut scratch.probe,
-          bundle,
-          true,
-          process.arguments.as_deref(),
-        );
+        let proton =
+          self.probe_variants(proton_path, &mut scratch.probe, bundle, true, process_args);
         refused |= proton.refused();
         if let Some((obj, exe_index)) = proton.take_hit() {
           return finish_direct_hit(

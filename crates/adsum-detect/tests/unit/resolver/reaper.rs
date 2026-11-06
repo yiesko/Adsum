@@ -64,3 +64,12 @@ fn reaper_rejects_space_app_id() {
   let e = exec("reaper", Some("SteamLaunch AppId 892970 -- ./game"));
   assert!(resolve_steam_reaper(&e).is_none());
 }
+
+#[test]
+fn reaper_end_to_end_app_id_and_target() {
+  let e = exec("reaper", Some("SteamLaunch AppId=440 -- ./game -arg"));
+  let r = resolve_steam_reaper(&e).expect("resolves");
+  assert_eq!(r.0, 440);
+  // target index points at ./game in argv (1-based).
+  assert_eq!(r.1, 4);
+}
