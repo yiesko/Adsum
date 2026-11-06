@@ -911,6 +911,7 @@ fn reaper_end_to_end_resolves_app_id() {
   assert!(hit.is_some(), "reaper target resolves via AppId");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn wine_relative_target_resolves_through_match_process() {
   let (tx, _rx) = adsum_telemetry::QueueGauge::pair();
@@ -919,7 +920,7 @@ fn wine_relative_target_resolves_through_match_process() {
     "name": "Wine Game",
     "hook": false,
     "executables": [
-      {"name": "game.exe", "is_launcher": false, "os": "linux"}
+      {"name": "game.exe", "is_launcher": false, "os": "win32"}
     ],
     "third_party_skus": [],
     "aliases": []
