@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use aho_corasick::AhoCorasick;
 
+use crate::compatibility::CompatibilityBundle;
 use crate::db::DetectableActivity;
 use crate::matching::{name_matchable, normalize_name};
 use crate::types::os_matches;
@@ -223,6 +224,10 @@ pub struct DetectablesBundle {
   pub(crate) custom: Arc<[Arc<ScannedEntry>]>,
   pub(crate) custom_ac: Option<AhoCorasick>,
   pub(crate) custom_indexes: Vec<PatternIndex>,
+  /// Darwin-Java compatibility rules derived at build time (Linux only):
+  /// macOS `>java` entries whose arguments identify a Java game running
+  /// natively on Linux. Same-generation indexes, dropped on rebuild.
+  pub(crate) compatibility: CompatibilityBundle,
 }
 
 /// Process-wide generation counter for [`DetectablesBundle::epoch`].
@@ -254,6 +259,7 @@ impl DetectablesBundle {
       custom: Arc::from(Vec::new()),
       custom_ac: None,
       custom_indexes: Vec::new(),
+      compatibility: CompatibilityBundle::default(),
     }
   }
 }
@@ -526,6 +532,8 @@ pub(crate) fn build_bundle(
   // peak is one automaton + one vector + builder scratch — never two
   // pattern vectors beside a live automaton.
   let split = collect_split_patterns(&detectable);
+  let compatibility =
+    crate::compatibility::build_compatibility_bundle(&detectable, std::env::consts::OS);
   let ac = build_ac_automaton(&split.native_patterns)?;
   let mut idx = split.native_idx;
   drop(split.native_patterns);
@@ -572,6 +580,7 @@ pub(crate) fn build_bundle(
     custom,
     custom_ac,
     custom_indexes: custom_idx,
+    compatibility,
   })
 }
 

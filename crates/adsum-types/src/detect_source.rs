@@ -30,6 +30,9 @@ pub enum DetectSource {
   ExeStem,
   /// Install folder carrying the title.
   Folder,
+  /// A macOS `>java` database entry whose declared arguments matched a
+  /// Linux process command line (the Darwin-Java compatibility rule).
+  Compatibility,
 }
 
 impl DetectSource {
@@ -45,6 +48,7 @@ impl DetectSource {
       Self::SteamLibrary => "steam-library",
       Self::ExeStem => "exe-stem",
       Self::Folder => "folder",
+      Self::Compatibility => "compatibility",
     }
   }
 }

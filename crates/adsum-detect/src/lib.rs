@@ -35,6 +35,7 @@
 
 pub mod bundle;
 pub mod cache;
+mod compatibility;
 pub mod db;
 mod generations;
 mod heroic;
