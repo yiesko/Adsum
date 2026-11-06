@@ -412,6 +412,7 @@ The core feature set is intentionally stable, with the focus on reliability, det
 - [SpikeHD/rsRPC](https://github.com/SpikeHD/rsRPC): the original project this repository continues from.
 - [OpenAsar/arRPC](https://github.com/OpenAsar/arRPC): inspiration for the local RPC server, detectable database format and bridge behaviour.
 - [pog5/rsrpc](https://github.com/pog5/rsrpc): reference for process-detection behaviour and test coverage.
+- [Vencord/GameDetection](https://github.com/Vencord/GameDetection): reference for the Darwin-to-Linux Java compatibility rule and the Minecraft loader signatures. GPL-3.0, used as behavioural reference only.
 
 ## License
 
