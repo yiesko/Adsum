@@ -21,6 +21,22 @@ fn query_params_match_legacy_semantics() {
   assert_eq!(query_param(uri, "client_id"), Some("abc"));
 }
 
+/// Critical query parameters reject duplicate keys to prevent ambiguity attacks.
+#[test]
+fn single_query_param_rejects_duplicates() {
+  assert_eq!(single_query_param("/?v=1", "v"), Ok(Some("1")));
+  assert_eq!(single_query_param("/?v=1&v=2", "v"), Err(()));
+  assert_eq!(
+    single_query_param("/?encoding=json&encoding=msgpack", "encoding"),
+    Err(())
+  );
+  assert_eq!(
+    single_query_param("/?client_id=a&client_id=b", "client_id"),
+    Err(())
+  );
+  assert_eq!(single_query_param("/?v=1", "other"), Ok(None));
+}
+
 /// A4: the per-message snapshot shares the connection's client id
 /// instead of copying it.
 ///
@@ -37,6 +53,8 @@ fn slot_snapshot_shares_the_connection_client_id() {
     responder: Responder::for_test(),
     published: Vec::new(),
     query_client_id: Some(AppId::from("123456789012345678")),
+    oauth: oauth_connection("123456789012345678"),
+    oauth_reply: None,
   };
   let stored_ptr = slot
     .query_client_id
@@ -68,6 +86,8 @@ fn forgetting_the_last_pid_releases_the_published_buffer() {
     responder: adsum_ws::Responder::for_test(),
     published: Vec::new(),
     query_client_id: None,
+    oauth: oauth_connection(""),
+    oauth_reply: None,
   };
   for pid in 1..=handlers::MAX_TRACKED_PIDS as u64 {
     let admission = slot.note_published(
@@ -105,6 +125,8 @@ fn a_partially_forgotten_list_keeps_its_buffer() {
     responder: adsum_ws::Responder::for_test(),
     published: Vec::new(),
     query_client_id: None,
+    oauth: oauth_connection(""),
+    oauth_reply: None,
   };
   slot.note_published(
     Some(adsum_types::AppId::from("app-1")),

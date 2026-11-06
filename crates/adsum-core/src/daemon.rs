@@ -7,7 +7,9 @@
 //! on shutdown.
 
 use std::collections::HashSet;
+use std::io;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use adsum_bridge::{Bridge, BridgeConfig, BridgeInputs, ProcInput, ScannedGame};
 use adsum_detect::db::DetectableActivity;
@@ -15,6 +17,7 @@ use adsum_detect::refresh::RefreshConfig;
 use adsum_detect::runtime::ShutdownHandle;
 use adsum_detect::server::ProcessServer;
 use adsum_detect::types::{ProcessCallback, ProcessEventListeners, ProcessScanState};
+use adsum_oauth::OAuthManager;
 use adsum_protocol::error::{AdsumError, Result};
 use adsum_telemetry::QueueGauge;
 use adsum_transport_ipc::IpcTransport;
@@ -173,25 +176,35 @@ impl Daemon {
   /// transports and the bridge on the caller's Tokio runtime, torn down
   /// in reverse order afterwards.
   ///
-  /// Must be called within a Tokio runtime. Teardown is total: after
-  /// the bridge and both transports stop, the scanner is shut down and
+  /// Must be called within a Tokio runtime. After the bridge and both
+  /// transports stop, the scanner is shut down and
   /// joined (directed shutdown — no orphaned scan/refresh/watcher
   /// threads), then the server handle is dropped so the event pump's
-  /// channel closes, and the pump itself is joined. When `run_until`
-  /// returns, no Adsum thread is still running: the CLI relies on this
-  /// implicitly at process exit, and library callers may run another
-  /// daemon afterwards. Bind failures tear the scanner down the same
-  /// way: no path after `start_scanner` leaks threads.
+  /// channel closes, and the pump itself is joined. A single OAuth manager
+  /// shares policy and worker capacity across IPC and WebSocket. After the
+  /// transports stop, its workers are cancelled and joined off-runtime; an
+  /// in-flight HTTPS request may take up to its 12-second deadline to finish.
+  /// Bind failures use the same teardown. Dropping the future signals scanner
+  /// and OAuth cancellation, but cannot synchronously join their workers.
   ///
   /// # Errors
   ///
   /// Bind failures (`IpcBind`, `WsBind`, `BridgeBind`) surface here;
   /// nothing exits the process — the caller (CLI) decides.
-  pub async fn run_until(
+  pub async fn run_until(self, shutdown: impl Future<Output = ()> + Send + 'static) -> Result<()> {
+    self
+      .run_until_with_oauth(shutdown, Arc::new(OAuthManager::from_env()))
+      .await
+  }
+
+  async fn run_until_with_oauth(
     mut self,
     shutdown: impl Future<Output = ()> + Send + 'static,
+    oauth: Arc<OAuthManager>,
   ) -> Result<()> {
+    let _oauth_cancel = OAuthCancelGuard(Arc::clone(&oauth));
     let user = Arc::new(Mutex::new(RpcUser::from_env()));
+    log_persisted_grants();
 
     // Move (never clone) the database into the scanner build: the fat
     // structs convert once to the slim form and drop. Cloning here would
@@ -218,17 +231,47 @@ impl Daemon {
       cancel_guard.arm(server);
     }
     let result = self
-      .serve(proc_rx, proc_tx, scanner_gauge, user, shutdown)
+      .serve(
+        proc_rx,
+        proc_tx,
+        scanner_gauge,
+        user,
+        shutdown,
+        Arc::clone(&oauth),
+      )
       .await;
+    // Both transports have stopped on success and bind failure. Join OAuth
+    // independently of Tokio's IPC/scanner work, never on a runtime worker.
+    oauth.cancel();
+    // Snapshot before the blocking shutdown consumes the Arc.
+    let oauth_metrics = oauth.metrics();
+    let oauth_teardown = tokio::task::spawn_blocking(move || {
+      let timed_out = oauth.shutdown();
+      if timed_out > 0 {
+        tracing::warn!(
+          "[daemon] {timed_out} OAuth worker(s) did not exit within the shutdown deadline"
+        );
+      }
+    });
     Self::teardown_scanner(scanner, pump).await;
+    if oauth_teardown.await.is_err() {
+      tracing::warn!("[daemon] OAuth teardown task failed");
+    }
+    tracing::info!(
+      authorize = oauth_metrics.authorize_total,
+      authenticate = oauth_metrics.authenticate_total,
+      cache_hits = oauth_metrics.cache_hits,
+      cache_misses = oauth_metrics.cache_misses,
+      rate_limited = oauth_metrics.rate_limited,
+      "[daemon] OAuth session totals"
+    );
     cancel_guard.disarm();
     result
   }
 
   /// Bind transports + bridge, serve until `shutdown`, stop the async
-  /// legs. Partial binds clean themselves on drop (transports close
-  /// sockets and abort tasks); scanner teardown is the caller's job so
-  /// it runs on success AND error.
+  /// legs. Partial binds use the same awaited transport teardown as normal
+  /// completion; scanner and OAuth worker joins are the caller's job.
   async fn serve(
     &self,
     proc_rx: mpsc::Receiver<ProcInput>,
@@ -236,82 +279,99 @@ impl Daemon {
     watch_gauge: Option<adsum_telemetry::QueueGauge>,
     user: Arc<Mutex<RpcUser>>,
     shutdown: impl Future<Output = ()> + Send + 'static,
+    oauth: Arc<OAuthManager>,
   ) -> Result<()> {
-    let mut ipc_transport = None;
-    let mut game_transport = None;
+    let (mut ipc_transport, mut ipc_rx) = split_option(None);
+    let (mut game_transport, mut game_rx) = split_option(None);
 
-    if self.config.enable_ipc_connector {
-      let (transport, rx) = IpcTransport::bind(Arc::clone(&user)).await?;
-      tracing::info!("[daemon] IPC transport on {}", transport.socket_path());
-      ipc_transport = Some((transport, rx));
+    let result = async {
+      if self.config.enable_ipc_connector {
+        let (transport, rx) =
+          IpcTransport::bind_with_oauth(Arc::clone(&user), Arc::clone(&oauth)).await?;
+        tracing::info!("[daemon] IPC transport on {}", transport.socket_path());
+        ipc_transport = Some(transport);
+        ipc_rx = rx;
+      }
+      // Each flag disables only its own command class (mapped below); the
+      // transport binds while either class is wanted, and stays down only
+      // when both are off.
+      if self.config.enable_websocket_connector || self.config.enable_secondary_events {
+        let ws_config = ws_transport_config(&self.config);
+        let (transport, rx) =
+          WsTransport::bind_with_oauth(ws_config, Arc::clone(&user), Arc::clone(&oauth)).await?;
+        tracing::info!("[daemon] Game transport on port {}", transport.bound_port());
+        game_transport = Some(transport);
+        game_rx = rx;
+      }
+
+      let bridge_config = bridge_config_for(
+        &self.config,
+        game_transport
+          .as_ref()
+          .map(|transport| transport.bound_port()),
+        ipc_transport
+          .as_ref()
+          .map(|transport| transport.socket_path().to_string()),
+      );
+      let bridge = Bridge::bind(
+        bridge_config,
+        Arc::clone(&user),
+        BridgeInputs {
+          ipc_rx,
+          game_rx,
+          proc_rx,
+          // Sender clones for census queue-depth sampling; game-client
+          // total for the census consumer count. `None` when the leg is off.
+          ipc_tx: ipc_transport
+            .as_ref()
+            .map(|transport| transport.event_sink().sender()),
+          game_tx: game_transport
+            .as_ref()
+            .map(|transport| transport.sink_sender()),
+          proc_tx,
+          game_clients: game_transport
+            .as_ref()
+            .map(|transport| transport.client_total()),
+          // The watcher's own gauge, shared as a refcounted handle so the
+          // census reads the live shed counter. `None` without a scanner —
+          // no watcher can shed, and the census reports 0.
+          watch_shed: watch_gauge.map(Arc::new),
+        },
+      )
+      .await?;
+      tracing::info!(
+        "[daemon] Bridge on {} (msgpack {})",
+        bridge.json_port(),
+        bridge.msgpack_port()
+      );
+
+      // Snapshot aliases: publish the configured snapshot name (prefix via
+      // ADSUM_STATE_PREFIX) into every known client runtime dir that
+      // exists — Equibop and any compatible state-file consumer.
+      let alias_ownership = bridge
+        .state_path()
+        .map(std::path::Path::to_path_buf)
+        .and_then(|target| start_snapshot_aliases(&target));
+
+      shutdown.await;
+      tracing::info!("[daemon] Shutting down...");
+      bridge.shutdown().await;
+      if let Some(aliases) = alias_ownership {
+        aliases.shutdown().await;
+      }
+      Ok(())
     }
-    // Each flag disables only its own command class (mapped below); the
-    // transport binds while either class is wanted, and stays down only
-    // when both are off.
-    if self.config.enable_websocket_connector || self.config.enable_secondary_events {
-      let ws_config = ws_transport_config(&self.config);
-      let (transport, rx) = WsTransport::bind(ws_config, Arc::clone(&user)).await?;
-      tracing::info!("[daemon] Game transport on port {}", transport.bound_port());
-      game_transport = Some((transport, rx));
-    }
+    .await;
 
-    let (ipc_transport, ipc_rx) = split_option(ipc_transport);
-    let (game_transport, game_rx) = split_option(game_transport);
-    let bridge_config = bridge_config_for(
-      &self.config,
-      game_transport
-        .as_ref()
-        .map(|transport| transport.bound_port()),
-      ipc_transport
-        .as_ref()
-        .map(|transport| transport.socket_path().to_string()),
-    );
-    let bridge = Bridge::bind(
-      bridge_config,
-      Arc::clone(&user),
-      BridgeInputs {
-        ipc_rx,
-        game_rx,
-        proc_rx,
-        // Sender clones for census queue-depth sampling; game-client
-        // total for the census consumer count. `None` when the leg is off.
-        ipc_tx: ipc_transport
-          .as_ref()
-          .map(|transport| transport.event_sink().sender()),
-        game_tx: game_transport
-          .as_ref()
-          .map(|transport| transport.sink_sender()),
-        proc_tx,
-        game_clients: game_transport
-          .as_ref()
-          .map(|transport| transport.client_total()),
-        // The watcher's own gauge, shared as a refcounted handle so the
-        // census reads the live shed counter. `None` without a scanner —
-        // no watcher can shed, and the census reports 0.
-        watch_shed: watch_gauge.map(Arc::new),
-      },
-    )
-    .await?;
-    tracing::info!(
-      "[daemon] Bridge on {} (msgpack {})",
-      bridge.json_port(),
-      bridge.msgpack_port()
-    );
-
-    shutdown.await;
-    tracing::info!("[daemon] Shutting down...");
-
-    // Reverse-order teardown of the async legs: consumers first,
-    // producers last. Dropping the bridge ends its pumps; transports
-    // close their listeners. Scanner teardown is the caller's job.
-    bridge.shutdown().await;
+    // Await partial transports too: a later bind failure must not leave their
+    // connections racing the daemon-wide OAuth worker join.
     if let Some(transport) = game_transport {
       transport.shutdown().await;
     }
     if let Some(transport) = ipc_transport {
       transport.shutdown().await;
     }
-    Ok(())
+    result
   }
 
   /// Stop scanner threads + pump on every `run_until` exit path
@@ -324,17 +384,22 @@ impl Daemon {
   ) {
     if let Some(scanner) = scanner {
       scanner.shutdown();
-      let teardown = tokio::task::spawn_blocking(move || {
-        scanner.join();
-        drop(scanner);
-        if let Some(pump) = pump
-          && pump.join().is_err()
-        {
-          tracing::warn!("[daemon] scanner pump thread panicked during join");
+      let timed_out = scanner.join(Duration::from_secs(5));
+      if timed_out > 0 {
+        tracing::warn!(
+          "[daemon] {timed_out} scanner worker(s) did not exit within the shutdown deadline"
+        );
+      }
+      drop(scanner);
+      if let Some(pump) = pump {
+        match join_with_timeout(pump, Duration::from_secs(5)) {
+          Ok(()) => {}
+          Err(err) => {
+            tracing::warn!(
+              "[daemon] scanner pump thread did not exit within the shutdown deadline: {err}"
+            );
+          }
         }
-      });
-      if teardown.await.is_err() {
-        tracing::warn!("[daemon] scanner teardown task panicked during join");
       }
     }
   }
@@ -473,6 +538,55 @@ impl Drop for CancelGuard {
   }
 }
 
+/// Dropping an abandoned run must signal OAuth cancellation without joining
+/// blocking I/O on the runtime thread. Normal completion joins explicitly.
+struct OAuthCancelGuard(Arc<OAuthManager>);
+
+/// Surface stored OAuth grants at startup: which applications have one, what
+/// scopes they carry, when the last access token expired, and whether the
+/// file is still private. Refresh tokens are never read into a log line —
+/// only their presence.
+fn log_persisted_grants() {
+  let ids = adsum_oauth::store::list();
+  if ids.is_empty() {
+    tracing::debug!("[daemon] no persisted OAuth grants");
+    return;
+  }
+  for id in ids {
+    match adsum_oauth::store::load(&id) {
+      Some(session) => {
+        #[cfg(unix)]
+        if let Some(mode) = adsum_oauth::store::stored_mode(&id)
+          && mode & 0o077 != 0
+        {
+          tracing::warn!(
+            application = %id,
+            mode = format!("{mode:04o}"),
+            "[daemon] persisted OAuth grant has loose file permissions; expected 0600"
+          );
+        }
+        tracing::info!(
+          application = %id,
+          scopes = %session.scopes.join(" "),
+          expires = session.expires,
+          refresh_stored = session.refresh_token.is_some(),
+          "[daemon] persisted OAuth grant"
+        );
+      }
+      None => tracing::warn!(
+        application = %id,
+        "[daemon] persisted OAuth grant file is unreadable or corrupt"
+      ),
+    }
+  }
+}
+
+impl Drop for OAuthCancelGuard {
+  fn drop(&mut self) {
+    self.0.cancel();
+  }
+}
+
 /// Map daemon connector flags onto the game transport config: each flag
 /// gates only its own command class (`SET_ACTIVITY` vs secondary
 /// browser/deep-link/callback commands).
@@ -507,6 +621,130 @@ fn bridge_config_for(
   }
 }
 
+/// Snapshot alias reconciliation cadence: fast enough that a client whose
+/// runtime dir appears after the daemon starts is picked up promptly.
+#[cfg(unix)]
+const STATE_ALIAS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Effective uid (Unix only; the state-alias mechanism is Unix-only).
+#[cfg(unix)]
+fn nix_euid() -> u32 {
+  // SAFETY: plain syscall wrapper, no preconditions.
+  unsafe { libc::geteuid() }
+}
+
+/// Publish and reconcile snapshot aliases every [`STATE_ALIAS_INTERVAL`]:
+/// client runtime dirs that appear after startup are picked up, and pairs
+/// whose target went dead or stale are cleaned.
+#[cfg(unix)]
+struct SnapshotAliases {
+  stop: tokio::sync::oneshot::Sender<()>,
+  task: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(unix)]
+impl SnapshotAliases {
+  /// Stop the reconcile loop and wait for it; the task removes the aliases
+  /// it owns before exiting. Bounded so a wedged task cannot hold the
+  /// daemon past the systemd stop deadline.
+  async fn shutdown(mut self) {
+    let _ = self.stop.send(());
+    tokio::select! {
+      result = &mut self.task => {
+        match result {
+          Ok(()) => {}
+          Err(err) => {
+            tracing::warn!("[daemon] snapshot alias task panicked: {err}");
+          }
+        }
+      }
+      _ = tokio::time::sleep(Duration::from_secs(5)) => {
+        tracing::warn!("[daemon] snapshot alias shutdown timed out; aborting task");
+        self.task.abort();
+      }
+    }
+  }
+}
+
+/// Spawn the snapshot alias reconciler for `target` (Unix only).
+#[cfg(unix)]
+fn start_snapshot_aliases(target: &std::path::Path) -> Option<SnapshotAliases> {
+  use adsum_transport_ipc::state_aliases;
+  use std::sync::Arc;
+
+  let name = Arc::<str>::from(target.file_name()?.to_string_lossy().into_owned());
+  let target = Arc::new(target.to_path_buf());
+  let euid = nix_euid();
+  let owned = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+  let task_owned = Arc::clone(&owned);
+  let (stop, mut stopped) = tokio::sync::oneshot::channel();
+  let task = tokio::spawn(async move {
+    loop {
+      let bases = adsum_transport_ipc::paths::socket_dir_candidates();
+      let dirs = state_alias_dirs_blocking(bases).await;
+      let pass_owned = Arc::clone(&task_owned);
+      let pass_target = Arc::clone(&target);
+      let pass_name = Arc::clone(&name);
+      tokio::task::spawn_blocking(move || {
+        let mut guard = pass_owned.blocking_lock();
+        for dir in dirs {
+          state_aliases::reconcile_state_alias(
+            &dir,
+            &pass_name,
+            &pass_target,
+            euid,
+            &mut guard,
+            state_aliases::STATE_CONSUMER_STALE_MS,
+            state_alias_now_ms(),
+          );
+        }
+      })
+      .await
+      .ok();
+      tokio::select! {
+        _ = &mut stopped => break,
+        () = tokio::time::sleep(STATE_ALIAS_INTERVAL) => {}
+      }
+    }
+    // Passes are sequential, so the lock is free here.
+    let mut guard = task_owned.lock().await;
+    state_aliases::remove_owned_state_aliases(&mut guard, euid);
+  });
+  Some(SnapshotAliases { stop, task })
+}
+
+/// No-op stub so non-Unix builds keep the same `serve` shape.
+#[cfg(not(unix))]
+struct SnapshotAliases;
+
+#[cfg(not(unix))]
+impl SnapshotAliases {
+  async fn shutdown(self) {}
+}
+
+/// Snapshot aliases are Unix-only: no client runtime dirs to publish into.
+#[cfg(not(unix))]
+fn start_snapshot_aliases(_target: &std::path::Path) -> Option<SnapshotAliases> {
+  None
+}
+
+/// The blocking discovery helpers run off the async workers.
+#[cfg(unix)]
+async fn state_alias_dirs_blocking(bases: Vec<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
+  tokio::task::spawn_blocking(move || adsum_transport_ipc::state_aliases::state_alias_dirs(&bases))
+    .await
+    .unwrap_or_default()
+}
+
+/// Milliseconds since the epoch, for alias freshness checks.
+#[cfg(unix)]
+fn state_alias_now_ms() -> u64 {
+  std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map(|elapsed| elapsed.as_millis() as u64)
+    .unwrap_or(0)
+}
+
 /// Split an optional bound transport into handle + receiver, or a
 /// pre-closed receiver when the leg is disabled (its pump exits at once).
 fn split_option<T>(
@@ -519,6 +757,23 @@ fn split_option<T>(
       (None, rx)
     }
   }
+}
+
+/// Join a thread with a deadline. The handle is moved to a waiter thread
+/// so the caller can bound the wait instead of blocking indefinitely — a
+/// wedged worker must not hold the shutdown past the systemd deadline.
+fn join_with_timeout(handle: std::thread::JoinHandle<()>, timeout: Duration) -> io::Result<()> {
+  let (tx, rx) = std::sync::mpsc::channel();
+  let _waiter = std::thread::spawn(move || {
+    let _ = handle.join();
+    let _ = tx.send(());
+  });
+  rx.recv_timeout(timeout).map_err(|err| {
+    io::Error::new(
+      io::ErrorKind::TimedOut,
+      format!("thread join timed out: {err}"),
+    )
+  })
 }
 
 #[cfg(test)]

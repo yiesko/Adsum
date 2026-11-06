@@ -33,7 +33,7 @@ UNIT_DIR="${HOME}/.config/systemd/user"
 UNIT_NAME="adsum.service"
 DROPIN_DIR="${UNIT_DIR}/${UNIT_NAME}.d"
 
-YES=0 FORCE=0 NO_SYSTEMD=0 AUTO_UPDATE=0 BINARY="" UNIT="" TAG=""
+YES=0 FORCE=0 NO_SYSTEMD=0 AUTO_UPDATE=0 OAUTH_CLIENT_ID="" OAUTH_REDIRECT="" OAUTH_SECRET="" BINARY="" UNIT="" TAG=""
 
 log() { printf '[install] %s\n' "$*"; }
 warn() { printf '[install] WARNING: %s\n' "$*" >&2; }
@@ -42,10 +42,14 @@ die() { printf '[install] ERROR: %s\n' "$*" >&2; exit 1; }
 usage() {
   cat <<'EOF'
 Usage: install.sh [--yes] [--force] [--no-systemd] [--auto-update]
+                  [--oauth-client-id ID] [--oauth-redirect URI] [--oauth-secret SECRET]
                   [--binary PATH] [--unit PATH] [--tag TAG] [-h|--help]
 
 Installs (or updates) the adsum binary, systemd user unit, and
 optionally enables the service + background update staging.
+With --oauth-client-id, also writes an OAuth drop-in (redirect URI
+defaults to http://127.0.0.1:48152/callback). After installing, run
+`adsum oauth login` once in a terminal to sign in.
 EOF
   exit "${1:-0}"
 }
@@ -60,6 +64,9 @@ while [ $# -gt 0 ]; do
     --force) FORCE=1 ;;
     --no-systemd) NO_SYSTEMD=1 ;;
     --auto-update) AUTO_UPDATE=1 ;;
+    --oauth-client-id) OAUTH_CLIENT_ID="${2:?--oauth-client-id needs a value}"; shift ;;
+    --oauth-redirect) OAUTH_REDIRECT="${2:?--oauth-redirect needs a value}"; shift ;;
+    --oauth-secret) OAUTH_SECRET="${2:?--oauth-secret needs a value}"; shift ;;
     --binary) BINARY="${2:?--binary needs a path}"; shift ;;
     --unit) UNIT="${2:?--unit needs a path}"; shift ;;
     --tag) TAG="${2:?--tag needs a value}"; shift ;;
@@ -237,6 +244,39 @@ if [ "$AUTO_UPDATE" -eq 1 ] && [ "$NO_SYSTEMD" -eq 0 ]; then
   mkdir -p "$DROPIN_DIR"
   printf '[Service]\nEnvironment=ADSUM_AUTO_UPDATE=1\n' > "${DROPIN_DIR}/10-auto-update.conf"
   log "auto-update staging enabled"
+fi
+
+# OAuth drop-in: opt-in via --oauth-client-id. The daemon never opens a
+# browser; the user runs `adsum oauth login` from a terminal afterwards.
+if [ -n "$OAUTH_CLIENT_ID" ] && [ "$NO_SYSTEMD" -eq 0 ]; then
+  mkdir -p "$DROPIN_DIR"
+  if [ -z "$OAUTH_REDIRECT" ]; then
+    OAUTH_REDIRECT="http://127.0.0.1:48152/callback"
+  fi
+  if [ -n "$OAUTH_SECRET" ]; then
+    (
+      umask 077
+      rm -f "${DROPIN_DIR}/20-oauth.conf"
+      cat > "${DROPIN_DIR}/20-oauth.conf" <<EOF
+[Service]
+Environment=ADSUM_OAUTH_REDIRECT_URI=${OAUTH_REDIRECT}
+Environment=ADSUM_OAUTH_CLIENT_SECRET=${OAUTH_SECRET}
+EOF
+      chmod 600 "${DROPIN_DIR}/20-oauth.conf"
+    )
+    log "oauth drop-in written (redirect + client secret)"
+  else
+    cat > "${DROPIN_DIR}/20-oauth.conf" <<EOF
+[Service]
+Environment=ADSUM_OAUTH_REDIRECT_URI=${OAUTH_REDIRECT}
+EOF
+    log "oauth drop-in written (redirect only; no secret, so no refresh/restore)"
+  fi
+  if [ -n "$OAUTH_SECRET" ]; then
+    log "finish setup in a terminal: ADSUM_OAUTH_CLIENT_SECRET=<your secret> adsum oauth login --client-id ${OAUTH_CLIENT_ID} --redirect-uri ${OAUTH_REDIRECT}"
+  else
+    log "finish setup in a terminal: adsum oauth login --client-id ${OAUTH_CLIENT_ID} --redirect-uri ${OAUTH_REDIRECT}"
+  fi
 fi
 
 if [ "$NO_SYSTEMD" -eq 0 ]; then

@@ -86,15 +86,9 @@ fn current_user_update_is_a_dispatch_with_the_user_inside() {
 
 #[test]
 fn unsupported_commands_map_to_official_codes() {
-  // OAuth needs the in-client flow + app secret.
-  assert_eq!(
-    unsupported_command("AUTHORIZE"),
-    Some((5000, "Authorization requires the real Discord client"))
-  );
-  assert_eq!(
-    unsupported_command("AUTHENTICATE"),
-    Some((5000, "Authorization requires the real Discord client"))
-  );
+  // OAuth is handled by the experimental loopback adapter.
+  assert!(unsupported_command("AUTHORIZE").is_none());
+  assert!(unsupported_command("AUTHENTICATE").is_none());
   // Invites target live sessions on the real client.
   assert_eq!(
     unsupported_command("SEND_ACTIVITY_JOIN_INVITE"),
@@ -106,7 +100,13 @@ fn unsupported_commands_map_to_official_codes() {
   // Voice/guilds/overlay/store: real-client state only.
   let (code, _) = unsupported_command("SELECT_VOICE_CHANNEL").expect("known");
   assert_eq!(code, 1000);
-  let (code, _) = unsupported_command("GET_GUILDS").expect("known");
+  // GET_GUILDS is token-backed; the rest need the real Discord client.
+  assert!(unsupported_command("GET_GUILDS").is_none());
+  let (code, _) = unsupported_command("GET_GUILD").expect("known");
+  assert_eq!(code, 1000);
+  let (code, _) = unsupported_command("GET_CHANNELS").expect("known");
+  assert_eq!(code, 1000);
+  let (code, _) = unsupported_command("GET_CHANNEL").expect("known");
   assert_eq!(code, 1000);
   // Handled elsewhere or genuinely unknown: no entry.
   assert!(unsupported_command("SET_ACTIVITY").is_none());

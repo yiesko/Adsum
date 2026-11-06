@@ -32,11 +32,23 @@ impl Scratch {
       .duration_since(UNIX_EPOCH)
       .expect("clock is after the epoch")
       .as_nanos();
-    let path = root.join(format!("adsum-sigterm-{pid}-{nanos}"));
-    fs::DirBuilder::new()
-      .mode(0o700)
-      .create(&path)
-      .expect("create scratch runtime dir");
+    // Retry on a name collision (stale dir from a crashed run, or two
+    // test processes sharing the same pid+nanos prefix): append a counter
+    // until creation succeeds.
+    let mut attempt = 0u32;
+    let path = loop {
+      let candidate = root.join(format!("adsum-sigterm-{pid}-{nanos}-{attempt}"));
+      match fs::DirBuilder::new().mode(0o700).create(&candidate) {
+        Ok(()) => break candidate,
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+          attempt += 1;
+          if attempt > 1000 {
+            panic!("create scratch runtime dir: too many collisions");
+          }
+        }
+        Err(err) => panic!("create scratch runtime dir: {err}"),
+      }
+    };
     Self(path)
   }
 

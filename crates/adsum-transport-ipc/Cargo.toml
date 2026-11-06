@@ -1,6 +1,6 @@
 [package]
 name = "adsum-transport-ipc"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -16,6 +16,7 @@ workspace = true
 [dependencies]
 adsum-types = { path = "../adsum-types" }
 adsum-protocol = { path = "../adsum-protocol" }
+adsum-oauth = { path = "../adsum-oauth" }
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "time", "macros", "sync"] }
 tokio-util = "0.7"
 interprocess = "2.2"
@@ -25,6 +26,10 @@ tracing.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# SDDL string for the pipe DACL; already in the tree via interprocess.
+widestring = "1.2"
 
 [dev-dependencies]
 libc = "0.2"

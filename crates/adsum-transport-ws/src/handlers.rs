@@ -208,7 +208,7 @@ pub(crate) async fn handle_subscribe(event: &ActivityCmd, responder: &Responder)
 pub(crate) async fn handle_unknown(cmd: &str, event: &ActivityCmd, responder: &Responder) -> bool {
   let unsupported = commands::unsupported_command(cmd);
   if unsupported.is_none() {
-    tracing::warn!("[transport-ws] Unknown command: {cmd}");
+    tracing::warn!("[transport-ws] Unknown command");
   }
   let (code, message) = unsupported.unwrap_or((1000, "Unknown command"));
   reply(
@@ -332,6 +332,9 @@ pub(crate) fn clear_for_slot(published: &PublishedSlot) -> ActivityCmd {
       activity: Some(None),
       code: None,
       user_id: None,
+      guild_id: None,
+      channel_id: None,
+      extra: Default::default(),
     }),
     nonce: published.nonce.clone(),
   }

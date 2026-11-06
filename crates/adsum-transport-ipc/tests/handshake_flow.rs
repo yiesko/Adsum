@@ -9,14 +9,37 @@
 mod common;
 
 use std::os::unix::net::UnixStream;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
+use adsum_oauth::{
+  OAuthBackend, OAuthCancellation, OAuthError, OAuthManager, RpcAuthPolicy, RpcOAuthResult,
+};
+
 use adsum_transport_ipc::EventSink;
-use adsum_transport_ipc::frame::{IpcFacilitator, PacketType, handle_stream};
+use adsum_transport_ipc::frame::{IpcFacilitator, PacketType, handle_stream as pump_stream};
 use adsum_types::AppId;
 use adsum_types::cmd::ActivityCmd;
 use adsum_types::user::RpcUser;
 use common::{read_frame, recv_cmd, write_frame};
+
+struct NoOAuth;
+
+impl OAuthBackend for NoOAuth {
+  fn execute(
+    &self,
+    _command: &ActivityCmd,
+    _client_id: &str,
+    _cancellation: &OAuthCancellation,
+  ) -> Result<RpcOAuthResult, OAuthError> {
+    Err(OAuthError::InvalidArguments)
+  }
+}
+
+fn handle_stream(ipc: &mut dyn IpcFacilitator, stream: &mut UnixStream) {
+  stream.set_nonblocking(true).expect("nonblocking pump");
+  pump_stream(ipc, stream);
+}
 
 struct TestFacilitator {
   handshake: bool,
@@ -25,6 +48,7 @@ struct TestFacilitator {
   nonce: serde_json::Value,
   sink: EventSink,
   published_pids: Vec<u64>,
+  deadline: Option<Duration>,
 }
 
 impl IpcFacilitator for TestFacilitator {
@@ -68,13 +92,29 @@ impl IpcFacilitator for TestFacilitator {
   fn current_user(&self) -> RpcUser {
     RpcUser::default()
   }
+  /// Disabled by default in tests: the shared deadline would race thread
+  /// scheduling in the socketpair tests. The deadline has its own test.
+  fn handshake_deadline(&self) -> Option<Duration> {
+    self.deadline
+  }
+  fn oauth_manager(&self) -> &Arc<OAuthManager> {
+    static OAUTH: LazyLock<Arc<OAuthManager>> = LazyLock::new(|| {
+      Arc::new(OAuthManager::new(
+        RpcAuthPolicy::Permissive,
+        Arc::new(NoOAuth),
+      ))
+    });
+    &OAUTH
+  }
   /// Test sink under assertion.
   fn sink(&self) -> &EventSink {
     &self.sink
   }
-  /// Test history via the shared bound helper.
-  fn note_published_pid(&mut self, pid: u64) {
-    adsum_transport_ipc::frame::track_pid(&mut self.published_pids, pid);
+  fn owns_published_pid(&self, pid: u64) -> bool {
+    self.published_pids.contains(&pid)
+  }
+  fn forget_published_pid(&mut self, pid: u64) {
+    self.published_pids.retain(|known| *known != pid);
   }
   /// Test history shares the production admission bound.
   fn admit_published_pid(&mut self, pid: u64) -> bool {
@@ -102,6 +142,7 @@ fn handshake_set_activity_close_flow() {
     nonce: serde_json::Value::Null,
     sink,
     published_pids: Vec::new(),
+    deadline: None,
   };
   let mut server_stream = server_stream;
   let server = std::thread::spawn(move || handle_stream(&mut facil, &mut server_stream));
@@ -180,6 +221,7 @@ fn set_activity_forwards_the_fixed_shape() {
     nonce: serde_json::Value::Null,
     sink,
     published_pids: Vec::new(),
+    deadline: None,
   };
   let mut server_stream = server_stream;
   let server = std::thread::spawn(move || handle_stream(&mut facil, &mut server_stream));
@@ -247,6 +289,7 @@ fn invalid_utf8_body_clears_published_pid() {
     nonce: serde_json::Value::Null,
     sink,
     published_pids: Vec::new(),
+    deadline: None,
   };
   let mut server_stream = server_stream;
   let server = std::thread::spawn(move || handle_stream(&mut facil, &mut server_stream));
@@ -330,6 +373,7 @@ fn spawn_server() -> (
     nonce: serde_json::Value::Null,
     sink,
     published_pids: Vec::new(),
+    deadline: None,
   };
   let mut server_stream = server_stream;
   let server = std::thread::spawn(move || handle_stream(&mut facil, &mut server_stream));
@@ -568,6 +612,7 @@ fn abrupt_close_clears_every_published_pid() {
     nonce: serde_json::Value::Null,
     sink,
     published_pids: Vec::new(),
+    deadline: None,
   };
   let mut server_stream = server_stream;
   let server = std::thread::spawn(move || handle_stream(&mut facil, &mut server_stream));
@@ -622,6 +667,7 @@ fn published_pid_history_is_bounded() {
     nonce: serde_json::Value::Null,
     sink,
     published_pids: Vec::new(),
+    deadline: None,
   };
   let mut server_stream = server_stream;
   let server = std::thread::spawn(move || handle_stream(&mut facil, &mut server_stream));
@@ -650,16 +696,11 @@ fn published_pid_history_is_bounded() {
   }
   pids.sort_unstable();
   assert_eq!(pids, (1u64..=16).collect::<Vec<_>>());
-  // Plus the close path's current-pid clear (pid 20, refused and never
-  // shown — a harmless no-op downstream kept for the external-implementor
-  // contract that clears exactly `[current_pid]`): then drained.
-  assert_eq!(recv_clear_pid(&mut rx), 20);
+  server.join().expect("server thread");
   assert!(
     rx.try_recv().is_err(),
-    "refused pids must leave no further sink traffic behind"
+    "refused pids must never be cleared: another connection may own them"
   );
-
-  server.join().expect("server thread");
 }
 
 /// Close clears retry through a full sink instead of shedding.
@@ -683,6 +724,7 @@ fn clean_close_clear_survives_a_full_sink() {
     nonce: serde_json::Value::Null,
     sink,
     published_pids: Vec::new(),
+    deadline: None,
   };
   let mut server_stream = server_stream;
   let server = std::thread::spawn(move || handle_stream(&mut facil, &mut server_stream));
@@ -753,6 +795,7 @@ fn close_echo_carries_the_clients_own_nonce() {
       nonce: serde_json::Value::Null,
       sink,
       published_pids: Vec::new(),
+      deadline: None,
     };
     let mut server_stream = server_stream;
     let server = std::thread::spawn(move || handle_stream(&mut facil, &mut server_stream));
@@ -928,4 +971,65 @@ fn set_activity_clear_with_valid_pid_forwards() {
 
   drop(client);
   server.join().expect("server thread");
+}
+
+/// Probes that connect and close without a handshake (a filesystem
+/// `exists()` on Windows named pipes opens the pipe) must never wedge the
+/// endpoint: after 50 ghosts, the next real client still gets READY.
+#[test]
+fn ghost_connections_do_not_wedge_the_next_client() {
+  for _ in 0..50 {
+    let (client, _rx, server) = spawn_server();
+    drop(client);
+    server.join().expect("ghost pump exits on EOF");
+  }
+  let (mut client, _rx, server) = spawn_server();
+  write_frame(
+    &mut client,
+    PacketType::Handshake,
+    r#"{"v":1,"client_id":"test-app"}"#,
+  );
+  let (packet_type, body) = read_frame(&mut client);
+  assert_eq!(packet_type, 1, "expected READY after 50 ghosts");
+  assert!(body.contains("READY"), "expected READY, got: {body}");
+  drop(client);
+  server.join().expect("server thread");
+}
+
+/// A connection that never handshakes is dropped at its deadline, freeing
+/// the slot; the client observes the close as EOF.
+#[test]
+fn unhandshaked_connections_close_at_the_deadline() {
+  use std::io::Read as _;
+
+  let (server_stream, mut client) = UnixStream::pair().expect("socketpair");
+  client
+    .set_read_timeout(Some(Duration::from_secs(5)))
+    .expect("timeout");
+  let (sink, _rx) = EventSink::bounded(16);
+  let mut facil = TestFacilitator {
+    handshake: false,
+    client_id: AppId::from(""),
+    pid: 0,
+    nonce: serde_json::Value::Null,
+    sink,
+    published_pids: Vec::new(),
+    deadline: Some(Duration::from_millis(100)),
+  };
+  let (done_tx, done_rx) = std::sync::mpsc::channel();
+  let mut server_stream = server_stream;
+  std::thread::spawn(move || {
+    handle_stream(&mut facil, &mut server_stream);
+    let _ = done_tx.send(());
+  });
+  // Deadline (100 ms) plus a poll interval, with slack for CI scheduling.
+  done_rx
+    .recv_timeout(Duration::from_secs(2))
+    .expect("pump must exit at the handshake deadline");
+  // The server closed its end: the client reads EOF (0 bytes).
+  let mut header = [0u8; 8];
+  assert!(
+    matches!(client.read(&mut header), Ok(0)),
+    "expected EOF after the deadline"
+  );
 }

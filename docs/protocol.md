@@ -12,7 +12,9 @@ officially-shaped replies. Two transports are served:
   in every existing client layout let games find it wherever they probe (see
   [Linux socket placement](#linux-socket-placement)). On Windows the same
   names are **named pipes** (`\\.\pipe\discord-ipc-0` … `-9`), with no
-  directory involved at all.
+  directory involved at all; the pipe carries an explicit DACL (full control
+  to SYSTEM, Administrators and the owner; read to Everyone and Anonymous),
+  matching what clients get from `lpSecurityAttributes = NULL`.
 - **WebSocket** — loopback only, on the first free port in
   `6463`–`6472` (`--ws-port-start` / `--ws-port-end`).
 
@@ -290,6 +292,28 @@ sandboxed client may not be able to resolve a symlink whose target is
 outside its approved mount. Adsum cannot grant a Flatpak or Snap package
 access to a host path.
 
+### State snapshot aliases
+
+With `--state-file`, Adsum also publishes its presence snapshot into the
+same client runtime directories it publishes IPC aliases into. The alias
+name always matches the canonical snapshot file (e.g. `/tmp/arrpc-state-0`
+with `ADSUM_STATE_PREFIX=arrpc-state-`), so a client that scans its own
+temp directory for `arrpc-state-N` — Equibop Flatpak scans
+`$XDG_RUNTIME_DIR/app/org.equicord.equibop/` — finds it without any client
+change.
+
+These aliases differ from the IPC ones in one deliberate way: the snapshot
+is rewritten atomically (temp + rename), so the target's inode changes on
+every heartbeat. The ownership marker therefore records the symlink
+identity and the target *path*; the target is validated as a regular,
+owner-only, parseable snapshot file and is never inode-compared. While the
+bridge runs, a reconcile pass re-publishes missing aliases (a client
+runtime dir that appears later is picked up) and removes pairs whose
+target went missing or stale beyond the consumer budget (~60s, the same
+window status panels use). On shutdown only Adsum-owned aliases and their
+markers are removed; foreign entries are preserved, and the canonical
+snapshot file itself is left to go stale.
+
 ### Official Discord discovery conflict
 
 If the official Discord client is running at the same official path and a
@@ -363,7 +387,10 @@ most important ones are `DEEP_LINK` and a malformed `SET_ACTIVITY`.
 |---|---|
 | `SET_ACTIVITY` | Forwarded to the bridge; the game gets an arRPC-shaped confirmation echoing its own activity (plus `application_id`). Clears (`activity: null`) work the same way. |
 | `SUBSCRIBE`, `UNSUBSCRIBE` | Acknowledged locally — there is no voice/guild backend to subscribe to. |
-| `GET_USER` | Returns the current identity, or `null` when the id names somebody else (a missing id resolves to self). |
+| `GET_USER` | Returns the connection's authenticated user after `AUTHENTICATE` when the `identify` scope was granted; otherwise returns the configured fallback identity or `null` as applicable. |
+| `GET_GUILDS` | Experimental: when the connection holds a session with the `guilds` scope, proxies `GET /users/@me/guilds` with a 30-second cache (a cache miss is fetched off the pump thread). An unauthenticated connection gets `4006` ("Not authenticated; call AUTHENTICATE first"); an authenticated connection without the `guilds` scope gets `4006` ("Missing required scope: guilds"). |
+| `AUTHORIZE` | Experimental: opens browser OAuth, validates a random `state` at the loopback callback, and returns `{code}`. Accepts optional PKCE S256 challenge fields. Requires `ADSUM_OAUTH_REDIRECT_URI`. |
+| `AUTHENTICATE` | Experimental: validates `args.access_token` through Discord `/oauth2/@me`, checks the application ID against the handshake, and stores a per-connection session containing user/scopes/expiry. The bearer token stays in memory for that connection only and is never logged or written to disk. |
 | `INVITE_BROWSER`, `GUILD_TEMPLATE_BROWSER`, `GIFT_CODE_BROWSER` | Forwarded to bridge clients, then ACKed. The websocket transport validates the code first (`4011` invalid invite, `4017` invalid guild template, `4016` invalid gift code). |
 | `DEEP_LINK` | **IPC forwards it, then ACKs. The websocket transport only ACKs** — it builds the acknowledgement and returns, never forwarding. A deep link over the websocket reaches bridge clients as nothing. |
 | `CONNECTIONS_CALLBACK` | Refused with an error (code `1000`, "CONNECTIONS_CALLBACK is not supported"). |
@@ -381,6 +408,85 @@ activity field") and neither forwards nor tracks the command; with the
 feature disabled the websocket transport stays silent for every
 `SET_ACTIVITY`, as it does for the other malformed shape above.
 
+### Identity: what Adsum knows, and when
+
+Adsum never talks to the Discord desktop client. Every identity it reports
+comes from one of two sources, and neither follows the desktop client
+automatically:
+
+1. **The fallback identity** — the user presented in `READY`, in
+   unauthenticated `GET_USER` replies, and in the bridge snapshots. It is
+   configured at startup with `ADSUM_USER_*` variables (defaulting to the
+   arRPC placeholder). No authentication backs it.
+2. **The OAuth grant owner** — the user bound to an authenticated
+   connection. This is the only identity Adsum can prove, because Discord
+   returned it for that exact token.
+
+#### Discord account switches
+
+Nothing in the local RPC protocol announces that the desktop client changed
+accounts. Adsum cannot detect a switch on its own, and it does not guess.
+After a switch:
+
+- **Presence is unaffected.** `SET_ACTIVITY` is published under the
+  application ID, and the Discord client that consumes the bridge shows it
+  for whichever account is logged in. Presence carries no identity.
+- **An authenticated session keeps reporting the old account.** The OAuth
+  grant belongs to the user who approved it in the browser, so `GET_USER`
+  and `GET_GUILDS` keep answering for that user until the grant is replaced
+  or expires. A client-side account switch does not revoke the token.
+- **The fallback identity stays stale** until something updates it.
+
+#### Recovery paths after a switch
+
+| Path | Who acts | Effect |
+|---|---|---|
+| `SET_USER` control message | The bridge client. Equibop and similar clients run inside the Discord client, so they know the active account. | Patches the shared fallback identity. New connections present it in `READY`, and unauthenticated `GET_USER` reflects it right away. Bridge consumers receive a `CURRENT_USER_UPDATE`. Repeating the same patch does nothing; `RESET_USER` restores the startup identity. Connections that are already open keep the `READY` they received. |
+| Fresh `AUTHORIZE` + `AUTHENTICATE` | The game or its user | Re-binds the connection's session to the account currently logged in at `discord.com` in the browser. The per-connection session is replaced; other connections are untouched. |
+| Re-`AUTHENTICATE` with a new `access_token` | The game's backend | Same as above, without the browser step. |
+| Delete the stored grant | The operator | `adsum oauth logout <client id>` (or `rm ~/.cache/adsum/oauth/<client id>.json`) removes the persisted refresh token. The next `AUTHENTICATE` cannot silently restore the old account, and a browser authorization is required again. |
+
+`SET_USER` never touches OAuth sessions, and OAuth sessions never patch the
+fallback identity. One is a label the operator controls; the other is a
+credential owned by a grant. Letting them mix would let either side
+impersonate the other.
+
+### OAuth prototype constraints
+
+- `AUTHORIZE` accepts `client_id`, `scopes`, and optional PKCE S256 fields in
+  `args`. Its ID must match the IPC handshake or WebSocket `client_id` query.
+- Set `ADSUM_OAUTH_REDIRECT_URI` to an exact registered URI such as
+  `http://127.0.0.1:48152/callback`. The port must be unprivileged (1024 or
+  above) and must not collide with Adsum's own listeners (6463-6472, 1337,
+  1338). Only one browser authorization can run at a time; the wait is
+  bounded by `ADSUM_OAUTH_TIMEOUT` (default 180 seconds). The authorization
+  code is returned to the RPC caller.
+- `AUTHENTICATE` validates `args.access_token` using `/oauth2/@me`, checks the
+  application ID, and stores user/scopes/expiry for that one connection. The
+  access token is retained in memory for that session only and is never
+  logged or written to disk.
+- `AUTHENTICATE` may also be called with `args.refresh_token`, or with no
+  token at all, when `ADSUM_OAUTH_CLIENT_SECRET` is set: Adsum then exchanges
+  the supplied or previously stored refresh token for a fresh access token
+  without a browser flow. The rotated refresh token is stored under
+  `~/.cache/adsum/oauth/<client_id>.json` with mode 0600.
+- `GET_USER` returns the authenticated user when the token granted `identify`.
+  Expired sessions are cleared when used.
+- `GET_GUILDS` proxies `GET /users/@me/guilds` while the connection holds a
+  session with the `guilds` scope. Responses are cached for 30 seconds per
+  connection and the cache is cleared on re-authentication.
+- `ADSUM_REQUIRE_RPC_AUTH=1` optionally requires a valid session for all
+  commands except `AUTHORIZE`/`AUTHENTICATE`; default off preserves current
+  unauthenticated Rich Presence compatibility.
+- `rpc_token`, provisional-account `username`, token revocation, and
+  the native authenticated Social SDK service connection remain unsupported.
+- OAuth commands are rate limited to one per 250 ms per connection by
+  default; `ADSUM_OAUTH_RATE_LIMIT_MS` tunes or disables the limit.
+
+See [OAuth prototype](oauth-social-sdk-prototype.md),
+[OAuth RPC testing](oauth-rpc-social-sdk-testing.md), and
+[Social SDK compatibility](social-sdk-compatibility.md).
+
 ### Limits that change what a client observes
 
 - **16 tracked pids per connection.** Beyond the cap, new pids are refused
@@ -388,6 +494,11 @@ feature disabled the websocket transport stays silent for every
   either. The cap bounds memory against pathological publishers; a client
   multiplexing more than 16 distinct pids over one connection will see the
   extras silently dropped.
+- **5-second handshake deadline.** A connection that does not complete its
+  handshake within 5 seconds of connecting is closed and its slot freed.
+  Real clients send the handshake immediately, so this only affects probes
+  that open the endpoint and go silent (on Windows, a filesystem `exists()`
+  on a named pipe opens the pipe).
 - **Flood guard.** An identical republish of the same `(application_id,
   pid)` within 5 seconds is dropped before it reaches the broadcast. A
   client that counts frames will count fewer than it published.
@@ -398,15 +509,18 @@ These answer with official-shaped errors instead of hanging:
 
 | Commands | Code | Message |
 |---|---|---|
-| `AUTHORIZE`, `AUTHENTICATE` | `5000` | Authorization requires the real Discord client |
 | Activity invites (`SEND_ACTIVITY_JOIN_INVITE`, `CLOSE_ACTIVITY_REQUEST`, `ACCEPT_ACTIVITY_INVITE`, `ACTIVITY_INVITE_USER`) | `5006` | No eligible activity: invites require the real Discord client |
-| Voice, guilds, channels, overlay, store, capture (e.g. `GET_GUILD`, `SELECT_VOICE_CHANNEL`, `SET_VOICE_SETTINGS`, `OVERLAY`, …) | `1000` | requires the real Discord client |
+| Voice, guild detail, channels, overlay, store, capture (e.g. `GET_GUILD`, `GET_CHANNELS`, `GET_CHANNEL`, `SELECT_VOICE_CHANNEL`, `SET_VOICE_SETTINGS`, `OVERLAY`, …) | `1000` | requires the real Discord client |
 | Anything else unknown | `1000` | Unknown command |
 
-Why: OAuth needs the real client's modal and the app's `client_secret`,
-and the other commands need live client state that only Discord itself
-has. The README's known-limitations section explains what that means for
-games that try to log in over RPC.
+OAuth is handled by the experimental loopback adapter. Its browser flow,
+PKCE exchange test and limitations are documented in
+[oauth-rpc-social-sdk-testing.md](oauth-rpc-social-sdk-testing.md). The adapter
+does not emulate `rpc_token`, provisional accounts, token revocation,
+or the authenticated Social SDK service connection. `GET_GUILD`,
+`GET_CHANNELS` and `GET_CHANNEL` need live client state that a user OAuth
+token cannot reach (Discord rejects those REST endpoints for user tokens),
+so they stay in the unsupported table above.
 
 ## Events
 

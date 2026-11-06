@@ -1,0 +1,20 @@
+[package]
+name = "adsum-oauth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Experimental Discord RPC OAuth helpers and per-connection authentication state"
+
+[lints]
+workspace = true
+
+[dependencies]
+getrandom.workspace = true
+adsum-types = { path = "../adsum-types" }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tracing.workspace = true
+ureq.workspace = true

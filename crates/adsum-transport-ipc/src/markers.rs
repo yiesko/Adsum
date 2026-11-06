@@ -698,8 +698,8 @@ fn write_and_link(
   std::fs::hard_link(temp_path, final_path)
 }
 
-/// Remove `path` only while it still names `identity`.
-fn remove_if_identity(path: &Path, identity: FileId) -> bool {
+/// Remove `path` only when its `(dev, ino)` still matches `identity`.
+pub(crate) fn remove_if_identity(path: &Path, identity: FileId) -> bool {
   let Ok(meta) = std::fs::symlink_metadata(path) else {
     return false;
   };

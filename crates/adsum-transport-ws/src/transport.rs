@@ -16,8 +16,11 @@ use std::{
   time::Duration,
 };
 
+use adsum_oauth::{OAuthConnection, OAuthError, OAuthManager, OAuthTask};
+use adsum_protocol::commands;
 use adsum_protocol::error::{AdsumError, Result};
-use adsum_protocol::query::query_param;
+#[cfg(test)]
+pub(crate) use adsum_protocol::query::query_param;
 use adsum_types::AppId;
 use adsum_types::cmd::{ActivityCmd, ActivityCmdArgs};
 use adsum_types::user::RpcUser;
@@ -47,6 +50,9 @@ const DISCONNECT_CLEAR_BUDGET: Duration = Duration::from_secs(1);
 /// the bridge is wedged; every handoff/publish table in this workspace
 /// sheds oldest the same way.
 const MAX_PENDING_COMMANDS: usize = 256;
+
+/// Poll bounded OAuth mailboxes without parking the pump or Tokio's blocking pool.
+const OAUTH_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// What a queued entry carries. Publishes and clears share one FIFO so a
 /// clear can never overtake an older publish of the same pid — only a
@@ -103,6 +109,9 @@ impl PendingClear {
         activity: Some(None),
         code: None,
         user_id: None,
+        guild_id: None,
+        channel_id: None,
+        extra: Default::default(),
       }),
       nonce: self.nonce,
     }
@@ -176,6 +185,41 @@ struct ClientSlot {
   /// forwarded commands carry. Refcounted, so the per-message snapshot
   /// clone is a counter bump and never a heap copy.
   query_client_id: Option<AppId>,
+  /// Policy, immutable query identity and session owned by this connection.
+  oauth: OAuthConnection,
+  /// One admitted operation, including its reply, at most. No per-command tasks.
+  oauth_reply: Option<PendingOAuthReply>,
+}
+
+/// Retain only the reply identity, never the token/code-bearing command args.
+struct PendingOAuthReply {
+  event: ActivityCmd,
+  // The synchronous receiver is Send but not Sync; client snapshots share the map.
+  task: Mutex<OAuthTask>,
+}
+
+impl std::fmt::Debug for PendingOAuthReply {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("PendingOAuthReply").finish_non_exhaustive()
+  }
+}
+
+impl Drop for ClientSlot {
+  fn drop(&mut self) {
+    self.close_oauth();
+  }
+}
+
+/// Closes even connections retained by a telemetry handle when the pump is aborted.
+#[derive(Default)]
+struct OAuthConnectionsGuard(FxHashMap<ClientId, OAuthConnection>);
+
+impl Drop for OAuthConnectionsGuard {
+  fn drop(&mut self) {
+    for connection in self.0.values() {
+      connection.close();
+    }
+  }
 }
 
 /// Whether a publication was admitted to the bounded per-connection history.
@@ -193,6 +237,17 @@ enum Admission {
 }
 
 impl ClientSlot {
+  fn close_oauth(&self) {
+    self.oauth.close();
+    if let Some(pending) = &self.oauth_reply {
+      pending
+        .task
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .cancel();
+    }
+  }
+
   /// Record a publication, refreshing a re-published pid as most recent.
   /// Unknown pids past [`handlers::MAX_TRACKED_PIDS`] are refused: the
   /// caller must not forward them, keeping every forwarded pid tracked
@@ -262,6 +317,8 @@ pub(crate) enum TryEmit {
 struct SlotSnapshot {
   responder: Responder,
   query_client_id: Option<AppId>,
+  oauth: OAuthConnection,
+  oauth_pending: bool,
 }
 
 impl SlotSnapshot {
@@ -276,6 +333,8 @@ impl SlotSnapshot {
     Self {
       responder: slot.responder.clone(),
       query_client_id: slot.query_client_id.clone(),
+      oauth: slot.oauth.clone(),
+      oauth_pending: slot.oauth_reply.is_some(),
     }
   }
 }
@@ -528,6 +587,8 @@ pub struct WsTransport {
   /// opportunistically on every pump event and drained on shutdown.
   pending_clears: Arc<Mutex<PendingQueue>>,
   bound_port: u16,
+  /// Only the compatibility bind wrapper owns manager shutdown.
+  owned_oauth: Option<Arc<OAuthManager>>,
 }
 
 impl std::fmt::Debug for WsTransport {
@@ -553,6 +614,24 @@ impl WsTransport {
   pub async fn bind(
     config: WsTransportConfig,
     user: Arc<Mutex<RpcUser>>,
+  ) -> Result<(Self, mpsc::Receiver<ActivityCmd>)> {
+    let oauth = Arc::new(OAuthManager::from_env());
+    let (mut transport, rx) = Self::bind_with_oauth(config, user, Arc::clone(&oauth)).await?;
+    transport.owned_oauth = Some(oauth);
+    Ok((transport, rx))
+  }
+
+  /// Bind with a caller-owned OAuth policy and work budget, shared with other
+  /// transports. The caller must cancel and join the manager after transport
+  /// teardown; shutting down this transport closes only its own connections.
+  ///
+  /// # Errors
+  ///
+  /// Returns the same configuration and bind errors as [`Self::bind`].
+  pub async fn bind_with_oauth(
+    config: WsTransportConfig,
+    user: Arc<Mutex<RpcUser>>,
+    oauth: Arc<OAuthManager>,
   ) -> Result<(Self, mpsc::Receiver<ActivityCmd>)> {
     if config.event_queue == 0 {
       return Err(AdsumError::InvalidConfig("event_queue must be non-zero"));
@@ -636,6 +715,7 @@ impl WsTransport {
         dropped: Arc::clone(&dropped),
       },
       pending_clears: Arc::clone(&pending_clears),
+      oauth,
       user,
       set_activity: config.set_activity,
       secondary_events: config.secondary_events,
@@ -651,6 +731,7 @@ impl WsTransport {
         sink_tx: tx,
         pending_clears,
         bound_port,
+        owned_oauth: None,
       },
       rx,
     ))
@@ -697,8 +778,16 @@ impl WsTransport {
   /// This is the only path that cleans up publications: `Drop` merely
   /// aborts the pump (Rust forbids `await` there), so owners must call
   /// `shutdown()` — the daemon always does. Past-budget sheds stay bounded
-  /// downstream by ghost reaping.
+  /// downstream by ghost reaping. The compatibility bind wrapper also joins
+  /// its OAuth workers off-runtime; an in-flight HTTPS request may take up to
+  /// its 12-second deadline to finish. Injected managers remain caller-owned.
   pub async fn shutdown(mut self) {
+    {
+      let clients = self.handle.clients.read().await;
+      for slot in clients.values() {
+        slot.close_oauth();
+      }
+    }
     if let Some(server) = self.server.take() {
       server.shutdown().await;
     }
@@ -717,6 +806,7 @@ impl WsTransport {
     {
       let mut clients = self.handle.clients.write().await;
       for (_, slot) in clients.drain() {
+        slot.close_oauth();
         self.total.fetch_sub(1, Ordering::Relaxed);
         for published in &slot.published {
           sink.stage_clear(&self.pending_clears, published);
@@ -742,6 +832,15 @@ impl WsTransport {
           .await;
       }
     }
+    if let Some(oauth) = self.owned_oauth.take() {
+      oauth.cancel();
+      if tokio::task::spawn_blocking(move || oauth.shutdown())
+        .await
+        .is_err()
+      {
+        tracing::warn!("[transport-ws] OAuth teardown task failed");
+      }
+    }
   }
 }
 
@@ -761,6 +860,9 @@ impl Drop for WsTransport {
   fn drop(&mut self) {
     // Best-effort: an explicit shutdown() drains gracefully; a drop must
     // at least not leave the pump parked forever.
+    if let Some(oauth) = &self.owned_oauth {
+      oauth.cancel();
+    }
     if let Some(pump) = &self.pump {
       pump.abort();
     }
@@ -775,6 +877,7 @@ struct PumpCtx {
   sink: Sink,
   /// Staged disconnect clears (see `MAX_PENDING_COMMANDS`).
   pending_clears: Arc<Mutex<PendingQueue>>,
+  oauth: Arc<OAuthManager>,
   user: Arc<Mutex<RpcUser>>,
   set_activity: bool,
   secondary_events: bool,
@@ -788,18 +891,37 @@ async fn pump_loop(
     total,
     sink,
     pending_clears,
+    oauth,
     user,
     set_activity,
     secondary_events,
   }: PumpCtx,
 ) {
-  while let Some(event) = hub.next_event().await {
+  let mut connections = OAuthConnectionsGuard::default();
+  let mut oauth_tick = tokio::time::interval(OAUTH_POLL_INTERVAL);
+  oauth_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+  loop {
+    let event = tokio::select! {
+      _ = oauth_tick.tick() => {
+        poll_oauth_replies(&clients, &total, &sink, &pending_clears).await;
+        let clients = clients.read().await;
+        connections.0.retain(|id, _| clients.contains_key(id));
+        continue;
+      }
+      event = hub.next_event() => {
+        let Some(event) = event else { break };
+        event
+      }
+    };
     match event {
       Event::Connect(id, responder) => {
-        on_connect(id, responder, &clients, &total, &user).await;
+        if let Some(connection) = on_connect(id, responder, &clients, &total, &user, &oauth).await {
+          connections.0.insert(id, connection);
+        }
       }
       Event::Disconnect(id, _) => {
         remove_and_clear(id, &clients, &total, &sink, &pending_clears).await;
+        connections.0.remove(&id);
       }
       Event::Message(id, message) => {
         on_message(
@@ -810,15 +932,80 @@ async fn pump_loop(
           &sink,
           &pending_clears,
           &user,
+          &oauth,
           set_activity,
           secondary_events,
         )
         .await;
+        if !clients.read().await.contains_key(&id) {
+          connections.0.remove(&id);
+        }
       }
       // `Event` is non-exhaustive: future variants must not break the pump.
       _ => {}
     }
   }
+}
+
+/// Poll each connection's single mailbox. Session commits belong to the
+/// manager; a failed delivery still prunes and clears the owning connection.
+async fn poll_oauth_replies(
+  clients: &Arc<RwLock<FxHashMap<ClientId, ClientSlot>>>,
+  total: &Arc<AtomicU64>,
+  sink: &Sink,
+  pending_clears: &Arc<Mutex<PendingQueue>>,
+) {
+  let replies = {
+    let mut clients = clients.write().await;
+    let mut replies = Vec::new();
+    for (&id, slot) in clients.iter_mut() {
+      let Some(result) = slot.oauth_reply.as_ref().and_then(|pending| {
+        pending
+          .task
+          .lock()
+          .unwrap_or_else(|e| e.into_inner())
+          .try_result()
+      }) else {
+        continue;
+      };
+      if let Some(pending) = slot.oauth_reply.take() {
+        replies.push((id, slot.responder.clone(), pending, result));
+      }
+    }
+    replies
+  };
+  for (id, responder, pending, result) in replies {
+    let response = match result {
+      Ok(result) => commands::oauth_response(&pending.event, &result.data),
+      Err(error) => {
+        let (code, message) = error.rpc_error();
+        commands::rpc_error(&pending.event.cmd, &pending.event.nonce, code, message)
+      }
+    };
+    if !handlers::reply(&responder, Message::Text(response.into())).await {
+      tracing::info!("[transport-ws] Client {id} OAuth reply failed, pruning");
+      remove_and_clear(id, clients, total, sink, pending_clears).await;
+    }
+  }
+}
+
+/// Extract a unique query parameter value. Returns Err(()) if the key is duplicated.
+fn single_query_param<'a>(uri: &'a str, key: &str) -> std::result::Result<Option<&'a str>, ()> {
+  let Some((_, query)) = uri.split_once('?') else {
+    return Ok(None);
+  };
+  let mut found = None;
+  for pair in query.split('&') {
+    if let Some((k, value)) = pair.split_once('=')
+      && k == key
+    {
+      if found.is_some() {
+        return Err(());
+      }
+      found = Some(value);
+    }
+  }
+  Ok(found)
 }
 
 /// Validate a new game client (version, encoding, origin), send READY and
@@ -829,34 +1016,60 @@ async fn on_connect(
   clients: &Arc<RwLock<FxHashMap<ClientId, ClientSlot>>>,
   total: &Arc<AtomicU64>,
   user: &Arc<Mutex<RpcUser>>,
-) {
+  oauth: &Arc<OAuthManager>,
+) -> Option<OAuthConnection> {
   // Parse + validate before any reply or insert.
   let uri = responder.details().uri.as_ref();
-  let version = query_param(uri, "v").unwrap_or("0");
-  let encoding = query_param(uri, "encoding").unwrap_or("json");
+  let v_res = single_query_param(uri, "v");
+  let enc_res = single_query_param(uri, "encoding");
+  let client_id_res = single_query_param(uri, "client_id");
+
+  let Ok(Some(version)) = v_res else {
+    tracing::warn!("[transport-ws] Rejecting client {id} (missing or duplicate version)");
+    responder.close(CloseCode::Normal).await;
+    return None;
+  };
+  let encoding = match enc_res {
+    Ok(Some(enc)) => enc,
+    Ok(None) => "json",
+    Err(()) => {
+      tracing::warn!("[transport-ws] Rejecting client {id} (duplicate encoding)");
+      responder.close(CloseCode::Normal).await;
+      return None;
+    }
+  };
+  if version != "1" || encoding != "json" {
+    tracing::warn!("[transport-ws] Rejecting client {id} (unsupported protocol)");
+    responder.close(CloseCode::Normal).await;
+    return None;
+  }
+
+  // Origins are per-connection: refuse mismatches here, before any READY
+  // or slot registration, instead of per message downstream.
+  // An invalid (non-UTF8) Origin header must NOT fall back to None.
+  let origin_header = responder.details().headers.get("origin");
+  let origin_valid = match origin_header {
+    None => origin_allowed(None),
+    Some(val) => val
+      .to_str()
+      .ok()
+      .is_some_and(|origin| origin_allowed(Some(origin))),
+  };
+  if !origin_valid {
+    tracing::warn!("[transport-ws] Refused origin for client {id}");
+    responder.close(CloseCode::Normal).await;
+    return None;
+  }
+
   // The connection's fallback id is the one value that must outlive the
   // handshake, so it enters shared ownership once here — one copy into
   // the refcounted layout per connection, and every later clone (the
   // per-message snapshot included) is free.
-  let query_client_id = query_param(uri, "client_id").map(AppId::from);
-  if version != "1" || encoding != "json" {
-    tracing::warn!("[transport-ws] Rejecting client {id} (v={version}, encoding={encoding})");
-    responder.close(CloseCode::Normal).await;
-    return;
-  }
-  // Origins are per-connection: refuse mismatches here, before any READY
-  // or slot registration, instead of per message downstream.
-  if !origin_allowed(
-    responder
-      .details()
-      .headers
-      .get("origin")
-      .and_then(|v| v.to_str().ok()),
-  ) {
-    tracing::warn!("[transport-ws] Refused origin for client {id}");
-    responder.close(CloseCode::Normal).await;
-    return;
-  }
+  // Duplicate client_id fails closed (treated as None for OAuth while preserving legacy RP).
+  let query_client_id = match client_id_res {
+    Ok(Some(client_id)) => Some(AppId::from(client_id)),
+    _ => None,
+  };
 
   // Snapshot the identity under a short lock; the guard never crosses await.
   let ready = user
@@ -869,17 +1082,24 @@ async fn on_connect(
     .is_err()
   {
     // Vanished mid-handshake: nothing to track.
-    return;
+    return None;
   }
+  let connection = oauth.connection_with_restore(
+    query_client_id.clone().unwrap_or_else(|| AppId::from("")),
+    false,
+  );
   clients.write().await.insert(
     id,
     ClientSlot {
       responder,
       published: Vec::new(),
       query_client_id,
+      oauth: connection.clone(),
+      oauth_reply: None,
     },
   );
   total.fetch_add(1, Ordering::Relaxed);
+  Some(connection)
 }
 
 /// Remove the slot and emit one clear per published pid (shared by
@@ -900,6 +1120,7 @@ async fn remove_and_clear(
 ) {
   let slot = clients.write().await.remove(&id);
   let Some(slot) = slot else { return };
+  slot.close_oauth();
   total.fetch_sub(1, Ordering::Relaxed);
   // Older staged clears first (causality), then this slot's own clears.
   // Each stages instead of shedding on a full sink: the next pump event,
@@ -964,6 +1185,7 @@ async fn on_message(
   sink: &Sink,
   pending_clears: &Arc<Mutex<PendingQueue>>,
   user: &Arc<Mutex<RpcUser>>,
+  oauth: &Arc<OAuthManager>,
   set_activity: bool,
   secondary_events: bool,
 ) {
@@ -986,11 +1208,43 @@ async fn on_message(
   };
   let event: ActivityCmd = match serde_json::from_str(&text) {
     Ok(event) => event,
-    Err(err) => {
-      tracing::warn!("[transport-ws] Invalid message from client {id}: {err}");
+    Err(_) => {
+      tracing::warn!("[transport-ws] Invalid message from client {id}");
       return;
     }
   };
+
+  let owned_clear = if event.cmd == "SET_ACTIVITY"
+    && let Some(args) = &event.args
+    && matches!(args.activity, Some(None))
+    && let Some(pid) = args.pid.filter(|pid| *pid != 0)
+  {
+    let app_id = event
+      .application_id
+      .as_ref()
+      .or(slot.query_client_id.as_ref());
+    clients.read().await.get(&id).is_some_and(|entry| {
+      entry
+        .published
+        .iter()
+        .any(|published| published.pid == pid && published.app_id.as_ref() == app_id)
+    })
+  } else {
+    false
+  };
+  if let Err(error) = slot.oauth.check_command(&event, owned_clear) {
+    let (code, message) = error.rpc_error();
+    let alive = handlers::reply(
+      &slot.responder,
+      Message::Text(commands::rpc_error(&event.cmd, &event.nonce, code, message).into()),
+    )
+    .await;
+    if !alive {
+      tracing::info!("[transport-ws] Client {id} send failed, pruning");
+      remove_and_clear(id, clients, total, sink, pending_clears).await;
+    }
+    return;
+  }
 
   // Every arm reports liveness: `false` means the game client died without
   // a clean `Disconnect` and its slot must be released now.
@@ -1019,6 +1273,44 @@ async fn on_message(
   // `event` for the whole match and forbid the move, so the value-moving
   // arm is selected first and the rest keeps its borrow path.
   let consumes_event = event.cmd == "SET_ACTIVITY" && set_activity;
+  if !consumes_event && matches!(event.cmd.as_ref(), "AUTHORIZE" | "AUTHENTICATE") {
+    // Admit before retaining a reply: both the manager's worker budget and
+    // this connection's reply mailbox stay bounded, including under floods.
+    let response_event = ActivityCmd {
+      cmd: event.cmd.clone(),
+      nonce: event.nonce.clone(),
+      ..ActivityCmd::empty()
+    };
+    let task = if slot.oauth_pending {
+      Err(OAuthError::OperationInProgress)
+    } else {
+      slot.oauth.start(event)
+    };
+    match task {
+      Ok(task) => {
+        if let Some(entry) = clients.write().await.get_mut(&id) {
+          entry.oauth_reply = Some(PendingOAuthReply {
+            event: response_event,
+            task: Mutex::new(task),
+          });
+        }
+      }
+      Err(error) => {
+        let (code, message) = error.rpc_error();
+        let alive = handlers::reply(
+          &slot.responder,
+          Message::Text(
+            commands::rpc_error(&response_event.cmd, &response_event.nonce, code, message).into(),
+          ),
+        )
+        .await;
+        if !alive {
+          remove_and_clear(id, clients, total, sink, pending_clears).await;
+        }
+      }
+    }
+    return;
+  }
   let alive = if consumes_event {
     // Genuine clears are not publications: they never consume history,
     // always forward (the bridge may hold the card), and free the slot
@@ -1036,6 +1328,48 @@ async fn on_message(
       // No `args` at all keeps the legacy clear path: never track pid 0.
       None => true,
     };
+    if is_clear
+      && event
+        .args
+        .as_ref()
+        .is_some_and(|args| matches!(args.activity, Some(None)))
+      && !owned_clear
+    {
+      let protected = match slot.oauth.session() {
+        Ok(session) => session.is_some() || oauth.policy() == adsum_oauth::RpcAuthPolicy::Required,
+        Err(error) => {
+          let (code, message) = error.rpc_error();
+          let alive = handlers::reply(
+            &slot.responder,
+            Message::Text(commands::rpc_error(&event.cmd, &event.nonce, code, message).into()),
+          )
+          .await;
+          if !alive {
+            remove_and_clear(id, clients, total, sink, pending_clears).await;
+          }
+          return;
+        }
+      };
+      if protected {
+        let alive = handlers::reply(
+          &slot.responder,
+          Message::Text(
+            commands::rpc_error(
+              &event.cmd,
+              &event.nonce,
+              4006,
+              "Activity pid is not owned by this connection",
+            )
+            .into(),
+          ),
+        )
+        .await;
+        if !alive {
+          remove_and_clear(id, clients, total, sink, pending_clears).await;
+        }
+        return;
+      }
+    }
     // Record first (one short write, no await inside): every forwarded
     // publication is tracked, so disconnect cleanup stays complete. The
     // pump is the only map mutator, so admission cannot change before
@@ -1138,13 +1472,80 @@ async fn on_message(
         // borrowed, so the reply is serialized straight from the shared
         // value — the snapshot this replaces deep-copied every field of
         // `RpcUser` on every GET_USER.
-        let response = {
-          let user = user.lock().unwrap_or_else(|e| e.into_inner());
-          handlers::get_user_response(&event, &user)
+        let response = match slot.oauth.session() {
+          Ok(Some(session)) => match session.user.as_ref() {
+            Some(authenticated_user) => handlers::get_user_response(&event, authenticated_user),
+            None => commands::user_response(&event, None),
+          },
+          Ok(None) => {
+            let user = user.lock().unwrap_or_else(|e| e.into_inner());
+            handlers::get_user_response(&event, &user)
+          }
+          Err(error) => {
+            let (code, message) = error.rpc_error();
+            commands::rpc_error(&event.cmd, &event.nonce, code, message)
+          }
         };
         let reply = Message::Text(response.into());
         handlers::reply(&slot.responder, reply).await
       }
+      "GET_GUILDS" => {
+        // Scope check stays synchronous (no I/O); the REST fetch runs in a
+        // detached task so the shared pump never waits on Discord. The task
+        // replies through the client's own responder and drops the snapshot.
+        let oauth = slot.oauth.clone();
+        let denied = match oauth.auth_scope("guilds") {
+          Ok(Some(true)) => None,
+          Ok(Some(false)) => Some(commands::rpc_error(
+            &event.cmd,
+            &event.nonce,
+            4006,
+            "Missing required scope: guilds",
+          )),
+          Ok(None) => {
+            let (code, message) = OAuthError::NotAuthenticated.rpc_error();
+            Some(commands::rpc_error(&event.cmd, &event.nonce, code, message))
+          }
+          Err(error) => {
+            let (code, message) = error.rpc_error();
+            Some(commands::rpc_error(&event.cmd, &event.nonce, code, message))
+          }
+        };
+        if let Some(response) = denied {
+          handlers::reply(&slot.responder, Message::Text(response.into())).await
+        } else {
+          let responder = slot.responder.clone();
+          let nonce = event.nonce.clone();
+          let cmd = event.cmd.clone();
+          // Acquire before spawning: checking `available_permits` first would
+          // let a burst spawn unbounded tasks that only queue on `acquire`.
+          match REST_FETCH_PERMITS.try_acquire() {
+            Ok(permit) => {
+              tokio::spawn(async move {
+                let response = match fetch_guilds_task(permit, oauth).await {
+                  Ok(data) => commands::rpc_data_response_cmd(&cmd, &nonce, &data),
+                  Err(error) => {
+                    let (code, message) = error.rpc_error();
+                    commands::rpc_error(&cmd, &nonce, code, message)
+                  }
+                };
+                let _ = handlers::reply(&responder, Message::Text(response.into())).await;
+              });
+              true
+            }
+            Err(_) => {
+              let response = commands::rpc_error(
+                &cmd,
+                &nonce,
+                5000,
+                "Too many concurrent Discord queries; retry later",
+              );
+              handlers::reply(&slot.responder, Message::Text(response.into())).await
+            }
+          }
+        }
+      }
+      // GET_GUILD / GET_CHANNELS / GET_CHANNEL require the local Discord client.
       other => handlers::handle_unknown(other, &event, &slot.responder).await,
     }
   };
@@ -1152,6 +1553,21 @@ async fn on_message(
     tracing::info!("[transport-ws] Client {id} send failed, pruning");
     remove_and_clear(id, clients, total, sink, pending_clears).await;
   }
+}
+
+/// In-flight cap for token-backed REST fetches transport-wide. The pump
+/// never waits on these; this only bounds how many hit Discord at once.
+static REST_FETCH_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
+/// Fetch the guild list off the pump; the caller-acquired permit bounds
+/// transport-wide concurrency. Runs on the blocking pool.
+async fn fetch_guilds_task(
+  _permit: tokio::sync::SemaphorePermit<'static>,
+  oauth: adsum_oauth::OAuthConnection,
+) -> std::result::Result<std::sync::Arc<serde_json::Value>, adsum_oauth::OAuthError> {
+  tokio::task::spawn_blocking(move || oauth.cached_fetch("/users/@me/guilds"))
+    .await
+    .unwrap_or(Err(adsum_oauth::OAuthError::DiscordUnavailable))
 }
 
 /// Browser origins must be Discord; absent origin (native clients) passes.

@@ -56,3 +56,47 @@ fn stale_regular_tmp_is_reclaimed() {
 
   let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The prefix override serves Equibop's scanner (`arrpc-state-*`), and
+/// blank, separator-bearing or over-long values fall back to the default
+/// so a crafted env value cannot escape the temp directory.
+#[test]
+fn snapshot_prefix_overrides_safely() {
+  assert_eq!(snapshot_prefix_from(None), "adsum-state-");
+  assert_eq!(snapshot_prefix_from(Some("")), "adsum-state-");
+  assert_eq!(snapshot_prefix_from(Some("adsum-state-")), "adsum-state-");
+  assert_eq!(snapshot_prefix_from(Some("arrpc-state-")), "arrpc-state-");
+  assert_eq!(snapshot_prefix_from(Some("a/b")), "adsum-state-");
+  assert_eq!(snapshot_prefix_from(Some("..")), "adsum-state-");
+  let long = "a".repeat(65);
+  assert_eq!(snapshot_prefix_from(Some(&long)), "adsum-state-");
+}
+
+/// Slot selection honors the caller-supplied prefix: with Equibop's
+/// `arrpc-state-` the chosen (and written) slots live in that namespace,
+/// and the default-prefix namespace is untouched.
+#[test]
+fn select_slot_honors_custom_prefix() {
+  let dir = std::env::temp_dir().join(format!("adsum-state-test-prefix-{}", std::process::id()));
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir_all(&dir).unwrap();
+  let now = now_secs();
+
+  let slot = select_slot_with_prefix(&dir, now, "arrpc-state-");
+  assert_eq!(slot, Some(dir.join("arrpc-state-0")));
+
+  // A fresh, valid snapshot owns slot 0 (a corrupt file would be treated
+  // as reusable), pushing selection to slot 1.
+  std::fs::write(
+    dir.join("arrpc-state-0"),
+    format!(r#"{{"timestamp":{}}}"#, now.saturating_mul(1000)),
+  )
+  .unwrap();
+  let slot = select_slot_with_prefix(&dir, now, "arrpc-state-");
+  assert_eq!(slot, Some(dir.join("arrpc-state-1")));
+
+  // The default-prefix namespace is untouched by the custom-prefix scan.
+  let slot = select_slot_with_prefix(&dir, now, "adsum-state-");
+  assert_eq!(slot, Some(dir.join("adsum-state-0")));
+  std::fs::remove_dir_all(&dir).ok();
+}

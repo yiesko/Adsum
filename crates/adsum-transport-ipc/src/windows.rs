@@ -9,11 +9,12 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use adsum_oauth::OAuthManager;
 use adsum_protocol::error::{AdsumError, Result};
 use adsum_types::AppId;
 use adsum_types::cmd::ActivityCmd;
 use adsum_types::user::RpcUser;
-use interprocess::local_socket::traits::Listener as _;
+use interprocess::local_socket::traits::{Listener as _, Stream as _};
 use interprocess::local_socket::{Listener, ListenerNonblockingMode, ListenerOptions, ToFsName};
 use interprocess::os::windows::local_socket::{ListenerOptionsExt, NamedPipe};
 use interprocess::os::windows::security_descriptor::SecurityDescriptor;
@@ -38,6 +39,8 @@ struct ConnFacilitator {
   pid: u64,
   nonce: Value,
   user: Arc<Mutex<RpcUser>>,
+  oauth: Arc<OAuthManager>,
+  token: CancellationToken,
   sink: EventSink,
   /// Pids published on this connection, oldest first (bounded).
   published_pids: Vec<u64>,
@@ -45,13 +48,20 @@ struct ConnFacilitator {
 
 impl ConnFacilitator {
   /// Blank per-connection state (handshake pending, no pid yet).
-  fn fresh(user: Arc<Mutex<RpcUser>>, sink: EventSink) -> Self {
+  fn fresh(
+    user: Arc<Mutex<RpcUser>>,
+    sink: EventSink,
+    oauth: Arc<OAuthManager>,
+    token: CancellationToken,
+  ) -> Self {
     Self {
       handshake: false,
       client_id: AppId::from(""),
       pid: 0,
       nonce: Value::Null,
       user,
+      oauth,
+      token,
       sink,
       published_pids: Vec::new(),
     }
@@ -103,13 +113,21 @@ impl IpcFacilitator for ConnFacilitator {
   fn current_user(&self) -> RpcUser {
     self.user.lock().unwrap_or_else(|e| e.into_inner()).clone()
   }
+  fn oauth_manager(&self) -> &Arc<OAuthManager> {
+    &self.oauth
+  }
+  fn is_cancelled(&self) -> bool {
+    self.token.is_cancelled()
+  }
   /// Downstream sink for validated commands and clears.
   fn sink(&self) -> &EventSink {
     &self.sink
   }
-  /// Remember a published pid for disconnect cleanup (bounded history).
-  fn note_published_pid(&mut self, pid: u64) {
-    crate::frame::track_pid(&mut self.published_pids, pid);
+  fn owns_published_pid(&self, pid: u64) -> bool {
+    self.published_pids.contains(&pid)
+  }
+  fn forget_published_pid(&mut self, pid: u64) {
+    self.published_pids.retain(|known| *known != pid);
   }
   /// Admit before forwarding: unknown pids past the bound are refused so
   /// every forwarded pid stays covered by disconnect cleanup.
@@ -148,6 +166,18 @@ impl IpcTransport {
   ///
   /// [`AdsumError::IpcBind`] when every pipe name is taken.
   pub async fn bind(user: Arc<Mutex<RpcUser>>) -> Result<(Self, mpsc::Receiver<ActivityCmd>)> {
+    Self::bind_with_oauth(user, Arc::new(OAuthManager::from_env())).await
+  }
+
+  /// Bind with the daemon-wide OAuth policy/backend shared with other transports.
+  ///
+  /// # Errors
+  ///
+  /// [`AdsumError::IpcBind`] when every pipe name is taken.
+  pub async fn bind_with_oauth(
+    user: Arc<Mutex<RpcUser>>,
+    oauth: Arc<OAuthManager>,
+  ) -> Result<(Self, mpsc::Receiver<ActivityCmd>)> {
     let (listener, pipe_path) =
       tokio::task::spawn_blocking(create_pipe)
         .await
@@ -170,6 +200,7 @@ impl IpcTransport {
       conns: Arc::clone(&conns),
       pump_sem: Arc::new(tokio::sync::Semaphore::new(MAX_PUMPS)),
       user,
+      oauth,
       sink: sink.clone(),
     }));
 
@@ -206,14 +237,9 @@ impl IpcTransport {
 
   /// Graceful shutdown: stop accepting, drain connections with a deadline.
   ///
-  /// Known limitation: a connection pump is a blocking `handle_stream`
-  /// running in `spawn_blocking`, and `abort_all` cannot interrupt a
-  /// running blocking task. Unlike Unix — where shutdown closes the
-  /// tracked sockets and unblocks every read — interprocess 2.x exposes
-  /// no way to cancel a pending named-pipe read, so a silent peer's pump
-  /// may outlive the drain deadline and exits when the peer disconnects.
-  /// For the CLI this is bounded by process exit; per-connection state is
-  /// already released with the task.
+  /// Nonblocking pumps observe cancellation even for silent peers and
+  /// partial frames. Only connection-owned OAuth work is cancelled; the
+  /// shared manager remains available to other transports.
   pub async fn shutdown(mut self) {
     self.token.cancel();
     if let Some(task) = self.accept_task.take() {
@@ -243,10 +269,8 @@ impl IpcTransport {
 
 impl Drop for IpcTransport {
   /// Best-effort shutdown without awaiting: cancel first so token-aware
-  /// loops (dispatch) observe it, then abort the tasks. A pending
-  /// named-pipe read cannot be unblocked from here (no handle for it),
-  /// so its pump still ends on peer disconnect — same as before, but
-  /// everything else now exits through cancellation instead of abort.
+  /// loops (including nonblocking connection pumps) observe it, then
+  /// abort the accept/dispatch tasks. Pumps exit through normal cleanup.
   fn drop(&mut self) {
     self.token.cancel();
     if let Some(task) = &self.accept_task {
@@ -258,13 +282,26 @@ impl Drop for IpcTransport {
   }
 }
 
+/// Pipe DACL: full control to SYSTEM, Administrators and the owner; read
+/// only to Everyone and Anonymous. Matches the default named-pipe policy
+/// clients get from `lpSecurityAttributes = NULL` (what arRPC/Node uses)
+/// without granting write beyond the owner. `SecurityDescriptor::default()`
+/// initializes a descriptor with no DACL at all, which is what rsRPC did
+/// (rsRPC issue #10).
+fn pipe_security_descriptor() -> std::io::Result<SecurityDescriptor> {
+  const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)(A;;GR;;;WD)(A;;GR;;;AN)";
+  let sddl = widestring::U16CString::from_str(PIPE_SDDL)
+    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string()))?;
+  SecurityDescriptor::deserialize(&sddl)
+}
+
 /// Bind the first free pipe name.
 fn create_pipe() -> Result<(Listener, String)> {
   for tries in 0..=9_u8 {
     let pipe_path = format!("{PIPE_BASE}-{tries}");
     let listener = ListenerOptions::new()
       .name(pipe_path.clone().to_fs_name::<NamedPipe>()?)
-      .security_descriptor(SecurityDescriptor::default());
+      .security_descriptor(pipe_security_descriptor()?);
     match listener.create_sync() {
       Ok(socket) => {
         tracing::info!("[ipc] Created IPC socket: {pipe_path}");
@@ -323,11 +360,9 @@ fn accept_loop(
   }
 }
 
-/// Cap on concurrent Windows IPC pumps: each parks a `spawn_blocking`
-/// thread in a blocking pump, and the CLI runtime allows 32 blocking
-/// threads — past this, peers are dropped at once instead of starving
-/// the pool (or the process) under connection floods.
-const MAX_PUMPS: usize = 32;
+/// Keep headroom in the CLI's 32-thread blocking pool for accept and
+/// unrelated daemon work, matching the Unix connection bound.
+const MAX_PUMPS: usize = 16;
 
 struct DispatchCtx {
   stream_rx: mpsc::Receiver<interprocess::local_socket::Stream>,
@@ -336,6 +371,7 @@ struct DispatchCtx {
   /// Bounds concurrent pumps (see `MAX_PUMPS`).
   pump_sem: Arc<tokio::sync::Semaphore>,
   user: Arc<Mutex<RpcUser>>,
+  oauth: Arc<OAuthManager>,
   sink: EventSink,
 }
 
@@ -347,6 +383,7 @@ async fn dispatch_loop(
     conns,
     pump_sem,
     user,
+    oauth,
     sink,
   }: DispatchCtx,
 ) {
@@ -356,7 +393,13 @@ async fn dispatch_loop(
       () = token.cancelled() => break,
       stream = stream_rx.recv() => {
         let Some(mut stream) = stream else { break };
-        let facil = ConnFacilitator::fresh(user.clone(), sink.clone());
+        if let Err(error) = stream.set_nonblocking(true) {
+          tracing::warn!(kind = ?error.kind(), "[ipc] Failed to set nonblocking pipe mode");
+          continue;
+        }
+        let facil = ConnFacilitator::fresh(
+          Arc::clone(&user), sink.clone(), Arc::clone(&oauth), token.clone(),
+        );
         // Bounded pumps: past the cap the peer is dropped at once instead
         // of parking another blocking thread. The permit rides into the
         // closure and releases when the pump returns.

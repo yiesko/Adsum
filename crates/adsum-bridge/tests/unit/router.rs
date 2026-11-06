@@ -256,6 +256,9 @@ async fn a_clear_does_not_reuse_a_sequence() {
       activity: Some(None),
       code: None,
       user_id: None,
+      guild_id: None,
+      channel_id: None,
+      extra: Default::default(),
     }),
     nonce: serde_json::Value::String("n2".to_string()),
   };

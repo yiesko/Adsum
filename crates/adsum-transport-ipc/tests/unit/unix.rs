@@ -256,3 +256,43 @@ fn accept_errors_back_off_only_when_persistent() {
     Some(Duration::from_millis(50))
   );
 }
+
+/// Boundary of the `sun_path` guard: exactly at the limit does not fit
+/// (the NUL terminator needs a byte); one byte under does.
+#[test]
+fn sun_path_guard_boundary() {
+  let ok = "a".repeat(SUN_PATH_MAX - 1);
+  assert!(path_fits_sun_path(std::path::Path::new(&ok)));
+  let full = "a".repeat(SUN_PATH_MAX);
+  assert!(!path_fits_sun_path(std::path::Path::new(&full)));
+}
+
+/// A candidate directory whose final socket paths would overflow `sun_path`
+/// (the macOS per-user temp dir case) is rejected outright, so the bind
+/// loop falls through to a shorter candidate instead of failing on bind.
+#[test]
+fn over_long_bind_dir_is_rejected() {
+  let base = scratch("long");
+  let padded = format!("{}{}", "adsum-test-", "a".repeat(90));
+  let dir = base.join(&padded);
+  std::fs::DirBuilder::new()
+    .mode(0o700)
+    .recursive(true)
+    .create(&dir)
+    .expect("long scratch dir");
+  assert!(dir.as_os_str().len() + "/discord-ipc-0".len() > SUN_PATH_MAX);
+
+  let error = create_socket(&dir).expect_err("over-long dir must be rejected");
+  let mut message = error.to_string();
+  let mut source = std::error::Error::source(&error);
+  while let Some(err) = source {
+    message.push_str("; ");
+    message.push_str(&err.to_string());
+    source = err.source();
+  }
+  assert!(
+    message.contains("sun_path"),
+    "expected the sun_path guard, got: {message}"
+  );
+  std::fs::remove_dir_all(&base).ok();
+}

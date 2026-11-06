@@ -27,9 +27,9 @@ fn watcher_failure_unparks_stale_scan() {
 fn shutdown_before_start_is_safe() {
   let server = fixture_server();
   server.shutdown();
-  server.join();
+  server.join(Duration::from_secs(5));
   server.shutdown();
-  server.join();
+  server.join(Duration::from_secs(5));
 }
 
 /// Join a live scan thread through a timeout channel: `shutdown()` must
@@ -46,7 +46,7 @@ fn shutdown_joins_scan_thread_promptly() {
   server.shutdown();
   let (done_tx, done_rx) = std::sync::mpsc::channel();
   std::thread::spawn(move || {
-    server.join();
+    server.join(Duration::from_secs(5));
     // Structural proof alongside the prompt return below: `join`
     // drains the handle registry, so no worker is merely detached.
     let drained = server
@@ -80,7 +80,7 @@ fn refresh_sleep_is_interrupted_by_shutdown() {
   server.shutdown();
   let (done_tx, done_rx) = std::sync::mpsc::channel();
   std::thread::spawn(move || {
-    server.join();
+    server.join(Duration::from_secs(5));
     let drained = server
       .worker_handles
       .lock()
@@ -125,5 +125,5 @@ fn worker_threads_carry_names() {
   std::thread::sleep(Duration::from_millis(200));
   assert!(has_prefix("adsum-scan"), "scan thread must be named");
   server.shutdown();
-  server.join();
+  server.join(Duration::from_secs(5));
 }

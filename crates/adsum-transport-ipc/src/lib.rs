@@ -13,6 +13,7 @@
 //!   the boot-time snapshot path.
 //! - Bounded queues shed counted instead of parking connection threads.
 
+mod codec;
 pub mod frame;
 pub mod sink;
 
@@ -22,6 +23,11 @@ mod markers;
 pub mod paths;
 #[cfg(unix)]
 mod probe;
+#[cfg(unix)]
+pub mod state_aliases;
+
+#[cfg(unix)]
+pub use probe::FileId;
 #[cfg(unix)]
 pub mod unix;
 #[cfg(windows)]

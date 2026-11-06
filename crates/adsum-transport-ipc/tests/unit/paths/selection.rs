@@ -212,3 +212,15 @@ fn foreign_owned_fallback_is_not_deleted() {
   assert_eq!(restore_result, 0, "restore fallback owner");
   let _ = std::fs::remove_dir(&fallback);
 }
+
+/// Diagnostic: does validate_alias_dir accept a plain 0700 dir under /tmp?
+#[test]
+fn probe_validate_alias_dir_tmp() {
+  let dir = std::env::temp_dir().join(format!("adsum-paths-probe-{}", std::process::id()));
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir_all(&dir).unwrap();
+  std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+  let result = validate_alias_dir(&dir);
+  println!("probe result: {result:?}");
+  std::fs::remove_dir_all(&dir).ok();
+}

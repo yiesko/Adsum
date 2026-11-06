@@ -32,7 +32,7 @@ pub(crate) enum SocketState {
 
 /// Filesystem identity of an entry, used to revalidate before unlink.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct FileId {
+pub struct FileId {
   /// Device number of the containing filesystem.
   pub dev: u64,
   /// Inode number within that filesystem.

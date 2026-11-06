@@ -97,6 +97,15 @@ These alternative clients have an RPC or bridge integration Adsum can work with:
 
 Using a client that isn't listed? If it can read an arRPC-style WebSocket bridge, it should work. Tell us how it went in [Discussions](https://github.com/yiesko/adsum/discussions).
 
+**Equibop's arRPC status panel.** With a manual WebSocket host/port, presence
+works but the panel's indicator can read "Stopped": it only tracks Equibop's
+own integrated arRPC process or `arrpc-state-*` snapshot files in its temp
+directory, never the WebSocket connection itself. Point Adsum's snapshots
+there by running the daemon with `ADSUM_STATE_FILE=1` and
+`ADSUM_STATE_PREFIX=arrpc-state-`. Flatpak installs are covered too: Adsum
+publishes a snapshot alias inside the Equibop Flatpak runtime directory
+(`$XDG_RUNTIME_DIR/app/org.equicord.equibop/`) automatically.
+
 ## What Adsum detects
 
 | Source | How it's recognised |
@@ -134,6 +143,11 @@ Most settings have both a CLI flag and an environment variable. The main ones:
 | Database refresh | `ADSUM_ENABLE_DB_UPDATE` | Off for the bare binary, **on** in the installed service | Refresh the game database hourly |
 | Ignored game IDs | `ADSUM_IGNORE_IDS` | None | Never publish these IDs |
 | Allowed web origins | `ADSUM_BRIDGE_ALLOWED_ORIGINS` | Discord's web pages only | Let other browser origins use the bridge |
+| OAuth callback | `ADSUM_OAUTH_REDIRECT_URI` | Unset | Exact registered loopback URI for experimental RPC OAuth |
+| OAuth timeout | `ADSUM_OAUTH_TIMEOUT` | 180 | Seconds to wait for the browser authorization (1-600) |
+| OAuth rate limit | `ADSUM_OAUTH_RATE_LIMIT_MS` | 250 | Minimum spacing between OAuth commands per connection; 0 disables |
+| OAuth client secret | `ADSUM_OAUTH_CLIENT_SECRET` | Unset | Enables refresh-token exchange and stored-session restore |
+| Strict RPC authentication | `ADSUM_REQUIRE_RPC_AUTH` | Off | Require per-connection `AUTHENTICATE` before commands other than `AUTHORIZE`/`AUTHENTICATE` |
 | Background update staging | `ADSUM_AUTO_UPDATE` | Off | Stage verified updates in the background |
 
 For the service, put settings in a drop-in instead of editing the unit. Create `~/.config/systemd/user/adsum.service.d/override.conf`:
@@ -216,11 +230,90 @@ Adsum can watch process start and exit events from the kernel (`cn_proc`) instea
 
 ## Known limitations
 
-- **No OAuth / `AUTHORIZE` flow.** Adsum can't complete authorization that needs the official Discord client and an application's private `client_secret`. Stop Adsum while using games that depend on it.
-- **Unreadable command lines are skipped.** Detection reads `/proc/<pid>/cmdline`. If the kernel denies access (another user's process, or a restrictive `hidepid` mount), that process is skipped.
-- **Some database entries declare no executables.** Those can match on Steam AppID alone, so a helper process that inherits such an ID can cause a false positive. Tightening this further would lose detections for games that provide no executable names.
-- **Official Discord can win discovery.** See the [troubleshooting note](#troubleshooting) above.
-- **Local IPC connections are a bounded resource.** Adsum serves at most 16 concurrent IPC connections with a 1 MiB payload limit. A local client can occupy every slot with idle or incomplete connections, because handshake, frame-read and idle timeouts are still to come. See [residual connection-exhaustion risk](docs/protocol.md#residual-connection-exhaustion-risk).
+- **Experimental Discord RPC OAuth over IPC and WebSocket.** Browser-based
+  `AUTHORIZE` with state validation and optional PKCE S256, token-validating
+  `AUTHENTICATE`, verified `GET_USER` and `GET_GUILDS`, optional
+  refresh-token persistence, and optional strict gating. It does not
+  implement `rpc_token`, token revocation, friends, messages, guild detail
+  APIs (`GET_GUILD`/`GET_CHANNELS`/`GET_CHANNEL`), lobbies, voice, or
+  Discord's native Social SDK.
+  <details>
+  <summary>What it does, how to set it up, and what changes for clients</summary>
+
+  `AUTHENTICATE` validates the caller-supplied access token with Discord and
+  creates a per-connection, in-memory identity session. `GET_USER` exposes
+  that identity when `identify` was granted, and `GET_GUILDS` lists the
+  user's servers when the `guilds` scope was granted. The access token stays
+  in memory, for that connection only.
+
+  With `ADSUM_OAUTH_CLIENT_SECRET` set, a supplied (or previously stored)
+  refresh token is exchanged for a new access token without a browser flow,
+  and the rotated refresh token is stored under `~/.cache/adsum/oauth/`
+  with mode 0600. The one-time setup runs from a terminal:
+  `adsum oauth login --client-id <id> --redirect-uri <uri>`, then restart
+  the service. Strict command gating is optional through
+  `ADSUM_REQUIRE_RPC_AUTH=1`.
+
+  For the installed service, configure the redirect URI in a systemd
+  drop-in; see the
+  [operator setup](docs/oauth-social-sdk-prototype.md#operator-setup-installed-service)
+  and the [OAuth test guide](docs/oauth-rpc-social-sdk-testing.md).
+
+  </details>
+- **Account switches are not detected.** Adsum never talks to the Discord
+  desktop client, and nothing in the RPC protocol announces an account
+  change.
+  <details>
+  <summary>What happens to presence, sessions, and the fallback identity</summary>
+
+  Presence follows whichever account the client runs. The OAuth session
+  keeps reporting the grant owner (the account that approved it in the
+  browser) until it is re-authenticated. Bridge clients can update the
+  fallback identity at runtime with the `SET_USER` control message. See the
+  [protocol identity notes](docs/protocol.md#identity-what-adsum-knows-and-when).
+
+  </details>
+- **Unreadable command lines are skipped.** Detection reads `/proc/<pid>/cmdline`.
+  <details>
+  <summary>When this happens</summary>
+
+  If the kernel denies access to another user's process, or a restrictive
+  `hidepid` mount hides the command line, Adsum skips that process instead
+  of guessing what it is.
+
+  </details>
+- **Some database entries declare no executables.** Those can match on
+  Steam AppID alone.
+  <details>
+  <summary>Why this can cause a false positive</summary>
+
+  A helper process that inherits such an AppID can be classified as the
+  game. Tightening this further would lose detections for games that
+  provide no executable names at all.
+
+  </details>
+- **Official Discord can win discovery.** See the
+  [troubleshooting note](#troubleshooting) above.
+  <details>
+  <summary>What is happening and how to fix it</summary>
+
+  When the official Discord client is also running, it can serve the game's
+  RPC connection before Adsum sees it. The troubleshooting section above
+  lists the steps to keep Adsum in the path.
+
+  </details>
+- **Local IPC connections are a bounded resource.** Adsum serves at most 16
+  concurrent IPC connections with a 1 MiB payload limit.
+  <details>
+  <summary>Residual connection-exhaustion risk</summary>
+
+  A connection that never completes its handshake is dropped after 5
+  seconds, so probe-style clients no longer hold a slot. Slots are still
+  consumable by many *authenticated* idle connections: frame-read and idle
+  timeouts for handshaked clients are still to come. See
+  [residual connection-exhaustion risk](docs/protocol.md#residual-connection-exhaustion-risk).
+
+  </details>
 
 ## Adsum and arRPC
 
@@ -291,6 +384,9 @@ cargo run --manifest-path tools/updater/Cargo.toml
 - [Process detection](docs/process-detection.md): executable matching, Steam and Epic IDs, Proton/Wine, overrides
 - [Detection traceability](docs/detection-traceability.md): detection sources, latency and clear reasons
 - [Protocol](docs/protocol.md): IPC/WebSocket messages and error codes
+- [OAuth prototype](docs/oauth-social-sdk-prototype.md): experimental `AUTHORIZE`/`AUTHENTICATE` behavior, security limits, and [operator setup](docs/oauth-social-sdk-prototype.md#operator-setup-installed-service)
+- [OAuth RPC test guide](docs/oauth-rpc-social-sdk-testing.md): Developer Portal setup and a manual PKCE authorization walkthrough
+- [Social SDK compatibility](docs/social-sdk-compatibility.md): supported RPC path versus the authenticated C++ SDK layer
 - [Web clients](docs/web-client.md): browser, Vencord and Node clients
 - [Rust library](docs/library.md): embedding the daemon
 - [Systemd setup](docs/systemd-user-units.md) and [operations](docs/systemd-operations.md): installation, logs, updates, uninstall

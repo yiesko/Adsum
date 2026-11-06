@@ -1,10 +1,12 @@
 [workspace]
-members = ["adsum-cli", "crates/adsum-ws", "crates/adsum-types", "crates/adsum-protocol", "crates/adsum-transport-ws", "crates/adsum-transport-ipc", "crates/adsum-bridge", "crates/adsum-telemetry", "crates/adsum-proc-events", "crates/adsum-steam", "crates/adsum-detect", "crates/adsum-core"]
+members = ["adsum-cli", "crates/adsum-ws", "crates/adsum-types", "crates/adsum-protocol", "crates/adsum-transport-ws", "crates/adsum-transport-ipc", "crates/adsum-bridge", "crates/adsum-telemetry", "crates/adsum-oauth", "crates/adsum-proc-events", "crates/adsum-steam", "crates/adsum-detect", "crates/adsum-core"]
 resolver = "2"
 
 # Shared package metadata: every member inherits these so author,
-# license, repository, edition and MSRV cannot drift apart.
+# license, repository, edition and MSRV cannot drift apart. The version
+# is project-wide: one release = one version across every crate.
 [workspace.package]
+version = "0.40.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -15,6 +17,7 @@ authors = ["spikehd", "yieskoW"]
 # (plus their own `features`, which add to the workspace set). Versions
 # change here once instead of per crate.
 [workspace.dependencies]
+getrandom = "0.3"
 tokio = { version = "1.53" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

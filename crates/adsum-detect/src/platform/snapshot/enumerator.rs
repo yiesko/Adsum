@@ -68,15 +68,7 @@ impl ProcessEnumerator for SnapshotEnumerator {
     // `exe().unwrap_or(Path::new(""))` shape, minus its allocation.
     slot.path.clear();
     if let Some(exe) = proc.exe() {
-      let text = exe.to_string_lossy();
-      // Anchor on the FOLDED first byte: a leading `\` (UNC) folds to
-      // `/` and is its own anchor — exactly what the old shape did.
-      if !matches!(text.as_bytes().first(), Some(b'/') | Some(b'\\')) {
-        slot.path.push('/');
-      }
-      for ch in text.chars() {
-        slot.path.push(if ch == '\\' { '/' } else { ch });
-      }
+      fold_and_anchor(exe.to_string_lossy().as_ref(), &mut slot.path);
     }
     // Arguments buffer reused: take the slot's own String, refill it, put
     // it back. Semantics identical to the historical per-tick rebuild:
@@ -99,3 +91,23 @@ impl ProcessEnumerator for SnapshotEnumerator {
     true
   }
 }
+
+/// Fold Windows separators to `/` and guarantee exactly one leading anchor,
+/// appending into the caller's reused buffer with no allocation.
+///
+/// The anchor decision runs on the FOLDED result: a UNC prefix already
+/// folds to `//` and is left as-is, while any other leading byte gets one
+/// `/` prepended (a `memmove` inside the reused buffer, not a copy).
+fn fold_and_anchor(exe: &str, out: &mut String) {
+  out.reserve(exe.len());
+  for ch in exe.chars() {
+    out.push(if ch == '\\' { '/' } else { ch });
+  }
+  if !out.is_empty() && !out.starts_with('/') {
+    out.insert(0, '/');
+  }
+}
+
+#[cfg(test)]
+#[path = "../../../tests/unit/platform/snapshot_enumerator.rs"]
+mod fold_tests;

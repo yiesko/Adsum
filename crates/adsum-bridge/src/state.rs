@@ -28,9 +28,8 @@ use std::os::unix::fs::OpenOptionsExt;
 static SNAPSHOT_TMP_SERIAL: AtomicU64 = AtomicU64::new(0);
 
 /// Optional presence snapshot for external tooling, enabled with
-/// `--state-file` / `ADSUM_STATE_FILE` (any boolish value, e.g. `1`).
-/// Slots live beside arRPC's own files but use an `adsum-` prefix so
-/// both daemons coexist: `<tmpdir>/adsum-state-{0..9}`.
+/// `--state-file` / `ADSUM_STATE_FILE`. The prefix defaults to
+/// `adsum-state-` and can be overridden with `ADSUM_STATE_PREFIX`.
 pub const STATE_FILE_PREFIX: &str = "adsum-state-";
 /// How many slots to scan before giving up (arRPC uses 10).
 pub const MAX_STATE_SLOTS: u8 = 10;
@@ -110,15 +109,45 @@ impl StateSnapshot {
   }
 }
 
+/// Snapshot slot prefix: `adsum-state-` by default, so Adsum's files sit
+/// beside arRPC's without colliding. `ADSUM_STATE_PREFIX` overrides it.
+pub fn snapshot_prefix() -> Cow<'static, str> {
+  snapshot_prefix_from(std::env::var("ADSUM_STATE_PREFIX").ok().as_deref())
+}
+
+/// Pure core of [`snapshot_prefix`]: blank, separator-bearing or over-long
+/// values fall back to the default instead of escaping the temp directory.
+fn snapshot_prefix_from(raw: Option<&str>) -> Cow<'static, str> {
+  match raw {
+    Some(value)
+      if !value.is_empty()
+        && value.len() <= 64
+        && value
+          .bytes()
+          .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')) =>
+    {
+      Cow::Owned(value.to_owned())
+    }
+    _ => Cow::Borrowed(STATE_FILE_PREFIX),
+  }
+}
+
 /// Pick a snapshot slot in `dir`: the first missing, stale (`mtime` older
 /// than [`STATE_STALE_SECS`]), or corrupt (unparseable / missing fresh
 /// timestamp) slot. Returns `None` when every slot holds a fresh snapshot
 /// (another live daemon owns them all). Stale temp leftovers from crashed
 /// writers are swept first, under the same staleness rule.
 pub fn select_slot(dir: &Path, now_secs: u64) -> Option<PathBuf> {
-  sweep_stale_tmps(dir, now_secs);
+  let prefix = snapshot_prefix();
+  select_slot_with_prefix(dir, now_secs, &prefix)
+}
+
+/// [`select_slot`] with the prefix supplied by the caller (unit-testable
+/// without process-global environment mutation).
+pub fn select_slot_with_prefix(dir: &Path, now_secs: u64, prefix: &str) -> Option<PathBuf> {
+  sweep_stale_tmps(dir, now_secs, prefix);
   for index in 0..MAX_STATE_SLOTS {
-    let path = dir.join(format!("{STATE_FILE_PREFIX}{index}"));
+    let path = dir.join(format!("{prefix}{index}"));
     if slot_reusable(&path, now_secs) {
       return Some(path);
     }
@@ -130,7 +159,7 @@ pub fn select_slot(dir: &Path, now_secs: u64) -> Option<PathBuf> {
 /// prefix as slots, `tmp-` extension, `mtime` older than staleness.
 /// Best-effort (a crowded `read_dir` simply skips); symlinks are removed
 /// as links, never followed.
-fn sweep_stale_tmps(dir: &Path, now_secs: u64) {
+fn sweep_stale_tmps(dir: &Path, now_secs: u64, prefix: &str) {
   let Ok(entries) = std::fs::read_dir(dir) else {
     return;
   };
@@ -141,7 +170,7 @@ fn sweep_stale_tmps(dir: &Path, now_secs: u64) {
     let is_tmp = path
       .file_name()
       .and_then(|name| name.to_str())
-      .is_some_and(|name| name.starts_with(STATE_FILE_PREFIX))
+      .is_some_and(|name| name.starts_with(prefix))
       && path
         .extension()
         .and_then(|ext| ext.to_str())

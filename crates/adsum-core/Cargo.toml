@@ -1,6 +1,6 @@
 [package]
 name = "adsum-core"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -16,6 +16,7 @@ workspace = true
 [dependencies]
 adsum-types = { path = "../adsum-types" }
 adsum-protocol = { path = "../adsum-protocol" }
+adsum-oauth = { path = "../adsum-oauth" }
 adsum-detect = { path = "../adsum-detect" }
 adsum-telemetry = { path = "../adsum-telemetry" }
 adsum-transport-ipc = { path = "../adsum-transport-ipc" }
@@ -25,6 +26,9 @@ tokio = { workspace = true, features = ["net", "rt-multi-thread", "time", "macro
 serde_json.workspace = true
 ureq.workspace = true
 tracing.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "time", "macros", "sync"] }

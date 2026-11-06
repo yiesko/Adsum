@@ -15,6 +15,7 @@
 //! `cadence` (idle backoff and its watcher gate) and `loops` (the two
 //! long-running thread bodies, extracted from the old inline closures).
 
+use std::io;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -101,24 +102,50 @@ impl ProcessServer {
     self.shutdown_handle().signal();
   }
 
-  /// Block until every thread spawned by `start` has exited. Call after
-  /// `shutdown`: joining without it waits out sleeps (refresh hours,
-  /// watcher retry minutes). Takes the handle registry, so a second
-  /// `join` returns at once. A panicked worker logs and continues
-  /// joining the rest instead of abandoning them.
-  pub fn join(&self) {
+  /// Block until every thread spawned by `start` has exited, bounded by
+  /// `timeout` per thread so a wedged worker (e.g. stuck in network I/O
+  /// that ignores the shutdown flag) cannot hold the daemon past the
+  /// systemd stop deadline. Call after `shutdown`: joining without it
+  /// waits out sleeps (refresh hours, watcher retry minutes). Takes the
+  /// handle registry, so a second `join` returns at once. A panicked
+  /// worker logs and continues joining the rest instead of abandoning
+  /// them. Returns the number of threads that did not exit in time.
+  pub fn join(&self, timeout: Duration) -> u32 {
     let handles: Vec<std::thread::JoinHandle<()>> = std::mem::take(
       &mut *self
         .worker_handles
         .lock()
         .unwrap_or_else(|e| e.into_inner()),
     );
+    let mut timed_out = 0u32;
     for handle in handles {
-      if handle.join().is_err() {
-        tracing::warn!("[Process Scanner] worker thread panicked during join");
+      match join_with_timeout(handle, timeout) {
+        Ok(()) => {}
+        Err(_) => {
+          timed_out += 1;
+          tracing::warn!("[Process Scanner] worker thread did not exit within {timeout:?}");
+        }
       }
     }
+    timed_out
   }
+}
+
+/// Join a thread with a deadline. The handle is moved to a waiter thread
+/// so the caller can bound the wait instead of blocking indefinitely — a
+/// wedged worker must not hold the shutdown past the systemd deadline.
+fn join_with_timeout(handle: std::thread::JoinHandle<()>, timeout: Duration) -> io::Result<()> {
+  let (tx, rx) = std::sync::mpsc::channel();
+  let _waiter = std::thread::spawn(move || {
+    let _ = handle.join();
+    let _ = tx.send(());
+  });
+  rx.recv_timeout(timeout).map_err(|err| {
+    io::Error::new(
+      io::ErrorKind::TimedOut,
+      format!("thread join timed out: {err}"),
+    )
+  })
 }
 
 impl ProcessServer {

@@ -52,9 +52,16 @@ impl EventSink {
   ///
   /// Never blocks: connection threads must not stall on a wedged bridge.
   pub fn emit(&self, cmd: ActivityCmd) {
+    self.emit_checked(cmd);
+  }
+
+  pub(crate) fn emit_checked(&self, cmd: ActivityCmd) -> bool {
     if self.tx.try_send(cmd).is_err() {
       self.dropped.fetch_add(1, Ordering::Relaxed);
       tracing::warn!("[ipc] Event sink full/closed, dropping command");
+      false
+    } else {
+      true
     }
   }
 
@@ -63,27 +70,32 @@ impl EventSink {
   /// shed-and-count past the bound or when closed, exactly like
   /// [`emit`](Self::emit).
   pub fn emit_clear(&self, cmd: ActivityCmd) {
+    self.emit_clear_checked(cmd);
+  }
+
+  pub(crate) fn emit_clear_checked(&self, cmd: ActivityCmd) -> bool {
     let mut pending = Some(cmd);
     let deadline = std::time::Instant::now() + CLEAR_SEND_TIMEOUT;
     while let Some(cmd) = pending.take() {
       match self.tx.try_send(cmd) {
-        Ok(()) => return,
+        Ok(()) => return true,
         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
           self.dropped.fetch_add(1, Ordering::Relaxed);
           tracing::warn!("[ipc] Event sink closed, dropping clear");
-          return;
+          return false;
         }
         Err(tokio::sync::mpsc::error::TrySendError::Full(cmd)) => {
           if std::time::Instant::now() >= deadline {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             tracing::warn!("[ipc] Event sink still full, dropping clear");
-            return;
+            return false;
           }
           pending = Some(cmd);
           std::thread::sleep(std::time::Duration::from_millis(1));
         }
       }
     }
+    false
   }
 
   /// Commands shed since creation.

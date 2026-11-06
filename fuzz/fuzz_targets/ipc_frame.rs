@@ -2,11 +2,11 @@
 
 use std::io::{Cursor, Read, Write};
 
-use libfuzzer_sys::fuzz_target;
 use adsum_transport_ipc::EventSink;
 use adsum_transport_ipc::frame::{IpcFacilitator, MAX_IPC_PAYLOAD, PacketType, handle_stream};
 use adsum_types::AppId;
 use adsum_types::user::RpcUser;
+use libfuzzer_sys::fuzz_target;
 use serde_json::Value;
 
 // Per-connection state with a drain-free sink: the queue is oversized so
@@ -15,6 +15,8 @@ struct FuzzFacilitator {
   handshake: bool,
   pid: u64,
   sink: EventSink,
+  published_pids: Vec<u64>,
+  oauth: std::sync::Arc<adsum_oauth::OAuthManager>,
 }
 
 impl IpcFacilitator for FuzzFacilitator {
@@ -47,9 +49,22 @@ impl IpcFacilitator for FuzzFacilitator {
   fn sink(&self) -> &EventSink {
     &self.sink
   }
+  fn oauth_manager(&self) -> &std::sync::Arc<adsum_oauth::OAuthManager> {
+    &self.oauth
+  }
+  fn admit_published_pid(&mut self, pid: u64) -> bool {
+    adsum_transport_ipc::frame::admit_pid(&mut self.published_pids, pid)
+  }
+  fn owns_published_pid(&self, pid: u64) -> bool {
+    self.published_pids.contains(&pid)
+  }
+  fn forget_published_pid(&mut self, pid: u64) {
+    self.published_pids.retain(|known| *known != pid);
+  }
+  fn take_published_pids(&mut self) -> Vec<u64> {
+    std::mem::take(&mut self.published_pids)
+  }
 }
-
-// Byte duplex: reads consume the fuzz input, writes accumulate responses.
 struct FuzzStream {
   input: Cursor<Vec<u8>>,
   output: Vec<u8>,
@@ -75,28 +90,33 @@ impl Write for FuzzStream {
 // facilitator. Must terminate (EOF ends the pump), never panic, and
 // only emit well-formed frames (known type, bounded length, full body).
 fuzz_target!(|data: &[u8]| {
-    let take = data.len().min(64 * 1024);
-    let mut stream = FuzzStream {
-      input: Cursor::new(data[..take].to_vec()),
-      output: Vec::new(),
-    };
-    let (sink, _rx) = EventSink::bounded(4096);
-    let mut ipc = FuzzFacilitator {
-      handshake: false,
-      pid: 0,
-      sink,
-    };
-    handle_stream(&mut ipc, &mut stream);
-    // Every response byte belongs to a complete frame.
-    let mut frames = stream.output.as_slice();
-    while !frames.is_empty() {
-      assert!(frames.len() >= 8, "torn response frame");
-      let rtype = u32::from_le_bytes(frames[0..4].try_into().unwrap());
-      let length = u32::from_le_bytes(frames[4..8].try_into().unwrap());
-      assert!(PacketType::try_from_u32(rtype).is_some(), "unknown response type");
-      assert!(length <= MAX_IPC_PAYLOAD, "oversize response frame");
-      let total = 8 + length as usize;
-      assert!(frames.len() >= total, "truncated response frame");
-      frames = &frames[total..];
-    }
+  let take = data.len().min(64 * 1024);
+  let mut stream = FuzzStream {
+    input: Cursor::new(data[..take].to_vec()),
+    output: Vec::new(),
+  };
+  let (sink, _rx) = EventSink::bounded(4096);
+  let mut ipc = FuzzFacilitator {
+    handshake: false,
+    pid: 0,
+    sink,
+    published_pids: Vec::new(),
+    oauth: std::sync::Arc::new(adsum_oauth::OAuthManager::from_env()),
+  };
+  handle_stream(&mut ipc, &mut stream);
+  // Every response byte belongs to a complete frame.
+  let mut frames = stream.output.as_slice();
+  while !frames.is_empty() {
+    assert!(frames.len() >= 8, "torn response frame");
+    let rtype = u32::from_le_bytes(frames[0..4].try_into().unwrap());
+    let length = u32::from_le_bytes(frames[4..8].try_into().unwrap());
+    assert!(
+      PacketType::try_from_u32(rtype).is_some(),
+      "unknown response type"
+    );
+    assert!(length <= MAX_IPC_PAYLOAD, "oversize response frame");
+    let total = 8 + length as usize;
+    assert!(frames.len() >= total, "truncated response frame");
+    frames = &frames[total..];
+  }
 });

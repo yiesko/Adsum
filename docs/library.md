@@ -40,8 +40,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 `run_until` takes a shutdown future: whatever you pass resolves when the
 daemon should stop (a Ctrl+C signal, a channel closing, a test ending).
-Teardown is total — transports, bridge, scanner threads and the event
-pump all stop and join, in reverse startup order. When `run_until`
+Teardown is total — transports, bridge, OAuth workers, scanner threads and
+the event pump all stop and join, in reverse startup order. When `run_until`
 returns, no Adsum thread is still running, so embedding more than one
 daemon lifetime per process is safe.
 
@@ -110,7 +110,7 @@ Every field, with its default:
 | `ignored_ids` | `[]` | App ids the scanner never publishes (`--ignore-ids`) |
 | `exclusions_url` | `None` | Discord exclusions feed (`--exclusions-url`) |
 | `app_version` | `adsum-core`'s own version — **`0.1.0`**, not the CLI's | Version stamped into state snapshots. The CLI overrides it with `0.40.0`; embedding it yourself does not, so set it if the value matters |
-| `state_file` | `false` | Presence snapshots to `<tmpdir>/adsum-state-{0..9}` (`--state-file`): owner-only files, shared slots under concurrency |
+| `state_file` | `false` | Presence snapshots to `<tmpdir>/adsum-state-{0..9}` (`--state-file`): owner-only files, shared slots under concurrency. With `ADSUM_STATE_PREFIX=arrpc-state-`, snapshot aliases are published into client runtime directories for status panels such as Equibop's. |
 | `bridge_allowed_origins` | `[]` | Extra browser origins driving bridge commands (`--bridge-allowed-origins`): normalized to browser form, then exact match |
 
 ## One-shot diagnostics (no threads)

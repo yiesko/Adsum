@@ -568,7 +568,23 @@ fn validate_real_dir_chain(
   while let Some(component) = components.next() {
     let is_final = components.peek().is_none();
     current.push(component.as_os_str());
-    let facts = facts_of(&current)?;
+    // Intermediate path components may be symlinks (e.g. macOS maps /tmp into
+    // /private/tmp): follow them with `metadata`. Only the final component
+    // must be a real directory, so it stays on `symlink_metadata`.
+    let facts = if is_final {
+      facts_of(&current)?
+    } else {
+      let meta =
+        std::fs::metadata(&current).map_err(|err| invalid_path(&current, &format!("{err}")))?;
+      if !meta.file_type().is_dir() {
+        return Err(invalid_path(&current, "not a real directory"));
+      }
+      Facts {
+        uid: meta.uid(),
+        mode: meta.mode(),
+        mnt_id: None,
+      }
+    };
     if facts.mode & MODE_TYPE_MASK != MODE_DIRECTORY {
       return Err(invalid_path(&current, "not a real directory"));
     }

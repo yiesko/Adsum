@@ -8,6 +8,11 @@ flag without an environment variable.
 Boolean flags (`--no-process-scan`, `--enable-db-update`, and the rest)
 accept `1`, `0`, `true`, `false`, `yes`, `no`, `on`, and `off`.
 
+One subcommand exists alongside the flags: `adsum oauth` manages Discord
+OAuth grants (`login`, `status`, `logout`) — see the
+[OAuth test guide](oauth-rpc-social-sdk-testing.md) and the
+[operator setup](oauth-social-sdk-prototype.md#operator-setup-installed-service).
+
 ## Detection and scanning
 
 | Flag | Environment variable | Default | What it does |
@@ -93,6 +98,7 @@ detected under Proton/Wine. Details:
 | `--list-detected` | `ADSUM_LIST_DETECTED` | Run one scan, print what would be published, and exit. |
 | `--list-database` | `ADSUM_LIST_DATABASE` | Print database counts and the first ten entries, then exit. |
 | `--state-file` | `ADSUM_STATE_FILE` | Write presence snapshots to `<tmpdir>/adsum-state-{0..9}` (arRPC layout) for external tooling. Off by default. Snapshots are owner-only; concurrent daemons share slots (last writer wins). |
+| — | `ADSUM_STATE_PREFIX` | Override the snapshot file prefix (default `adsum-state-`), used with `--state-file`. Set `arrpc-state-` so Equibop's arRPC status panel recognizes Adsum when its integrated arRPC is disabled. |
 | `-D, --debug` | `ADSUM_DEBUG` | Print the resolved configuration and enable debug logging. |
 
 ```bash
