@@ -207,10 +207,6 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Bound on how long a connection may stay un-handshaked. Generous for
 /// every real client, which sends the handshake immediately after connect.
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(5);
-/// An idle connection that never sends a frame and never drains replies
-/// must not hold a pump slot forever: probes that connect and go silent
-/// are dropped after this window.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn release_message_capacity(message: &mut String) {
   message.clear();
@@ -318,7 +314,6 @@ pub fn handle_stream(ipc: &mut dyn IpcFacilitator, stream: &mut (impl Read + Wri
   let mut closing = false;
   let mut clean_close = false;
   let connected_at = std::time::Instant::now();
-  let mut idle_since: Option<std::time::Instant> = None;
   loop {
     if ipc.is_cancelled() {
       break;
@@ -413,19 +408,8 @@ pub fn handle_stream(ipc: &mut dyn IpcFacilitator, stream: &mut (impl Read + Wri
       break;
     }
     if !progressed {
-      if idle_since.is_none() {
-        idle_since = Some(std::time::Instant::now());
-      } else if idle_since
-        .map(|since| since.elapsed() >= IDLE_TIMEOUT)
-        .unwrap_or(false)
-      {
-        tracing::debug!("[ipc] Idle connection timed out, closing pump");
-        break;
-      }
-    } else {
-      idle_since = None;
+      std::thread::sleep(POLL_INTERVAL);
     }
-    std::thread::sleep(POLL_INTERVAL);
   }
   connection.close();
   let clean = clean_close || ipc.is_cancelled();
