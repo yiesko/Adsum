@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use crate::bundle::{DetectablesBundle, build_bundle};
+use crate::bundle::{DetectablesBundle, build_bundle_for_os};
 use crate::compatibility::match_compatibility;
 use crate::types::Exec;
 use crate::types::{DetectSource, OsName, ScannedEntry, ScannedExe, ScannedHit};
@@ -25,7 +25,7 @@ fn fixture() -> (Arc<ScannedEntry>, DetectablesBundle) {
     aliases: Box::new([]),
   });
   let entries: Arc<[Arc<ScannedEntry>]> = Arc::from(vec![entry]);
-  let bundle = build_bundle(entries, Arc::from(Vec::new())).expect("bundle builds");
+  let bundle = build_bundle_for_os(entries, Arc::from(Vec::new()), "linux").expect("bundle builds");
   let entry = bundle.list[0].clone();
   (entry, bundle)
 }
@@ -195,7 +195,7 @@ fn non_vanilla_entry_has_no_loader_signatures() {
     epic_ids: Box::new([]),
     aliases: Box::new([]),
   })]);
-  let bundle = build_bundle(entries, Arc::from(Vec::new())).expect("bundle builds");
+  let bundle = build_bundle_for_os(entries, Arc::from(Vec::new()), "linux").expect("bundle builds");
   let mut stat = String::new();
   let process = java_process("--launchTarget fmlclient");
   assert!(
@@ -224,7 +224,7 @@ fn ambiguous_entries_are_refused() {
     })
   };
   let entries: Arc<[Arc<ScannedEntry>]> = Arc::from(vec![mk("1"), mk("2")]);
-  let bundle = build_bundle(entries, Arc::from(Vec::new())).expect("bundle builds");
+  let bundle = build_bundle_for_os(entries, Arc::from(Vec::new()), "linux").expect("bundle builds");
   let mut stat = String::new();
   let process = java_process("-cp game.jar net.minecraft.client.main.Main");
   assert!(

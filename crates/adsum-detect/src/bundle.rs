@@ -527,13 +527,22 @@ pub(crate) fn build_bundle(
   detectable: Arc<[Arc<ScannedEntry>]>,
   custom: Arc<[Arc<ScannedEntry>]>,
 ) -> Result<DetectablesBundle, aho_corasick::BuildError> {
+  build_bundle_for_os(detectable, custom, std::env::consts::OS)
+}
+
+/// Same as [`build_bundle`] with an explicit target OS, so the
+/// compatibility rules are testable from any host.
+pub(crate) fn build_bundle_for_os(
+  detectable: Arc<[Arc<ScannedEntry>]>,
+  custom: Arc<[Arc<ScannedEntry>]>,
+  target_os: &str,
+) -> Result<DetectablesBundle, aho_corasick::BuildError> {
   // One walk feeds both automata (see `collect_split_patterns`); each
   // source vector is dropped right after its automaton compiles, so the
   // peak is one automaton + one vector + builder scratch — never two
   // pattern vectors beside a live automaton.
   let split = collect_split_patterns(&detectable);
-  let compatibility =
-    crate::compatibility::build_compatibility_bundle(&detectable, std::env::consts::OS);
+  let compatibility = crate::compatibility::build_compatibility_bundle(&detectable, target_os);
   let ac = build_ac_automaton(&split.native_patterns)?;
   let mut idx = split.native_idx;
   drop(split.native_patterns);
