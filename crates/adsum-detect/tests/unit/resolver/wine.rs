@@ -73,3 +73,11 @@ fn wine_rejects_drive_c_windows() {
   let e = exec("wine", Some("/drive_c/windows/system32/foo.exe"));
   assert!(resolve_wine_chain(&e).is_none());
 }
+
+#[test]
+fn wine_preserves_target_arguments() {
+  let e = exec("wine", Some("./game.exe -windowed"));
+  let r = resolve_wine_chain(&e).expect("resolves");
+  assert_eq!(r.path, "./game.exe");
+  assert_eq!(e.arguments_from(r.argument_start), Some("-windowed"));
+}
