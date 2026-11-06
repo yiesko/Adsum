@@ -311,6 +311,15 @@ probe and before the weaker stem, folder and steam-library tiers. It does
 not promote arbitrary Darwin entries, does not create a generic `java`
 rule, and does not weaken the existing tiers.
 
+## Linux emulator awareness
+
+On Linux, wrappers such as Box64, FEX, QEMU user-mode, Wine/Proton and the
+Steam `reaper` are resolved to their real target executable before
+matching. `Exec.path` (argv[0]) is never overwritten; only a local view
+of the target path is used, so the original evidence stays available.
+Resolvers are pure functions of `Exec` (and an optional `/proc/<pid>/exe`
+identity) and do not read `/proc` themselves.
+
 ## Sources
 
 - Epic's [Testing Guide](https://dev.epicgames.com/docs/epic-games-store/testing-guide)

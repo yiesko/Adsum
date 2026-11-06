@@ -133,6 +133,15 @@ unclassified payloads, so old readers keep working):
 Clears evict their cards, so "why did it stop" lives in the journal
 (clear lines above), not the snapshot.
 
+## Emulator resolution
+
+Linux wrappers (Box64, FEX, QEMU user-mode, Wine/Proton, Steam reaper)
+are resolved to their real target before matching. The matcher source
+stays the underlying tier (`automaton`, `compatibility`, etc.); the
+wrapper is an input transformation, not a new source. `Exec.path`
+(argv[0]) is preserved, so traces can distinguish the wrapper from the
+target.
+
 ## See also
 
 - [process-detection.md](process-detection.md) — how games are found.
