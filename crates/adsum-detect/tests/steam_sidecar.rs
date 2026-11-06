@@ -910,3 +910,34 @@ fn reaper_end_to_end_resolves_app_id() {
   let hit = server.match_process(&process, &bundle, &excl, &mut obs_open, &mut scratch);
   assert!(hit.is_some(), "reaper target resolves via AppId");
 }
+
+#[test]
+fn wine_relative_target_resolves_through_match_process() {
+  let (tx, _rx) = adsum_telemetry::QueueGauge::pair();
+  let entry: DetectableActivity = serde_json::from_value(serde_json::json!({
+    "id": "999",
+    "name": "Wine Game",
+    "hook": false,
+    "executables": [
+      {"name": "game.exe", "is_launcher": false, "os": "linux"}
+    ],
+    "third_party_skus": [],
+    "aliases": []
+  }))
+  .expect("fixture parses");
+  let server = ProcessServer::new_with_custom(
+    vec![Arc::new(entry)],
+    vec![],
+    tx,
+    ProcessEventListeners::default(),
+    RefreshConfig::default(),
+    vec![],
+  );
+  let bundle = server.bundle();
+  let mut scratch = ScanScratch::default();
+  let excl = server.exclusions_read();
+  let mut obs_open = false;
+  let process = process("wine", "./game.exe");
+  let hit = server.match_process(&process, &bundle, &excl, &mut obs_open, &mut scratch);
+  assert!(hit.is_some(), "wine relative target resolves");
+}
