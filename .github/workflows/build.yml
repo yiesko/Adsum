@@ -164,14 +164,6 @@ jobs:
           set -euo pipefail
           python3 scripts/release.py classify "$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
 
-      - name: Select previous release tag
-        id: previous_tag
-        if: steps.version.outputs.prerelease == 'true'
-        run: |
-          set -euo pipefail
-          tag="$(python3 scripts/release.py previous-tag "$GITHUB_REF_NAME")"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-
       # Download all artifacts from the build job
       - name: Download artifacts
         # NOTE: no node24 release yet (v6 still targets node20); bump when upstream ships it.
@@ -238,6 +230,14 @@ jobs:
           # fallbacks is the behaviour this step replaces.
           python3 scripts/release.py extract-changelog CHANGELOG.md "$GITHUB_REF_NAME" RELEASE_NOTES.md
 
+      - name: Extract pre-release changelog
+        if: steps.version.outputs.prerelease == 'true'
+        run: |
+          # Pre-release notes come from the same hand-written changelog
+          # as stable ones: GitHub's generated notes only list merged
+          # PRs, which misses direct-push work.
+          python3 scripts/release.py extract-unreleased CHANGELOG.md RELEASE_NOTES.md
+
       - name: Create stable release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         if: steps.version.outputs.prerelease == 'false'
@@ -275,8 +275,8 @@ jobs:
           # published pre-release refuses later asset uploads, so it must
           # stay a draft until the publish step.
           draft: true
-          previous_tag: ${{ steps.previous_tag.outputs.tag }}
-          generate_release_notes: true
+          body_path: RELEASE_NOTES.md
+          generate_release_notes: false
           prerelease: true
 
       - name: Publish release

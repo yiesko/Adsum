@@ -35,19 +35,6 @@ class ReleaseTagTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     release.parse_tag(tag)
 
-    def test_previous_tag_ignores_build_metadata_and_invalid_tags(self):
-        tags = [
-            "v0.39.0",
-            "not-semver",
-            "v0.40.0",
-            "v0.41.0-beta.1",
-            "v0.41.0-beta.1+build.4",
-            "v0.41.0-beta.2",
-        ]
-        self.assertEqual(release.previous_tag("v0.41.0-beta.2", tags), "v0.41.0-beta.1")
-        self.assertEqual(release.previous_tag("v0.41.0-beta.1", tags), "v0.40.0")
-        self.assertIsNone(release.previous_tag("v1.0.0", []))
-
     def test_changelog_extraction_boundaries_and_empty_section(self):
         body = """# Changelog
 
@@ -79,11 +66,34 @@ class ReleaseTagTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 release.extract_changelog(path, "v0.41.0")
 
+    def test_unreleased_extraction_stops_at_next_version(self):
+        body = """# Changelog
+
+## [Unreleased]
+
+### Added
+- Later
+
+## [0.41.0] - 2026-01-01
+
+### Added
+- Current
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "CHANGELOG.md"
+            path.write_text(body)
+            self.assertEqual(
+                release.extract_unreleased(path), "### Added\n- Later\n"
+            )
+
     def test_real_changelog_extraction(self):
         path = Path(__file__).resolve().parents[2] / "CHANGELOG.md"
         body = release.extract_changelog(path, "v0.40.0")
         self.assertIn("Added", body)
         self.assertNotIn("0.39.0", body)
+        unreleased = release.extract_unreleased(path)
+        self.assertIn("Added", unreleased)
+        self.assertNotIn("0.40.0", unreleased)
 
     def test_package_version_stamp_and_stable_consistency(self):
         with tempfile.TemporaryDirectory() as directory:

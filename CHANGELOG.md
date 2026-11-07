@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **OAuth setup in the installer**. `install.sh` can write the OAuth redirect and secret settings for the user service.
 - **Cross-client state snapshots**. With `--state-file`, Adsum can create `arrpc-state-N` links in client runtime folders and use `ADSUM_STATE_PREFIX` to choose the file prefix.
 - **Compatibility detection**. Adsum now recognizes games started by Box64, FEX, QEMU, Wine/Proton, and Steam reaper, including Wine games on macOS, plus Minecraft and compatible loaders on Linux.
-- **Pre-release tags**. Alpha, beta, and release-candidate tags are now published as GitHub pre-releases with their own generated notes. Stable tags still need a numbered changelog section.
+- **Pre-release tags**. Alpha, beta, and release-candidate tags are now published as GitHub pre-releases with notes from this changelog. Stable tags still need a numbered changelog section.
 
 ### Changed
 - **Lower memory use at startup**. The bundled game database is stored in a smaller form, so the measured startup peak fell from about 57 MB to about 28 MB in local testing.

@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import re
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -69,34 +68,8 @@ def _sort_key(version: SemVer) -> tuple:
     )
 
 
-def previous_tag(current: str, tags: list[str]) -> str | None:
-    """Return the greatest valid SemVer tag below `current`, if any."""
-    current_version = parse_tag(current)
-    candidates = []
-    for tag in tags:
-        try:
-            parsed = parse_tag(tag.strip())
-        except ValueError:
-            continue
-        if parsed.tag == current_version.tag or parsed.version == current_version.version:
-            continue
-        if _sort_key(parsed) < _sort_key(current_version):
-            candidates.append(parsed)
-    return max(candidates, key=_sort_key).tag if candidates else None
-
-
-def git_tags() -> list[str]:
-    """List git tags visible to this checkout, newest ordering irrelevant."""
-    output = subprocess.check_output(
-        ["git", "tag", "--list", "v*"], text=True
-    )
-    return output.splitlines()
-
-
-def extract_changelog(path: Path, tag: str) -> str:
-    """Extract the non-empty section for a stable tag's exact SemVer version."""
-    parsed = parse_tag(tag)
-    heading = f"## [{parsed.version}]"
+def _extract_section(path: Path, heading: str) -> str:
+    """Return the non-empty body under one `## [..]` changelog heading."""
     lines: list[str] = []
     found = False
     for line in path.read_text().splitlines():
@@ -113,6 +86,17 @@ def extract_changelog(path: Path, tag: str) -> str:
     if not body:
         raise ValueError(f"CHANGELOG.md '{heading}' section is empty")
     return body + "\n"
+
+
+def extract_changelog(path: Path, tag: str) -> str:
+    """Extract the non-empty section for a stable tag's exact SemVer version."""
+    parsed = parse_tag(tag)
+    return _extract_section(path, f"## [{parsed.version}]")
+
+
+def extract_unreleased(path: Path) -> str:
+    """Extract the `[Unreleased]` section used as pre-release notes."""
+    return _extract_section(path, "## [Unreleased]")
 
 
 def stamp_package_version(path: Path, tag: str) -> None:
@@ -156,15 +140,14 @@ def cmd_classify(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_previous_tag(args: argparse.Namespace) -> int:
-    previous = previous_tag(args.tag, git_tags())
-    if previous:
-        print(previous)
+def cmd_extract_changelog(args: argparse.Namespace) -> int:
+    body = extract_changelog(Path(args.changelog), args.tag)
+    Path(args.output).write_text(body)
     return 0
 
 
-def cmd_extract_changelog(args: argparse.Namespace) -> int:
-    body = extract_changelog(Path(args.changelog), args.tag)
+def cmd_extract_unreleased(args: argparse.Namespace) -> int:
+    body = extract_unreleased(Path(args.changelog))
     Path(args.output).write_text(body)
     return 0
 
@@ -182,15 +165,16 @@ def main(argv: list[str] | None = None) -> int:
     classify.add_argument("tag")
     classify.set_defaults(func=cmd_classify)
 
-    previous = subcommands.add_parser("previous-tag")
-    previous.add_argument("tag")
-    previous.set_defaults(func=cmd_previous_tag)
-
     extract = subcommands.add_parser("extract-changelog")
     extract.add_argument("changelog")
     extract.add_argument("tag")
     extract.add_argument("output")
     extract.set_defaults(func=cmd_extract_changelog)
+
+    unreleased = subcommands.add_parser("extract-unreleased")
+    unreleased.add_argument("changelog")
+    unreleased.add_argument("output")
+    unreleased.set_defaults(func=cmd_extract_unreleased)
 
     stamp = subcommands.add_parser("stamp-version")
     stamp.add_argument("cargo_toml")
