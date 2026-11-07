@@ -672,8 +672,14 @@ pub(crate) fn initial_bundle(
   // re-walked and dropped).
   let slim = |list: Vec<Arc<DetectableActivity>>| {
     list
-      .iter()
-      .map(|entry| Arc::new(ScannedEntry::from_activity(entry)))
+      .into_iter()
+      .map(|entry| {
+        let scanned = match Arc::try_unwrap(entry) {
+          Ok(activity) => ScannedEntry::from_owned(activity),
+          Err(shared) => ScannedEntry::from_activity(&shared),
+        };
+        Arc::new(scanned)
+      })
       .collect::<Vec<_>>()
   };
   let custom: Vec<Arc<ScannedEntry>> = custom
