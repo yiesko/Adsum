@@ -103,13 +103,14 @@ impl ProcessServer {
   }
 
   /// Block until every thread spawned by `start` has exited, bounded by
-  /// `timeout` per thread so a wedged worker (e.g. stuck in network I/O
-  /// that ignores the shutdown flag) cannot hold the daemon past the
-  /// systemd stop deadline. Call after `shutdown`: joining without it
-  /// waits out sleeps (refresh hours, watcher retry minutes). Takes the
-  /// handle registry, so a second `join` returns at once. A panicked
-  /// worker logs and continues joining the rest instead of abandoning
-  /// them. Returns the number of threads that did not exit in time.
+  /// one shared `timeout` for all threads so a wedged worker (e.g. stuck
+  /// in network I/O that ignores the shutdown flag) cannot hold the daemon
+  /// past the systemd stop deadline. Call after `shutdown`: joining
+  /// without it waits out sleeps (refresh hours, watcher retry minutes).
+  /// Takes the handle registry, so a second `join` returns at once. A
+  /// panicked worker logs and continues joining the rest instead of
+  /// abandoning them. Returns the number of threads that did not exit in
+  /// time.
   pub fn join(&self, timeout: Duration) -> u32 {
     let handles: Vec<std::thread::JoinHandle<()>> = std::mem::take(
       &mut *self
@@ -125,7 +126,9 @@ impl ProcessServer {
         Ok(()) => {}
         Err(_) => {
           timed_out += 1;
-          tracing::warn!("[Process Scanner] worker thread did not exit within {timeout:?}");
+          tracing::warn!(
+            "[Process Scanner] worker thread did not exit before the {timeout:?} join deadline"
+          );
         }
       }
     }
