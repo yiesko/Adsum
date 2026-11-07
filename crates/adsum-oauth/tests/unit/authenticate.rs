@@ -18,12 +18,11 @@ fn fetch_discord_json_rejects_unsafe_paths() {
 
 #[test]
 fn fetch_discord_json_accepts_api_paths() {
-  // We cannot hit the network in unit tests; only the validation gate is
-  // exercised here. A valid path passes validation and fails later at the
-  // HTTP layer, never with InvalidArguments.
   for good in ["/users/@me/guilds", "/users/@me", "/oauth2/@me"] {
-    let err = crate::authenticate::fetch_discord_json("token", good).unwrap_err();
-    assert_ne!(err, crate::OAuthError::InvalidArguments, "path {good:?}");
+    assert!(
+      crate::authenticate::validate_api_path(good).is_ok(),
+      "path {good:?}"
+    );
   }
 }
 

@@ -150,7 +150,7 @@ pub(crate) fn session_from_auth_response(
 ///
 /// Returns the parsed body on 2xx, `InvalidAccessToken` on 401/403 and
 /// `DiscordUnavailable` on transport/other errors. The token is never logged.
-pub fn fetch_discord_json(access_token: &str, path: &str) -> Result<Value, OAuthError> {
+pub fn validate_api_path(path: &str) -> Result<(), OAuthError> {
   if !path.starts_with('/')
     || path.starts_with("//")
     || path.contains("..")
@@ -160,6 +160,11 @@ pub fn fetch_discord_json(access_token: &str, path: &str) -> Result<Value, OAuth
   {
     return Err(OAuthError::InvalidArguments);
   }
+  Ok(())
+}
+
+pub fn fetch_discord_json(access_token: &str, path: &str) -> Result<Value, OAuthError> {
+  validate_api_path(path)?;
   let agent: ureq::Agent = ureq::Agent::config_builder()
     .timeout_global(Some(Duration::from_secs(8)))
     .max_redirects(0)
