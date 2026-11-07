@@ -583,16 +583,11 @@ fn validate_real_dir_chain(
             "symlink not owned by root or the effective uid",
           ));
         }
-        let meta =
-          std::fs::metadata(&current).map_err(|err| invalid_path(&current, &format!("{err}")))?;
-        if !meta.file_type().is_dir() {
-          return Err(invalid_path(&current, "not a real directory"));
-        }
-        Facts {
-          uid: meta.uid(),
-          mode: meta.mode(),
-          mnt_id: None,
-        }
+        // Validate every component the link resolves through, not just its
+        // final directory: an attacker-writable ancestor could swap it.
+        let resolved = std::fs::canonicalize(&current)
+          .map_err(|err| invalid_path(&current, &format!("{err}")))?;
+        validate_real_dir_chain(&resolved, ctx, true)?
       } else {
         facts_of(&current)?
       }

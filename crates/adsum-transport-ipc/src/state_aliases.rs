@@ -488,7 +488,8 @@ pub fn recover_state_alias(
     // A renamed, replaced or foreign entry is never ours to remove.
     AliasState::Foreign => StateRecovery::Conflict,
     AliasState::Missing => {
-      if validate_snapshot_target(target, euid).is_ok() {
+      let fresh = snapshot_target_age(target, now_ms).is_some_and(|age| age <= consumer_stale_ms);
+      if fresh && validate_snapshot_target(target, euid).is_ok() {
         if std::os::unix::fs::symlink(target, &alias).is_ok()
           && state_symlink_id(&alias, target).is_some()
         {
