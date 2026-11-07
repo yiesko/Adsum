@@ -175,3 +175,21 @@ fn non_naming_candidate_does_not_block_the_variant() {
     "a candidate whose name does not name the path is Refused, not NoMatch"
   );
 }
+
+#[test]
+fn exec_argument_at_preserves_empty_argv_entries() {
+  use crate::types::{ArgSpan, Exec};
+  let exec = Exec {
+    pid: 1,
+    path: "java".into(),
+    arguments: Some("-game  hl2".into()), // two spaces => empty token
+    argument_spans: vec![
+      ArgSpan { start: 0, end: 5 },
+      ArgSpan { start: 6, end: 6 },
+      ArgSpan { start: 7, end: 10 },
+    ],
+  };
+  assert_eq!(exec.argument_at(0), Some("-game"));
+  assert_eq!(exec.argument_at(1), Some(""));
+  assert_eq!(exec.argument_at(2), Some("hl2"));
+}
