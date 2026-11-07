@@ -6,7 +6,7 @@ use adsum_detect::db::DetectableActivity;
 use adsum_detect::refresh::RefreshConfig;
 use adsum_detect::scratch::ScanScratch;
 use adsum_detect::server::ProcessServer;
-use adsum_detect::types::{Exec, ProcessEventListeners};
+use adsum_detect::types::{Exec, ProcessEventListeners, ScannedEntry};
 
 /// One-game custom database fixture for generation-swap tests.
 fn custom_db() -> Vec<DetectableActivity> {
@@ -100,7 +100,10 @@ fn remove_by_name_drops_the_generation_entry() {
 fn match_scratch_reuses_lowered_buffer() {
   let (tx, _rx) = adsum_telemetry::QueueGauge::pair();
   let server = ProcessServer::new_with_custom(
-    custom_db().into_iter().map(Arc::new).collect(),
+    custom_db()
+      .into_iter()
+      .map(|entry| Arc::new(ScannedEntry::from_owned(entry)))
+      .collect(),
     vec![],
     tx,
     ProcessEventListeners::default(),

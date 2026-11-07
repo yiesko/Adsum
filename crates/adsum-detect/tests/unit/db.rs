@@ -20,6 +20,76 @@ fn trim_parse_matches_the_value_path_on_the_bundled_db() {
   assert_paths_agree(BUNDLED_DETECTABLE);
 }
 
+/// Direct slim parsing decodes only scanner inputs and normalizes SKU
+/// ids (strings or numbers), including lowercase Epic ids.
+#[test]
+fn slim_parse_decodes_only_scanner_fields() {
+  let body = r#"[{
+    "id":"1","name":"G","hook":false,"description":"drop",
+    "aliases":["Alt"],
+    "executables":[{"name":"g.exe","os":"win32","is_launcher":false,"arguments":"--x"}],
+    "third_party_skus":[
+      {"distributor":"steam","id":99},
+      {"distributor":"xbox","id":"x"},
+      {"distributor":"epic","id":"B0CD075465C44F87BE3B505AC04A2E46"}
+    ]
+  }]"#;
+  let (parsed, label) = parse_slim_database(body).expect("slim body parses");
+  assert_eq!(label, "direct");
+  assert_eq!(parsed.len(), 1);
+  let entry = &parsed[0];
+  assert_eq!(entry.id.as_ref(), "1");
+  assert_eq!(entry.name.as_ref(), "G");
+  assert_eq!(
+    entry.aliases.iter().map(|s| s.as_ref()).collect::<Vec<_>>(),
+    ["Alt"]
+  );
+  assert_eq!(
+    entry
+      .steam_ids
+      .iter()
+      .map(|s| s.as_ref())
+      .collect::<Vec<_>>(),
+    ["99"]
+  );
+  assert_eq!(
+    entry
+      .epic_ids
+      .iter()
+      .map(|s| s.as_ref())
+      .collect::<Vec<_>>(),
+    ["b0cd075465c44f87be3b505ac04a2e46"]
+  );
+  assert_eq!(entry.executables[0].arguments.as_deref(), Some("--x"));
+}
+
+/// Slim canonical hashes ignore scanner-irrelevant fields, so no
+/// rebuild happens for volatile metadata churn.
+#[test]
+fn slim_hashes_ignore_ignored_field_churn() {
+  let body_a = r#"[{"id":"1","name":"G","hook":false,"description":"v1","executables":[],"third_party_skus":[],"aliases":[]}]"#;
+  let body_b = r#"[{"name":"G","aliases":[],"id":"1","description":"v2","hook":true,"third_party_skus":[],"executables":[]}]"#;
+  let parsed_a = parse_slim_database(body_a).expect("first body");
+  let parsed_b = parse_slim_database(body_b).expect("second body");
+  assert_ne!(body_hash(body_a), body_hash(body_b));
+  assert_eq!(
+    canonical_slim_content_hash(&parsed_a.0),
+    canonical_slim_content_hash(&parsed_b.0)
+  );
+}
+
+/// A lean body over the SKU cap is rejected before SKU filtering can
+/// hide the raw list size.
+#[test]
+fn slim_parse_enforces_the_sku_cap() {
+  let skus = (0..MAX_THIRD_PARTY_SKUS_PER_ENTRY + 1)
+    .map(|i| format!(r#"{{"distributor":"steam","id":"{i}"}}"#))
+    .collect::<Vec<_>>()
+    .join(",");
+  let body = format!(r#"[{{"id":"1","name":"G","third_party_skus":[{skus}]}}]"#);
+  assert!(parse_slim_database(&body).is_err());
+}
+
 /// A body that parses but breaks a structural cap is rejected, on both
 /// the direct and the trimmed path.
 ///

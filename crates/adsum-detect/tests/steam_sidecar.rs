@@ -21,7 +21,7 @@ use adsum_detect::db::DetectableActivity;
 use adsum_detect::refresh::RefreshConfig;
 use adsum_detect::scratch::ScanScratch;
 use adsum_detect::server::ProcessServer;
-use adsum_detect::types::{DetectSource, Exec, ProcessEventListeners};
+use adsum_detect::types::{DetectSource, Exec, ProcessEventListeners, ScannedEntry};
 
 /// Steam AppId of the game being updated (Garry's Mod).
 const APP_ID: &str = "4000";
@@ -54,6 +54,11 @@ fn helpers() -> impl Iterator<Item = &'static str> {
   adsum_detect::matching::STEAM_SIDECAR_BASENAMES
     .into_iter()
     .chain(UNLISTED_HELPERS.iter().copied())
+}
+
+/// Wrap a full fixture entry for the scanner's slim main list.
+fn scanned(entry: DetectableActivity) -> Arc<ScannedEntry> {
+  Arc::new(ScannedEntry::from_owned(entry))
 }
 
 /// A process as the scanner reads it: `argv[0]` plus the argument string
@@ -89,7 +94,7 @@ fn server() -> ProcessServer {
   }))
   .expect("fixture parses");
   ProcessServer::new_with_custom(
-    vec![Arc::new(entry)],
+    vec![scanned(entry)],
     vec![],
     tx,
     ProcessEventListeners::default(),
@@ -202,7 +207,7 @@ fn colliding_exe_server() -> ProcessServer {
   ]))
   .expect("fixture parses");
   ProcessServer::new_with_custom(
-    entries.into_iter().map(Arc::new).collect(),
+    entries.into_iter().map(scanned).collect(),
     vec![],
     tx,
     ProcessEventListeners::default(),
@@ -306,7 +311,7 @@ fn launcher_entry_server() -> ProcessServer {
   }))
   .expect("fixture parses");
   ProcessServer::new_with_custom(
-    vec![Arc::new(entry)],
+    vec![scanned(entry)],
     vec![],
     tx,
     ProcessEventListeners::default(),
@@ -397,7 +402,7 @@ fn portal_entry_server() -> ProcessServer {
   }))
   .expect("fixture parses");
   ProcessServer::new_with_custom(
-    vec![Arc::new(entry)],
+    vec![scanned(entry)],
     vec![],
     tx,
     ProcessEventListeners::default(),
@@ -480,7 +485,7 @@ fn portal_win32_entry_server() -> ProcessServer {
   }))
   .expect("fixture parses");
   ProcessServer::new_with_custom(
-    vec![Arc::new(entry)],
+    vec![scanned(entry)],
     vec![],
     tx,
     ProcessEventListeners::default(),
@@ -513,7 +518,7 @@ fn portal_entry_with_custom_override_server() -> ProcessServer {
   }))
   .expect("fixture parses");
   ProcessServer::new_with_custom(
-    vec![Arc::new(entry)],
+    vec![scanned(entry)],
     vec![custom],
     tx,
     ProcessEventListeners::default(),
@@ -605,7 +610,7 @@ fn bare_exe_win32_server(declared: &str) -> ProcessServer {
   }))
   .expect("fixture parses");
   ProcessServer::new_with_custom(
-    vec![Arc::new(entry)],
+    vec![scanned(entry)],
     vec![],
     tx,
     ProcessEventListeners::default(),
@@ -638,7 +643,7 @@ fn hoi4_server() -> ProcessServer {
   }))
   .expect("fixture parses");
   ProcessServer::new_with_custom(
-    vec![Arc::new(entry)],
+    vec![scanned(entry)],
     vec![],
     tx,
     ProcessEventListeners::default(),
@@ -759,7 +764,7 @@ fn an_entry_with_no_executables_stands_on_the_id_alone() {
   }))
   .expect("fixture parses");
   let server = ProcessServer::new_with_custom(
-    vec![Arc::new(entry)],
+    vec![scanned(entry)],
     vec![],
     tx,
     ProcessEventListeners::default(),
@@ -808,7 +813,7 @@ fn exe_only_server() -> ProcessServer {
   }))
   .expect("fixture parses");
   ProcessServer::new_with_custom(
-    vec![Arc::new(entry)],
+    vec![scanned(entry)],
     vec![],
     tx,
     ProcessEventListeners::default(),
@@ -928,7 +933,7 @@ fn wine_relative_target_resolves_through_match_process() {
   }))
   .expect("fixture parses");
   let server = ProcessServer::new_with_custom(
-    vec![Arc::new(entry)],
+    vec![scanned(entry)],
     vec![],
     tx,
     ProcessEventListeners::default(),

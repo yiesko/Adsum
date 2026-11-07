@@ -7,6 +7,7 @@
 use std::sync::{Arc, Mutex};
 
 use adsum_types::AppId;
+use serde::Deserialize;
 
 use crate::db::DetectableActivity;
 
@@ -208,13 +209,9 @@ impl OsName {
 }
 
 /// One database game as the scanner needs it: matching identity plus
-/// publish labels, nothing else. A full [`DetectableActivity`] carries
-/// ~30 mostly-`None` fields (`Option<String>` costs 24B even when empty),
-/// so storing 24k of them pins ~13MB; the slim form keeps under a third
-/// of that. Converted once per generation at build time from the full
-/// public struct (which stays the API and transport shape) — only
-/// Steam and Epic distributor SKUs survive the trip, since only those
-/// matchers read them.
+/// publish labels, nothing else. It decodes directly into this form,
+/// so scanner-irrelevant [`DetectableActivity`] fields are skipped
+/// before allocation. Only Steam and Epic distributor SKUs survive.
 #[derive(Clone, Debug)]
 pub struct ScannedEntry {
   /// Refcounted like the bridge's `ScannedGame.id`: the detection
@@ -238,7 +235,84 @@ pub struct ScannedEntry {
   pub aliases: Box<[Box<str>]>,
 }
 
+/// One executable in the lean decoding shape for [`ScannedEntryJson`].
+#[derive(Deserialize)]
+pub(crate) struct SlimExecutableJson {
+  pub is_launcher: bool,
+  pub name: String,
+  pub os: String,
+  pub arguments: Option<String>,
+}
+
+/// One third-party SKU in the lean decoding shape. IDs may be strings or
+/// numbers in source bodies, so decoding accepts both.
+#[derive(Deserialize)]
+pub(crate) struct SlimThirdPartySkuJson {
+  pub distributor: String,
+  pub id: Option<serde_json::Value>,
+}
+
+/// The lean shape every main database entry decodes into, before joining
+/// the scanner's [`ScannedEntry`] form. Scanner-irrelevant fields are
+/// skipped by Serde instead of being materialized.
+#[derive(Deserialize)]
+pub(crate) struct SlimEntryJson {
+  pub id: String,
+  pub name: String,
+  pub aliases: Option<Vec<String>>,
+  pub executables: Option<Vec<SlimExecutableJson>>,
+  pub third_party_skus: Option<Vec<SlimThirdPartySkuJson>>,
+}
+
 impl ScannedEntry {
+  /// Decodes one database entry directly into scanner form, without
+  /// materializing scanner-irrelevant fields. `Arc`/boxed strings move
+  /// into the result, so each source string converts exactly once.
+  pub(crate) fn from_slim_json(raw: SlimEntryJson) -> Self {
+    let mut steam_ids: Vec<Box<str>> = Vec::new();
+    let mut epic_ids: Vec<Box<str>> = Vec::new();
+    for sku in raw.third_party_skus.unwrap_or_default() {
+      let sku_id = match sku.id {
+        Some(serde_json::Value::String(id)) => id,
+        Some(serde_json::Value::Number(id)) => id.to_string(),
+        _ => continue,
+      };
+      if sku_id.is_empty() {
+        continue;
+      }
+      match sku.distributor.as_str() {
+        "steam" => steam_ids.push(sku_id.into_boxed_str()),
+        "epic" => epic_ids.push(sku_id.to_ascii_lowercase().into_boxed_str()),
+        _ => {}
+      }
+    }
+    Self {
+      id: AppId::from(raw.id),
+      name: Arc::from(raw.name),
+      executables: raw
+        .executables
+        .unwrap_or_default()
+        .into_iter()
+        .map(|exe| ScannedExe {
+          name: exe.name.into_boxed_str(),
+          os: OsName::from_string(exe.os),
+          is_launcher: exe.is_launcher,
+          arguments: exe.arguments.map(String::into_boxed_str),
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice(),
+      steam_ids: steam_ids.into_boxed_slice(),
+      epic_ids: epic_ids.into_boxed_slice(),
+      aliases: raw
+        .aliases
+        .unwrap_or_default()
+        .into_iter()
+        .map(String::into_boxed_str)
+        .collect::<Vec<_>>()
+        .into_boxed_slice(),
+    }
+  }
+
   /// Convert a full public entry to the slim scanner form (borrowing):
   /// used where the input is shared (`Arc` main list). See
   /// [`from_owned`](ScannedEntry::from_owned) for owned batches.

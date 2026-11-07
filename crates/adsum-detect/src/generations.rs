@@ -52,7 +52,7 @@ impl ProcessServer {
   /// input, failing build) report `false` so the refresh thread keeps its
   /// old validators and retries the data next hour instead of trusting
   /// tags for a bundle that was never installed.
-  pub(crate) fn update_main_detectables(&self, detectable: Vec<DetectableActivity>) -> bool {
+  pub(crate) fn update_main_detectables(&self, detectable: Vec<ScannedEntry>) -> bool {
     // Never swap in an empty database (outage returning `[]`, corrupt
     // fetch): it would build a failing automaton and blind detection.
     // Keep serving the current data instead.
@@ -68,14 +68,9 @@ impl ProcessServer {
     // Same writer serialization as `rebuild_custom`: appends landing in
     // this load->store window must not be discarded by the swap.
     let _writer = self.writer_lock.lock().unwrap_or_else(|e| e.into_inner());
-    // Move (not clone) into the slim form, then drop the input before
-    // the automata build below (~tens of MB of scratch): the fat structs
-    // must not ride along to the end of this function and double the
-    // rebuild peak.
-    let slim: Vec<Arc<ScannedEntry>> = detectable
-      .into_iter()
-      .map(|entry| Arc::new(ScannedEntry::from_owned(entry)))
-      .collect();
+    // Move (not clone) into the shared slim form before the automata
+    // build below, so the input cannot linger beside that build.
+    let slim: Vec<Arc<ScannedEntry>> = detectable.into_iter().map(Arc::new).collect();
     let detectable: Arc<[Arc<ScannedEntry>]> = slim.into();
     let custom = Arc::clone(&self.detectables.load().custom);
     let next = match build_bundle(detectable, custom) {

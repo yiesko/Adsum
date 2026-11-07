@@ -5,8 +5,9 @@ use std::time::Duration;
 
 use adsum_protocol::error::AdsumError;
 
-use crate::db::{DetectableActivity, Exclusions, body_hash, parse_exclusions};
+use crate::db::{Exclusions, body_hash, parse_exclusions, parse_slim_database};
 use crate::server::ProcessServer;
+use crate::types::ScannedEntry;
 
 /// HTTP agent with a global timeout: without it, a blackholed endpoint
 /// hangs the hourly refresh thread forever.
@@ -46,7 +47,7 @@ pub enum FetchOutcome {
     etag: Option<String>,
     content_hash: u64,
     trimmed_hash: u64,
-    detectable: Vec<DetectableActivity>,
+    detectable: Vec<ScannedEntry>,
   },
 }
 
@@ -111,17 +112,13 @@ pub fn fetch_detectable_etag(
     });
   }
 
-  // Direct parse first: serde skips unknown fields, so the full body
-  // parses with zero DOM overhead (~5x less transient memory than the
-  // trimmed-Value pass). The trimming pass stays as fallback for entries
-  // missing required fields (it defaults them). The first error is
-  // reused below: re-parsing the same body a third time just to produce
-  // an identical error would double the failure cost for nothing.
-  let (parsed, _which_shape) = crate::db::parse_database(&body)?;
+  // Direct slim parse first: Serde skips scanner-irrelevant fields,
+  // so the full body never materializes full activities. Bodies that
+  // need defaults use the shared trim fallback, then convert once.
+  let (parsed, _which_shape) = parse_slim_database(&body)?;
   // The raw body has served its purposes (raw hash above, parse input
-  // here): drop its ~13MB BEFORE the canonical hash and the automata
-  // build below, instead of letting it ride along to the end of this
-  // function and inflating the rebuild peak.
+  // here): drop it before the canonical hash and the automata build
+  // below, instead of letting it ride along and inflating the peak.
   drop(body);
   finish_fetch(etag, content_hash, known_trimmed, parsed)
 }
@@ -135,9 +132,9 @@ fn finish_fetch(
   etag: Option<String>,
   content_hash: u64,
   known_trimmed: Option<u64>,
-  detectable: Vec<DetectableActivity>,
+  detectable: Vec<ScannedEntry>,
 ) -> adsum_protocol::error::Result<FetchOutcome> {
-  let trimmed_hash = crate::db::canonical_content_hash(&detectable);
+  let trimmed_hash = crate::db::canonical_slim_content_hash(&detectable);
   if known_trimmed.is_some_and(|known| known == trimmed_hash) {
     return Ok(FetchOutcome::SameContent {
       etag,

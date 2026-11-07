@@ -1,7 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use adsum_core::{Daemon, RPCConfig};
-use adsum_detect::db::{DetectableActivity, content_hashes};
+use adsum_detect::db::{DetectableActivity, content_hashes_slim, parse_slim_database};
 use clap::Parser;
 use std::path::PathBuf;
 
@@ -327,12 +327,12 @@ fn daemon_from_fetched(
   // string to `from_json_str` would parse the ~5MB body twice for zero
   // new information (double transient memory at boot). The trimmed
   // fallback goes straight from Value (no String round-trip).
-  match adsum_detect::db::parse_database(&detectable) {
+  match parse_slim_database(&detectable) {
     Ok((parsed, shape)) => {
       // Seed the hourly guard with this body: the first refresh check can
       // then skip the parse/rebuild exactly like later checks, instead of
       // one guaranteed redundant rebuild per boot.
-      config.initial_db_content_hash = Some(content_hashes(&detectable, &parsed));
+      config.initial_db_content_hash = Some(content_hashes_slim(&detectable, &parsed));
       // The parser names the shape it decoded; boot reports it on the
       // inventory line. It only ever returns these two.
       let label = match shape {

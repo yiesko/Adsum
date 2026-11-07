@@ -1,13 +1,14 @@
 //! Database loading and one-shot diagnostics.
 //!
-//! Parsing prefers the direct struct decode (zero DOM); bodies whose
-//! entries miss required fields fall back through the trimmed projection.
-//! Callers that already hold a parsed `Vec` skip both via
-//! [`Daemon::from_parsed`][crate::daemon::Daemon::from_parsed].
+//! Parsing prefers the direct slim decode (zero DOM); bodies whose
+//! entries need defaults fall back through the trimmed projection.
+//! The daemon holds only these slim entries, so startup never retains
+//! scanner-irrelevant database fields.
 
 use std::sync::Arc;
 
-use adsum_detect::db::{self, DetectableActivity};
+use adsum_detect::db;
+use adsum_detect::types::ScannedEntry;
 use adsum_protocol::error::{AdsumError, Result};
 
 /// Minimal game info returned by one-shot scans.
@@ -44,10 +45,10 @@ pub struct DetectableSummary {
 /// or a structural-limit error when the body decodes past a cap.
 ///
 /// The label says which shape decoded (`direct` or `trimmed`); the parse
-/// itself is [`adsum_detect::db::parse_database`], shared with the hourly
+/// itself is [`adsum_detect::db::parse_slim_database`], shared with the hourly
 /// refresh so a cap holds on both.
-pub fn parse_body(body: &str) -> Result<(Vec<DetectableActivity>, &'static str)> {
-  db::parse_database(body)
+pub fn parse_body(body: &str) -> Result<(Vec<ScannedEntry>, &'static str)> {
+  db::parse_slim_database(body)
 }
 
 /// Read a database file, then [`parse_body`].
@@ -56,7 +57,7 @@ pub fn parse_body(body: &str) -> Result<(Vec<DetectableActivity>, &'static str)>
 ///
 /// [`AdsumError::UnreadableFile`] when the file is missing or unreadable,
 /// `InvalidJson` when it does not parse.
-pub fn load_file(path: &std::path::Path) -> Result<Vec<DetectableActivity>> {
+pub fn load_file(path: &std::path::Path) -> Result<Vec<ScannedEntry>> {
   let body = std::fs::read_to_string(path).map_err(|source| AdsumError::UnreadableFile {
     path: path.to_path_buf(),
     source,
@@ -71,19 +72,19 @@ pub fn load_file(path: &std::path::Path) -> Result<Vec<DetectableActivity>> {
 /// # Errors
 ///
 /// See [`parse_body`].
-pub fn load_bundled() -> Result<Vec<DetectableActivity>> {
+pub fn load_bundled() -> Result<Vec<ScannedEntry>> {
   Ok(parse_body(db::BUNDLED_DETECTABLE)?.0)
 }
 
 /// Summarize a held database (entry count, executable counts, names).
 #[must_use]
-pub fn summarize(detectable: &[Arc<DetectableActivity>]) -> Vec<DetectableSummary> {
+pub fn summarize(detectable: &[Arc<ScannedEntry>]) -> Vec<DetectableSummary> {
   detectable
     .iter()
     .map(|entry| DetectableSummary {
-      id: entry.id.clone(),
-      name: entry.name.clone(),
-      executables: entry.executables.as_ref().map(Vec::len).unwrap_or(0),
+      id: entry.id.to_string(),
+      name: entry.name.to_string(),
+      executables: entry.executables.len(),
     })
     .collect()
 }

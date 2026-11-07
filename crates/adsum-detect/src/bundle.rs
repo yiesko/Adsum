@@ -661,27 +661,12 @@ fn normalize_exe_pattern(name: &str) -> String {
 /// Build the initial detection generation, folding `custom` overrides
 /// in: one automaton construction per boot instead of build-then-rebuild.
 pub(crate) fn initial_bundle(
-  detectable: Vec<Arc<DetectableActivity>>,
+  detectable: Vec<Arc<ScannedEntry>>,
   custom: Vec<DetectableActivity>,
 ) -> Arc<DetectablesBundle> {
   tracing::info!(
     "[Process Scanner] Building Aho-Corasick patterns for main detectable activities..."
   );
-  // Convert both sides straight to the slim scanner form: no
-  // intermediate `Vec<Arc>` of full entries (24k Arcs built just to be
-  // re-walked and dropped).
-  let slim = |list: Vec<Arc<DetectableActivity>>| {
-    list
-      .into_iter()
-      .map(|entry| {
-        let scanned = match Arc::try_unwrap(entry) {
-          Ok(activity) => ScannedEntry::from_owned(activity),
-          Err(shared) => ScannedEntry::from_activity(&shared),
-        };
-        Arc::new(scanned)
-      })
-      .collect::<Vec<_>>()
-  };
   let custom: Vec<Arc<ScannedEntry>> = custom
     .into_iter()
     .map(|entry| Arc::new(ScannedEntry::from_owned(entry)))
@@ -689,7 +674,7 @@ pub(crate) fn initial_bundle(
   // Boxed once, here: everything downstream (the stored bundle plus every
   // rebuild that carries the main list unchanged) clones a refcount
   // instead of walking ~24k entries.
-  let detectable: Arc<[Arc<ScannedEntry>]> = slim(detectable).into();
+  let detectable: Arc<[Arc<ScannedEntry>]> = detectable.into();
   let custom: Arc<[Arc<ScannedEntry>]> = custom.into();
   let bundle = Arc::new(build_bundle(detectable, custom).unwrap_or_else(|e| {
     tracing::warn!(

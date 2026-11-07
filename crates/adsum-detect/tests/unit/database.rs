@@ -37,7 +37,9 @@ fn activity(id: &str) -> DetectableActivity {
 fn custom_rebuild_shares_the_main_list() {
   let server = server();
   // Seed a real main list, not the empty one `server()` builds.
-  let main: Vec<DetectableActivity> = (0..64).map(|i| activity(&i.to_string())).collect();
+  let main: Vec<ScannedEntry> = (0..64)
+    .map(|i| ScannedEntry::from_owned(activity(&i.to_string())))
+    .collect();
   server.update_main_detectables(main);
 
   let before = server.detectables.load();
@@ -65,7 +67,9 @@ fn custom_rebuild_shares_the_main_list() {
 #[test]
 fn remove_override_keeps_sharing_the_main_list() {
   let server = server();
-  let main: Vec<DetectableActivity> = (0..8).map(|i| activity(&i.to_string())).collect();
+  let main: Vec<ScannedEntry> = (0..8)
+    .map(|i| ScannedEntry::from_owned(activity(&i.to_string())))
+    .collect();
   server.update_main_detectables(main);
   server.append_detectables(vec![activity("custom-x")]);
 

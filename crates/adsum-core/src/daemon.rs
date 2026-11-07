@@ -16,7 +16,7 @@ use adsum_detect::db::DetectableActivity;
 use adsum_detect::refresh::RefreshConfig;
 use adsum_detect::runtime::ShutdownHandle;
 use adsum_detect::server::ProcessServer;
-use adsum_detect::types::{ProcessCallback, ProcessEventListeners, ProcessScanState};
+use adsum_detect::types::{ProcessCallback, ProcessEventListeners, ProcessScanState, ScannedEntry};
 use adsum_oauth::OAuthManager;
 use adsum_protocol::error::{AdsumError, Result};
 use adsum_telemetry::QueueGauge;
@@ -35,7 +35,7 @@ const PROC_CHANNEL_BOUND: usize = 512;
 
 /// The daemon: parsed database plus staged overrides, pre-run.
 pub struct Daemon {
-  detectable: Vec<Arc<DetectableActivity>>,
+  detectable: Vec<Arc<ScannedEntry>>,
   config: RPCConfig,
   staged_overrides: Vec<DetectableActivity>,
   on_scan_complete: Option<Arc<Mutex<ProcessCallback>>>,
@@ -63,7 +63,7 @@ struct ServeParams {
 impl Daemon {
   /// Create from already-parsed activities (infallible).
   #[must_use]
-  pub fn from_parsed(detectable: Vec<DetectableActivity>, config: RPCConfig) -> Self {
+  pub fn from_parsed(detectable: Vec<ScannedEntry>, config: RPCConfig) -> Self {
     let detectable = detectable.into_iter().map(Arc::new).collect();
     Self {
       detectable,
@@ -215,10 +215,9 @@ impl Daemon {
     let user = Arc::new(Mutex::new(RpcUser::from_env()));
     log_persisted_grants();
 
-    // Move (never clone) the database into the scanner build: the fat
-    // structs convert once to the slim form and drop. Cloning here would
-    // pin a second ~25MB generation beside the scanner's, and retaining
-    // it afterwards would pin it for the daemon lifetime.
+    // Move (never clone) the database into the scanner build: it is
+    // already scanner-only, so no second full generation is pinned
+    // beside the scanner's bundle for the daemon lifetime.
     let db = std::mem::take(&mut self.detectable);
     let staged = std::mem::take(&mut self.staged_overrides);
 
@@ -447,7 +446,7 @@ impl Daemon {
   /// cadence would hot-spin the scan loop): checked before the build.
   async fn start_scanner(
     &self,
-    db: Vec<Arc<DetectableActivity>>,
+    db: Vec<Arc<ScannedEntry>>,
     staged: Vec<DetectableActivity>,
   ) -> Result<(
     Option<ProcessServer>,

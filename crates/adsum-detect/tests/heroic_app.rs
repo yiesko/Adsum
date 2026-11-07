@@ -6,7 +6,7 @@ use adsum_detect::db::DetectableActivity;
 use adsum_detect::refresh::RefreshConfig;
 use adsum_detect::scratch::ScanScratch;
 use adsum_detect::server::ProcessServer;
-use adsum_detect::types::{DetectSource, Exec, ProcessEventListeners, ScannedHit};
+use adsum_detect::types::{DetectSource, Exec, ProcessEventListeners, ScannedEntry, ScannedHit};
 
 /// Heroic's app name for GTA V Enhanced (the `-epicapp` value).
 const APP_NAME: &str = "8769e24080ea413b8ebca3f1b8c50951";
@@ -26,18 +26,18 @@ const UNKNOWN_NAMESPACE: &str = "00000000000000000000000000000000";
 
 /// The fixture entries, both declaring the same executable so the app-name
 /// mapping can only lose to the sandbox id by precedence, not by a miss.
-fn gta_db() -> Vec<Arc<DetectableActivity>> {
+fn gta_db() -> Vec<Arc<ScannedEntry>> {
   vec![
-    Arc::new(activity(
+    Arc::new(ScannedEntry::from_owned(activity(
       GTA_ID,
       "Grand Theft Auto V Enhanced",
       "B0CD075465C44F87BE3B505AC04A2E46",
-    )),
-    Arc::new(activity(
+    ))),
+    Arc::new(ScannedEntry::from_owned(activity(
       SECOND_ID,
       "Grand Theft Auto V Enhanced (second entry)",
       "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
-    )),
+    ))),
   ]
 }
 

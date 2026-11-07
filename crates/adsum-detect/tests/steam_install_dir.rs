@@ -11,7 +11,7 @@ use adsum_detect::db::{DetectableActivity, parse_exclusions};
 use adsum_detect::refresh::RefreshConfig;
 use adsum_detect::scratch::ScanScratch;
 use adsum_detect::server::ProcessServer;
-use adsum_detect::types::{DetectSource, Exec, ProcessEventListeners};
+use adsum_detect::types::{DetectSource, Exec, ProcessEventListeners, ScannedEntry};
 use adsum_steam::SteamLibraries;
 
 /// Nonexistent pid: `/proc` reads fail, so tests never inherit a
@@ -123,7 +123,10 @@ fn launcher_entry() -> DetectableActivity {
 fn server(entries: Vec<DetectableActivity>) -> ProcessServer {
   let (tx, _rx) = adsum_telemetry::QueueGauge::pair();
   ProcessServer::new_with_custom(
-    entries.into_iter().map(Arc::new).collect(),
+    entries
+      .into_iter()
+      .map(|entry| Arc::new(ScannedEntry::from_owned(entry)))
+      .collect(),
     vec![],
     tx,
     ProcessEventListeners::default(),

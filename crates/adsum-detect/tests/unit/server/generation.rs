@@ -32,7 +32,7 @@ fn refused_bundle_swap_reports_failure() {
   // of trusting tags for a bundle that was never installed).
   let server = fixture_server();
   assert!(!server.update_main_detectables(vec![]));
-  assert!(server.update_main_detectables(vec![custom_entry()]));
+  assert!(server.update_main_detectables(vec![ScannedEntry::from_owned(custom_entry())]));
 }
 
 /// Concurrent appends and refreshes lose neither side (writer lock).

@@ -22,7 +22,7 @@ use crate::db::{DetectableActivity, Exclusions};
 use crate::heroic::HeroicApps;
 use crate::platform::memory::release_parse_arenas;
 use crate::refresh::RefreshConfig;
-use crate::types::{ProcessDetectedEvent, ProcessEventListeners};
+use crate::types::{ProcessDetectedEvent, ProcessEventListeners, ScannedEntry};
 
 // 0.36.1 paths kept working after the module split: these items now
 // live in `runtime`, re-exported here so existing imports keep building.
@@ -211,7 +211,7 @@ impl ProcessServer {
   /// diagnostics) use this so staged overrides never cost a second full
   /// build per boot.
   pub fn new_with_custom(
-    detectable: Vec<Arc<DetectableActivity>>,
+    detectable: Vec<Arc<ScannedEntry>>,
     custom: Vec<DetectableActivity>,
     event_sender: adsum_telemetry::GaugeSender<ProcessDetectedEvent>,
     event_listeners: ProcessEventListeners,

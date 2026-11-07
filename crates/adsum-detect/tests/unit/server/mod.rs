@@ -41,16 +41,18 @@ fn custom_entry_named(id: &str) -> DetectableActivity {
 
 /// A wide main database: widens the refresh's load->store window so a
 /// concurrent append is actually likely to land inside it.
-fn main_entries(count: usize) -> Vec<DetectableActivity> {
+fn main_entries(count: usize) -> Vec<ScannedEntry> {
   (0..count)
     .map(|i| {
-      serde_json::from_value(serde_json::json!({
-        "id": format!("main-{i}"),
-        "name": format!("Main {i}"),
-        "hook": true,
-        "executables": [{"name": format!("main-{i}.exe"), "is_launcher": false, "os": "win32"}],
-      }))
-      .expect("fixture parses")
+      ScannedEntry::from_owned(
+        serde_json::from_value(serde_json::json!({
+          "id": format!("main-{i}"),
+          "name": format!("Main {i}"),
+          "hook": true,
+          "executables": [{"name": format!("main-{i}.exe"), "is_launcher": false, "os": "win32"}],
+        }))
+        .expect("fixture parses"),
+      )
     })
     .collect()
 }

@@ -11,11 +11,11 @@ fn parse_body_prefers_direct_and_labels() {
 /// Trimmed-name fallback still classifies when direct misses.
 #[test]
 fn parse_body_falls_back_through_trim() {
-  // Missing `hook` (required without default): direct parse fails, the
-  // trimmed projection defaults it.
-  let (parsed, label) = parse_body(r#"[{"id":"1","name":"G"}]"#).unwrap();
+  // Missing `id`: the lean direct decode needs it, so the trimmed
+  // projection defaults it before converting.
+  let (parsed, label) = parse_body(r#"[{"name":"G"}]"#).unwrap();
   assert_eq!(label, "trimmed");
-  assert_eq!(parsed[0].name, "G");
+  assert_eq!(parsed[0].name.as_ref(), "G");
 }
 
 /// Garbage bodies classify to nothing (never panic).
@@ -27,5 +27,8 @@ fn parse_body_rejects_garbage() {
 /// The bundled snapshot loads and parses end to end.
 #[test]
 fn bundled_loads() {
-  assert!(!load_bundled().expect("bundled snapshot parses").is_empty());
+  let loaded = load_bundled().expect("bundled snapshot parses");
+  assert!(!loaded.is_empty());
+  assert_eq!(loaded[0].name.len().min(1), 1);
+  assert!(loaded.iter().all(|entry| !entry.id.as_ref().is_empty()));
 }
