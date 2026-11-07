@@ -279,12 +279,17 @@ fn handle_rpc_command_with_context(
 
       // Resolve an access token plus the refresh token to persist (if any):
       // - both tokens supplied: validate the access token, store the refresh
-      //   token for future restarts (secret not required to store it);
+      //   token for future restarts only when a client secret is configured;
       // - only a refresh token: exchange it now, which needs the secret;
       // - neither: try to restore the stored session from disk, so a game
       //   that authenticated once never needs the browser flow again.
       let (token, rotated_refresh) = match (provided_access, provided_refresh) {
-        (Some(access), refresh) => (access.to_owned(), refresh.map(str::to_owned)),
+        (Some(access), refresh) => (
+          access.to_owned(),
+          refresh
+            .filter(|_| store::client_secret().is_some())
+            .map(str::to_owned),
+        ),
         (None, Some(rt)) => {
           let Some(_secret) = store::client_secret() else {
             return Err(OAuthError::ClientSecretRequired);
@@ -294,7 +299,16 @@ fn handle_rpc_command_with_context(
             authenticate::refresh_access_token(rt, expected_client_id)?;
           // Discord invalidates `rt` as soon as the exchange succeeds, so a
           // rotated token is persisted before the access token is validated.
-          save_rotated(expected_client_id, new_refresh.as_deref(), Vec::new(), 0);
+          let previous = store::load(expected_client_id);
+          save_rotated(
+            expected_client_id,
+            new_refresh.as_deref(),
+            previous
+              .as_ref()
+              .map(|p| p.scopes.clone())
+              .unwrap_or_default(),
+            previous.as_ref().map_or(0, |p| p.expires),
+          );
           (new_access, new_refresh.or_else(|| Some(rt.to_owned())))
         }
         (None, None) => {

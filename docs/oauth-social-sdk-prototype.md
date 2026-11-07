@@ -65,11 +65,12 @@ connect query: `/?v=1&encoding=json&client_id=YOUR_APPLICATION_ID`.
   off by default to preserve Adsum's pre-existing Rich Presence compatibility
   and Social SDK's unauthenticated RPC presence path.
 
-The session is not a general Discord API client. It does not keep the token
-needed to call guild, channel, message or relationship endpoints. Those RPC
-commands remain explicitly unsupported rather than returning fabricated
-success responses. `GET_GUILDS` is the one token-backed command Adsum
-implements (proxied to `GET /users/@me/guilds` under the `guilds` scope).
+The session is not a general Discord API client: Adsum keeps the access
+token in memory but does not expose guild, channel, message or relationship
+endpoints. Those RPC commands remain explicitly unsupported rather than
+returning fabricated success responses. `GET_GUILDS` is the one
+token-backed command Adsum implements (proxied to `GET /users/@me/guilds`
+under the `guilds` scope).
 `GET_GUILD`, `GET_CHANNELS` and `GET_CHANNEL` stay unsupported: Discord's
 REST endpoints for those reject user OAuth tokens, and the live answers come
 from the desktop client's own state.

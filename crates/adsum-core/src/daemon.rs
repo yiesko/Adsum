@@ -383,23 +383,26 @@ impl Daemon {
     pump: Option<std::thread::JoinHandle<()>>,
   ) {
     if let Some(scanner) = scanner {
-      scanner.shutdown();
-      let timed_out = scanner.join(Duration::from_secs(5));
-      if timed_out > 0 {
-        tracing::warn!(
-          "[daemon] {timed_out} scanner worker(s) did not exit within the shutdown deadline"
-        );
-      }
-      drop(scanner);
-      if let Some(pump) = pump {
-        match join_with_timeout(pump, Duration::from_secs(5)) {
-          Ok(()) => {}
-          Err(err) => {
-            tracing::warn!(
-              "[daemon] scanner pump thread did not exit within the shutdown deadline: {err}"
-            );
-          }
+      let joined = tokio::task::spawn_blocking(move || {
+        scanner.shutdown();
+        let timed_out = scanner.join(Duration::from_secs(5));
+        if timed_out > 0 {
+          tracing::warn!(
+            "[daemon] {timed_out} scanner worker(s) did not exit within the shutdown deadline"
+          );
         }
+        drop(scanner);
+        if let Some(pump) = pump
+          && let Err(err) = join_with_timeout(pump, Duration::from_secs(5))
+        {
+          tracing::warn!(
+            "[daemon] scanner pump thread did not exit within the shutdown deadline: {err}"
+          );
+        }
+      })
+      .await;
+      if joined.is_err() {
+        tracing::warn!("[daemon] scanner teardown task failed");
       }
     }
   }

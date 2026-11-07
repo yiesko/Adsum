@@ -50,6 +50,7 @@ fn store_dir() -> Option<PathBuf> {
   let base = std::env::var("XDG_CACHE_HOME")
     .ok()
     .map(PathBuf::from)
+    .filter(|path| path.is_absolute())
     .or_else(home_cache)?;
   Some(base.join("adsum").join("oauth"))
 }
@@ -98,7 +99,7 @@ pub fn save(session: &PersistedSession) -> std::io::Result<()> {
   let tmp = path.with_extension(format!("json.tmp.{}.{seq}", std::process::id()));
   {
     let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true).truncate(true);
     #[cfg(unix)]
     {
       use std::os::unix::fs::OpenOptionsExt;

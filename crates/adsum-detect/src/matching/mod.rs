@@ -237,25 +237,23 @@ pub(crate) fn first_hit_naming_path(
 pub(crate) fn arguments_contain_whole_word(args: Option<&str>, required: &str) -> bool {
   // Nothing declared means nothing to require (parity with the old
   // `contains("")` behaviour an empty database field had).
-  if required.is_empty() {
+  if required.trim().is_empty() {
     return true;
   }
   let Some(args) = args else {
     return false;
   };
-  let bytes = args.as_bytes();
-  let mut start = 0;
-  while let Some(at) = args[start..].find(required) {
-    let at = start + at;
-    let end = at + required.len();
-    let before_ok = at == 0 || bytes[at - 1] == b' ';
-    let after_ok = end == bytes.len() || bytes[end] == b' ';
-    if before_ok && after_ok {
-      return true;
-    }
-    start = end.max(at + 1);
+  // Token-based comparison: collapses runs of ASCII whitespace (including
+  // empty argv entries that the reader joins with multiple spaces) so a
+  // required multi-token sequence matches regardless of spacing.
+  let required: Vec<&str> = required.split_ascii_whitespace().collect();
+  if required.is_empty() {
+    return true;
   }
-  false
+  let tokens: Vec<&str> = args.split_ascii_whitespace().collect();
+  tokens
+    .windows(required.len())
+    .any(|window| window == required.as_slice())
 }
 
 impl ProcessServer {
@@ -476,10 +474,13 @@ impl ProcessServer {
         crate::resolver::resolve_wine_chain(process)
       }
       name if name.eq_ignore_ascii_case("reaper") => crate::resolver::resolve_steam_reaper(process)
-        .map(|(_, idx)| crate::resolver::ResolvedTarget {
-          path: process.argument_at(idx.saturating_sub(1)).unwrap_or(""),
-          argument_start: idx,
-          is_windows_binary: false,
+        .and_then(|(_, idx)| {
+          let path = process.argument_at(idx.checked_sub(1)?)?;
+          (!path.is_empty()).then_some(crate::resolver::ResolvedTarget {
+            path,
+            argument_start: idx,
+            is_windows_binary: false,
+          })
         }),
       _ => None,
     }

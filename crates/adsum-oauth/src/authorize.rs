@@ -177,7 +177,7 @@ pub(crate) fn parse_loopback_redirect(value: &str) -> Result<CallbackTarget, OAu
     return Err(OAuthError::InvalidRedirect);
   }
   // Avoid colliding with Adsum's own listener ports.
-  if (6463..=6472).contains(&port) || port == 1337 || port == 1338 {
+  if (6463..=6472).contains(&port) || (1337..=1348).contains(&port) {
     return Err(OAuthError::InvalidRedirect);
   }
   Ok(CallbackTarget {

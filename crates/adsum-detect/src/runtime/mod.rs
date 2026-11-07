@@ -118,8 +118,10 @@ impl ProcessServer {
         .unwrap_or_else(|e| e.into_inner()),
     );
     let mut timed_out = 0u32;
+    let deadline = std::time::Instant::now() + timeout;
     for handle in handles {
-      match join_with_timeout(handle, timeout) {
+      let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+      match join_with_timeout(handle, remaining) {
         Ok(()) => {}
         Err(_) => {
           timed_out += 1;
@@ -135,17 +137,27 @@ impl ProcessServer {
 /// so the caller can bound the wait instead of blocking indefinitely — a
 /// wedged worker must not hold the shutdown past the systemd deadline.
 fn join_with_timeout(handle: std::thread::JoinHandle<()>, timeout: Duration) -> io::Result<()> {
+  if handle.is_finished() {
+    if handle.join().is_err() {
+      tracing::warn!("[Process Scanner] worker thread panicked");
+    }
+    return Ok(());
+  }
   let (tx, rx) = std::sync::mpsc::channel();
   let _waiter = std::thread::spawn(move || {
-    let _ = handle.join();
-    let _ = tx.send(());
+    let panicked = handle.join().is_err();
+    let _ = tx.send(panicked);
   });
-  rx.recv_timeout(timeout).map_err(|err| {
+  let panicked = rx.recv_timeout(timeout).map_err(|err| {
     io::Error::new(
       io::ErrorKind::TimedOut,
       format!("thread join timed out: {err}"),
     )
-  })
+  })?;
+  if panicked {
+    tracing::warn!("[Process Scanner] worker thread panicked");
+  }
+  Ok(())
 }
 
 impl ProcessServer {

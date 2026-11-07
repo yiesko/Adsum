@@ -82,6 +82,8 @@ pub(crate) fn authenticate_with_context(
   if !session.scopes.iter().any(|scope| scope == "identify") {
     data["user"] = Value::Null;
   }
+  // Never echo the bearer token back to the caller.
+  data["access_token"] = Value::Null;
   Ok((data, session))
 }
 

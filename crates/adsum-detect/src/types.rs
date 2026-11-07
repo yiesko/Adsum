@@ -30,9 +30,10 @@ pub struct Exec {
 
 impl Exec {
   /// Returns the argument at `index` (zero-based, after argv[0]),
-  /// borrowed from the slot's own buffer. Empty argv entries (NUL
-  /// padding, e.g. from Wine) collapse because the reader joins tokens
-  /// with a single space.
+  /// borrowed from the slot's own buffer. Tokens are split on ASCII
+  /// whitespace, so argv entries containing spaces cannot be recovered
+  /// (the reader joins argv with a single space); treat as a best-effort
+  /// view, not a faithful argv reconstruction.
   pub(crate) fn argument_at(&self, index: usize) -> Option<&str> {
     self
       .arguments
@@ -41,16 +42,15 @@ impl Exec {
       .nth(index)
   }
 
-  /// Whether the contiguous token sequence starting at `start` matches
-  /// `required` token-by-token, without allocation.
   /// Borrow the argument string starting at token `start`, preserving the
   /// remaining tokens (and their separating spaces) without allocation.
   pub fn arguments_from(&self, start: usize) -> Option<&str> {
     let storage = self.arguments.as_deref()?;
+    let bytes = storage.as_bytes();
     let mut pos = 0usize;
     let mut count = 0usize;
     while pos < storage.len() {
-      while pos < storage.len() && storage.as_bytes()[pos] == b' ' {
+      while pos < storage.len() && bytes[pos].is_ascii_whitespace() {
         pos += 1;
       }
       if pos >= storage.len() {
@@ -59,7 +59,7 @@ impl Exec {
       if count == start {
         return Some(&storage[pos..]);
       }
-      while pos < storage.len() && storage.as_bytes()[pos] != b' ' {
+      while pos < storage.len() && !bytes[pos].is_ascii_whitespace() {
         pos += 1;
       }
       count += 1;
@@ -67,6 +67,8 @@ impl Exec {
     None
   }
 
+  /// Whether the contiguous token sequence starting at `start` matches
+  /// `required` token-by-token, without allocation.
   pub(crate) fn has_argument_sequence(&self, start: usize, required: &str) -> bool {
     for (offset, expected) in required.split_ascii_whitespace().enumerate() {
       match self.argument_at(start + offset) {

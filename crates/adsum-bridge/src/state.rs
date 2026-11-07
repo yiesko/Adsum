@@ -145,6 +145,14 @@ pub fn select_slot(dir: &Path, now_secs: u64) -> Option<PathBuf> {
 /// [`select_slot`] with the prefix supplied by the caller (unit-testable
 /// without process-global environment mutation).
 pub fn select_slot_with_prefix(dir: &Path, now_secs: u64, prefix: &str) -> Option<PathBuf> {
+  if prefix.is_empty()
+    || prefix.len() > 64
+    || !prefix
+      .bytes()
+      .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+  {
+    return None;
+  }
   sweep_stale_tmps(dir, now_secs, prefix);
   for index in 0..MAX_STATE_SLOTS {
     let path = dir.join(format!("{prefix}{index}"));

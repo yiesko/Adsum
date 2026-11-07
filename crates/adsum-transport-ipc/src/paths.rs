@@ -574,15 +574,27 @@ fn validate_real_dir_chain(
     let facts = if is_final {
       facts_of(&current)?
     } else {
-      let meta =
-        std::fs::metadata(&current).map_err(|err| invalid_path(&current, &format!("{err}")))?;
-      if !meta.file_type().is_dir() {
-        return Err(invalid_path(&current, "not a real directory"));
-      }
-      Facts {
-        uid: meta.uid(),
-        mode: meta.mode(),
-        mnt_id: None,
+      let link = std::fs::symlink_metadata(&current)
+        .map_err(|err| invalid_path(&current, &format!("{err}")))?;
+      if link.file_type().is_symlink() {
+        if link.uid() != 0 && link.uid() != euid {
+          return Err(invalid_path(
+            &current,
+            "symlink not owned by root or the effective uid",
+          ));
+        }
+        let meta =
+          std::fs::metadata(&current).map_err(|err| invalid_path(&current, &format!("{err}")))?;
+        if !meta.file_type().is_dir() {
+          return Err(invalid_path(&current, "not a real directory"));
+        }
+        Facts {
+          uid: meta.uid(),
+          mode: meta.mode(),
+          mnt_id: None,
+        }
+      } else {
+        facts_of(&current)?
       }
     };
     if facts.mode & MODE_TYPE_MASK != MODE_DIRECTORY {

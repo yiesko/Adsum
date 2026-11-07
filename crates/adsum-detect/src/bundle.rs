@@ -494,12 +494,11 @@ fn collect_split_patterns(detectables: &[Arc<ScannedEntry>]) -> SplitPatterns {
         continue;
       }
       if native {
-        split.native_patterns.push(pattern.clone());
+        split.native_patterns.push(pattern);
         split
           .native_idx
           .push(pattern_index(activity_index, exe_index));
-      }
-      if proton {
+      } else if proton {
         split.proton_patterns.push(pattern);
         split
           .proton_idx

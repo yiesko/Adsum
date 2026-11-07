@@ -15,27 +15,28 @@ fn basename(path: &str) -> Option<&str> {
 
 /// Whether `name` is a Wine loader that should be skipped in a chain.
 fn is_wine_loader(name: &str) -> bool {
-  matches!(
-    name.to_ascii_lowercase().as_str(),
-    "wine" | "wine64" | "wine-preloader" | "wine64-preloader"
-  )
+  name.eq_ignore_ascii_case("wine")
+    || name.eq_ignore_ascii_case("wine64")
+    || name.eq_ignore_ascii_case("wine-preloader")
+    || name.eq_ignore_ascii_case("wine64-preloader")
 }
 
 /// Whether `name` is one of the recognised emulators or Wine loaders.
 fn is_emulator_or_loader(name: &str) -> bool {
-  matches!(
-    name.to_ascii_lowercase().as_str(),
-    "box64"
-      | "fex"
-      | "fexinterpreter"
-      | "fexloader"
-      | "qemu-x86_64"
-      | "qemu-x86_64-static"
-      | "wine"
-      | "wine64"
-      | "wine-preloader"
-      | "wine64-preloader"
-  )
+  [
+    "box64",
+    "fex",
+    "fexinterpreter",
+    "fexloader",
+    "qemu-x86_64",
+    "qemu-x86_64-static",
+    "wine",
+    "wine64",
+    "wine-preloader",
+    "wine64-preloader",
+  ]
+  .iter()
+  .any(|candidate| name.eq_ignore_ascii_case(candidate))
 }
 
 /// Whether `name` is the Steam reaper launcher.
@@ -64,8 +65,7 @@ fn is_wine_system_path(target: &str) -> bool {
 }
 
 fn is_windows_binary(target: &str) -> bool {
-  let lower = target.to_ascii_lowercase();
-  lower.ends_with(".exe")
+  target.len() >= 4 && target[target.len() - 4..].eq_ignore_ascii_case(".exe")
 }
 
 /// Resolve a Box64 invocation, including `--` and Wine chains.
@@ -251,15 +251,27 @@ pub(crate) fn resolve_steam_reaper(process: &Exec) -> Option<(u64, usize)> {
 
 fn resolve_steam_reaper_inner(process: &Exec) -> Option<(u64, usize)> {
   let args = process.arguments.as_deref()?;
-  if !args.split_ascii_whitespace().any(|t| t == "SteamLaunch") {
+  let mut has_steam_launch = false;
+  let mut app_id: Option<u64> = None;
+  let mut sep: Option<usize> = None;
+  for (idx, token) in args.split_ascii_whitespace().enumerate() {
+    if token == "SteamLaunch" {
+      has_steam_launch = true;
+    } else if app_id.is_none()
+      && let Some(value) = token.strip_prefix("AppId=")
+      && !value.is_empty()
+      && value.bytes().all(|b| b.is_ascii_digit())
+    {
+      app_id = value.parse().ok();
+    } else if sep.is_none() && token == "--" {
+      sep = Some(idx);
+    }
+  }
+  if !has_steam_launch {
     return None;
   }
-  let app_id = args.split_ascii_whitespace().find_map(|t| {
-    t.strip_prefix("AppId=")
-      .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
-  })?;
-  let app_id: u64 = app_id.parse().ok()?;
-  let sep = args.split_ascii_whitespace().position(|t| t == "--")?;
+  let app_id = app_id?;
+  let sep = sep?;
   let target_idx = sep + 1;
   process.argument_at(target_idx)?;
   Some((app_id, target_idx + 1))

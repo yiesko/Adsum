@@ -19,7 +19,7 @@ pub struct ActivityPayload {
 /// ([`AppId`]): the command is cloned per publish on the bridge path, and
 /// a `String` there copied the id every time.
 #[skip_serializing_none]
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ActivityCmd {
   pub application_id: Option<AppId>,
@@ -31,6 +31,22 @@ pub struct ActivityCmd {
   pub data: Option<HashMap<String, Value>>,
   pub evt: Option<String>,
   pub nonce: Value,
+}
+
+impl std::fmt::Debug for ActivityCmd {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("ActivityCmd")
+      .field("application_id", &self.application_id)
+      .field("cmd", &self.cmd)
+      .field("args", &self.args)
+      .field(
+        "data_keys",
+        &self.data.as_ref().map(|d| d.keys().collect::<Vec<_>>()),
+      )
+      .field("evt", &self.evt)
+      .field("nonce", &"<redacted>")
+      .finish()
+  }
 }
 
 impl ActivityCmd {
@@ -133,7 +149,7 @@ impl ActivityCmd {
 }
 
 #[skip_serializing_none]
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ActivityCmdArgs {
   pub pid: Option<u64>,
   /// Outer `None` = field absent (malformed for `SET_ACTIVITY`),
@@ -151,6 +167,20 @@ pub struct ActivityCmdArgs {
   /// Forward-compatible RPC args (OAuth and future protocol extensions).
   #[serde(flatten, default)]
   pub extra: HashMap<String, Value>,
+}
+
+impl std::fmt::Debug for ActivityCmdArgs {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("ActivityCmdArgs")
+      .field("pid", &self.pid)
+      .field("activity", &self.activity)
+      .field("code", &self.code.as_ref().map(|_| "<redacted>"))
+      .field("user_id", &self.user_id)
+      .field("guild_id", &self.guild_id)
+      .field("channel_id", &self.channel_id)
+      .field("extra_keys", &self.extra.keys().collect::<Vec<_>>())
+      .finish()
+  }
 }
 
 #[skip_serializing_none]

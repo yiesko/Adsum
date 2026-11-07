@@ -36,7 +36,7 @@ connection, and serves token-backed commands (`GET_GUILDS`) from it.
 4. Keep the application confidential: the client secret is used only by the
    component that exchanges codes — never sent to Adsum, never stored in
    Adsum's configuration unless you explicitly enable refresh-token
-   persistence (section 7).
+   persistence (section 6).
 
 Do not use another developer's application secret or a production user's
 access token.

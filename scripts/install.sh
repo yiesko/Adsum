@@ -33,7 +33,7 @@ UNIT_DIR="${HOME}/.config/systemd/user"
 UNIT_NAME="adsum.service"
 DROPIN_DIR="${UNIT_DIR}/${UNIT_NAME}.d"
 
-YES=0 FORCE=0 NO_SYSTEMD=0 AUTO_UPDATE=0 OAUTH_CLIENT_ID="" OAUTH_REDIRECT="" OAUTH_SECRET="" BINARY="" UNIT="" TAG=""
+YES=0 FORCE=0 NO_SYSTEMD=0 AUTO_UPDATE=0 OAUTH_CLIENT_ID="" OAUTH_REDIRECT="" OAUTH_SECRET="${ADSUM_OAUTH_CLIENT_SECRET:-}" BINARY="" UNIT="" TAG=""
 
 log() { printf '[install] %s\n' "$*"; }
 warn() { printf '[install] WARNING: %s\n' "$*" >&2; }

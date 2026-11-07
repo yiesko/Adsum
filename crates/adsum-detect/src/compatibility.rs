@@ -51,16 +51,6 @@ pub(crate) enum RequiredArguments {
   Static(&'static str),
 }
 
-impl RequiredArguments {
-  /// Stable sort key: derived rules sort before appended static ones.
-  fn signature(self) -> &'static str {
-    match self {
-      Self::DatabaseExecutable => "",
-      Self::Static(signature) => signature,
-    }
-  }
-}
-
 /// One derived rule: an index pair into the same bundle generation plus
 /// the arguments it requires. No owned text — the entry lives in the
 /// same generation and static signatures are constants.
@@ -136,21 +126,17 @@ pub(crate) fn build_compatibility_bundle(
       }
     }
   }
-  // Deterministic dedup: sort by the entry, signature and origin; the
-  // executable index is not part of the identity, so two identical
-  // executables on one entry collapse into one rule.
-  rules.sort_unstable_by(|a, b| {
-    (a.entry_index, a.required_arguments.signature(), a.origin).cmp(&(
-      b.entry_index,
-      b.required_arguments.signature(),
-      b.origin,
-    ))
-  });
-  rules.dedup_by(|a, b| {
-    a.entry_index == b.entry_index
-      && a.required_arguments.signature() == b.required_arguments.signature()
-      && a.origin == b.origin
-  });
+  // Deterministic dedup: identity includes the resolved argument text so
+  // two executables on the same entry with different arguments stay distinct.
+  let rule_key = |rule: &CompatibilityRule| {
+    let args = entries
+      .get(rule.entry_index as usize)
+      .and_then(|entry| required_arguments(rule, entry))
+      .unwrap_or("");
+    (rule.entry_index, rule.origin, args)
+  };
+  rules.sort_by(|a, b| rule_key(a).cmp(&rule_key(b)));
+  rules.dedup_by(|a, b| rule_key(a) == rule_key(b));
   if !rules.is_empty() {
     tracing::info!(
       "[Compatibility] Built {} Darwin-Java compatibility rules for Linux",
