@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "adsum-bridge"
-version = "0.50.0-rc1"
+version = "0.50.0-rc3"
 dependencies = [
  "adsum-protocol",
  "adsum-telemetry",
@@ -28,7 +28,7 @@ dependencies = [
 
 [[package]]
 name = "adsum-cli"
-version = "0.50.0-rc1"
+version = "0.50.0-rc3"
 dependencies = [
  "adsum-core",
  "adsum-detect",
@@ -48,7 +48,7 @@ dependencies = [
 
 [[package]]
 name = "adsum-core"
-version = "0.50.0-rc1"
+version = "0.50.0-rc3"
 dependencies = [
  "adsum-bridge",
  "adsum-detect",
@@ -67,7 +67,7 @@ dependencies = [
 
 [[package]]
 name = "adsum-detect"
-version = "0.50.0-rc1"
+version = "0.50.0-rc3"
 dependencies = [
  "adsum-proc-events",
  "adsum-protocol",
@@ -92,7 +92,7 @@ dependencies = [
 
 [[package]]
 name = "adsum-oauth"
-version = "0.50.0-rc1"
+version = "0.50.0-rc3"
 dependencies = [
  "adsum-types",
  "getrandom 0.3.4",
@@ -104,7 +104,7 @@ dependencies = [
 
 [[package]]
 name = "adsum-proc-events"
-version = "0.50.0-rc1"
+version = "0.50.0-rc3"
 dependencies = [
  "adsum-telemetry",
  "libc",
@@ -113,7 +113,7 @@ dependencies = [
 
 [[package]]
 name = "adsum-protocol"
-version = "0.50.0-rc1"
+version = "0.50.0-rc3"
 dependencies = [
  "adsum-types",
  "bytes",
@@ -129,7 +129,7 @@ dependencies = [
 
 [[package]]
 name = "adsum-steam"
-version = "0.50.0-rc1"
+version = "0.50.0-rc3"
 dependencies = [
  "hotpath",
  "serde_json",
@@ -138,14 +138,14 @@ dependencies = [
 
 [[package]]
 name = "adsum-telemetry"
-version = "0.50.0-rc1"
+version = "0.50.0-rc3"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "adsum-transport-ipc"
-version = "0.50.0-rc1"
+version = "0.50.0-rc3"
 dependencies = [
  "adsum-oauth",
  "adsum-protocol",
@@ -162,7 +162,7 @@ dependencies = [
 
 [[package]]
 name = "adsum-transport-ws"
-version = "0.50.0-rc1"
+version = "0.50.0-rc3"
 dependencies = [
  "adsum-oauth",
  "adsum-protocol",
@@ -180,7 +180,7 @@ dependencies = [
 
 [[package]]
 name = "adsum-types"
-version = "0.50.0-rc1"
+version = "0.50.0-rc3"
 dependencies = [
  "serde",
  "serde_json",
@@ -189,7 +189,7 @@ dependencies = [
 
 [[package]]
 name = "adsum-ws"
-version = "0.50.0-rc1"
+version = "0.50.0-rc3"
 dependencies = [
  "bytes",
  "futures-util",

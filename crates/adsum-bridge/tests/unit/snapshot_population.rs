@@ -31,7 +31,7 @@ fn shared_with_state(dir: &Path) -> Arc<Shared> {
   {
     let sole = Arc::get_mut(&mut shared).expect("sole owner of a fresh shared");
     sole.state_path = Some(dir.join("adsum-state-0"));
-    sole.app_version = "0.40.0-test".to_string();
+    sole.app_version = "0.50.0-rc3-test".to_string();
     sole.json_port = 1337;
     sole.msgpack_port = 1338;
   }
@@ -118,7 +118,7 @@ async fn persist_now_writes_snapshot_with_activities() {
 
   assert_eq!(
     snapshot.get("appVersion").and_then(|v| v.as_str()),
-    Some("0.40.0-test"),
+    Some("0.50.0-rc3-test"),
     "app version stamped"
   );
   let activities = snapshot.get("activities").expect("activities key");
@@ -213,13 +213,13 @@ fn state_snapshot_round_trip() {
     detection_source: Some(std::borrow::Cow::Borrowed("steam-app-id")),
     detect_latency_ms: None,
   };
-  let snapshot = StateSnapshot::new("0.40.0", servers, vec![activity]);
+  let snapshot = StateSnapshot::new("0.50.0-rc3", servers, vec![activity]);
 
   let json: serde_json::Value = serde_json::to_value(&snapshot).expect("serializes");
 
   assert_eq!(
     json.get("appVersion").and_then(|v| v.as_str()),
-    Some("0.40.0")
+    Some("0.50.0-rc3")
   );
   let activities = json
     .get("activities")

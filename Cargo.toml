@@ -6,7 +6,7 @@ resolver = "2"
 # license, repository, edition and MSRV cannot drift apart. The version
 # is project-wide: one release = one version across every crate.
 [workspace.package]
-version = "0.40.0"
+version = "0.50.0-rc3"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
