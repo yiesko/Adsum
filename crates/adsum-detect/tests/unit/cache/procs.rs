@@ -366,6 +366,7 @@ fn an_in_place_argv_drift_reclassifies_the_cached_hit() {
     pid,
     path: "/bin/phantom-with-other-argv".into(),
     arguments: Some("other-argv".into()),
+    argument_spans: Vec::new(),
   });
   {
     let mut cache = server.proc_cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -418,6 +419,7 @@ fn a_cached_miss_is_not_revalidated_on_argv_drift() {
     pid,
     path: "/bin/phantom-with-other-argv".into(),
     arguments: Some("other-argv".into()),
+    argument_spans: Vec::new(),
   });
   {
     let mut cache = server.proc_cache.lock().unwrap_or_else(|e| e.into_inner());

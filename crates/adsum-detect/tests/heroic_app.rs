@@ -84,6 +84,7 @@ fn classify_at(server: &ProcessServer, path: &str, arguments: &str) -> Option<Sc
       pid: u64::from(std::process::id()),
       path: path.to_string(),
       arguments: Some(arguments.to_string()),
+      argument_spans: Vec::new(),
     },
     &bundle,
     &excl,

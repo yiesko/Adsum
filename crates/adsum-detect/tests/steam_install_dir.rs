@@ -148,6 +148,7 @@ fn classify(
       pid: NO_PID,
       path: path.to_string(),
       arguments: Some(arguments.to_string()),
+      argument_spans: Vec::new(),
     },
     &bundle,
     &excl,

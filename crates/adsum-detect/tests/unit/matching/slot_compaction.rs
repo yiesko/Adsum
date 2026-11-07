@@ -8,6 +8,7 @@ fn surplus_list(count: usize) -> Vec<Exec> {
       pid: i as u64 + 1,
       path: "p".repeat(64),
       arguments: Some("a".repeat(32)),
+      argument_spans: Vec::new(),
     })
     .collect()
 }

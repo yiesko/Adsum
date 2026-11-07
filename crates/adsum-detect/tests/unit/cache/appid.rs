@@ -20,6 +20,7 @@ fn exec(pid: u64) -> Exec {
     pid,
     path: String::new(),
     arguments: None,
+    argument_spans: Vec::new(),
   }
 }
 

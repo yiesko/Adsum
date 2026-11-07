@@ -36,6 +36,7 @@ fn java_process(arguments: &str) -> Exec {
     pid: 1000,
     path: "/usr/lib/jvm/bin/java".into(),
     arguments: Some(arguments.into()),
+    argument_spans: Vec::new(),
   }
 }
 
@@ -156,6 +157,7 @@ fn non_java_executables_do_not_detect() {
       pid: 1000,
       path: path.into(),
       arguments: Some("net.minecraft.client.main.Main".into()),
+      argument_spans: Vec::new(),
     };
     assert!(
       match_compatibility(&process, &bundle, &mut stat).is_none(),
@@ -173,6 +175,7 @@ fn java_basename_matches_case_insensitively() {
     pid: 1000,
     path: "/opt/JDK/Java".into(),
     arguments: Some("-cp x.jar net.minecraft.client.main.Main".into()),
+    argument_spans: Vec::new(),
   };
   let hit = match_compatibility(&process, &bundle, &mut stat).expect("`Java` detects");
   assert!(is_minecraft(&hit));

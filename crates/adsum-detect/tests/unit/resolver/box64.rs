@@ -6,6 +6,7 @@ fn exec(path: &str, args: Option<&str>) -> Exec {
     pid: 1000,
     path: path.into(),
     arguments: args.map(str::to_string),
+    argument_spans: Vec::new(),
   }
 }
 

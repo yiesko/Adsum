@@ -63,6 +63,7 @@ fn process(argv0: &str, arguments: &str) -> Exec {
     pid: u64::from(std::process::id()),
     path: argv0.to_string(),
     arguments: Some(arguments.to_string()),
+    argument_spans: Vec::new(),
   }
 }
 

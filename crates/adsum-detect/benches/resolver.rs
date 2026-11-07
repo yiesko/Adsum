@@ -8,6 +8,7 @@ fn exec_box64() -> Exec {
     pid: 1234,
     path: "box64".into(),
     arguments: Some("wine ./game.exe -windowed".into()),
+    argument_spans: Vec::new(),
   }
 }
 

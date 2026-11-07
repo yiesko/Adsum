@@ -53,6 +53,7 @@ fn append_swaps_in_a_new_classifying_generation() {
         pid: 1,
         path: "/games/swapgame.exe".to_string(),
         arguments: None,
+        argument_spans: Vec::new(),
       },
       &after,
       &excl,
@@ -79,7 +80,8 @@ fn remove_by_name_drops_the_generation_entry() {
         &Exec {
           pid: 1,
           path: "/games/swapgame.exe".to_string(),
-          arguments: None
+          arguments: None,
+          argument_spans: Vec::new(),
         },
         &bundle,
         &excl,
@@ -116,6 +118,7 @@ fn match_scratch_reuses_lowered_buffer() {
     pid: 1,
     path: "/games/Swap Game/othergame.exe".to_string(),
     arguments: None,
+    argument_spans: Vec::new(),
   };
   let classify = |server: &ProcessServer,
                   exec: &Exec,
