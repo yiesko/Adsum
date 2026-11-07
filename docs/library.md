@@ -10,7 +10,7 @@ your own future completes.
 
 ```toml
 [dependencies]
-adsum-core = { git = "https://github.com/yiesko/adsum", tag = "v0.40.0" }
+adsum-core = { git = "https://github.com/yiesko/adsum", tag = "v0.50.0-rc3" }
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal"] }
 ```
 
@@ -18,7 +18,7 @@ Add `adsum-detect` from the same repository if you need to name
 `DetectableActivity` yourself (to build entries by hand, for example) — its path is `adsum_detect::db::DetectableActivity`:
 
 ```toml
-adsum-detect = { git = "https://github.com/yiesko/adsum", tag = "v0.40.0" }
+adsum-detect = { git = "https://github.com/yiesko/adsum", tag = "v0.50.0-rc3" }
 ```
 
 ## Minimal example
@@ -111,7 +111,7 @@ Every field, with its default:
 | `initial_db_etag` / `initial_db_content_hash` | `None` / `None` | Seeds for the first conditional refresh (set these when you fetched the body yourself) |
 | `ignored_ids` | `[]` | App ids the scanner never publishes (`--ignore-ids`) |
 | `exclusions_url` | `None` | Discord exclusions feed (`--exclusions-url`) |
-| `app_version` | `adsum-core`'s own version — **`0.40.0`** (workspace version) | Version stamped into state snapshots. The CLI uses the same value; override only if you need a different label |
+| `app_version` | `adsum-core`'s own version — **`0.50.0-rc3`** (workspace version) | Version stamped into state snapshots. The CLI uses the same value; override only if you need a different label |
 | `state_file` | `false` | Presence snapshots to `<tmpdir>/adsum-state-{0..9}` (`--state-file`): owner-only files, shared slots under concurrency. With `ADSUM_STATE_PREFIX=arrpc-state-`, snapshot aliases are published into client runtime directories for status panels such as Equibop's. |
 | `bridge_allowed_origins` | `[]` | Extra browser origins driving bridge commands (`--bridge-allowed-origins`): normalized to browser form, then exact match |
 

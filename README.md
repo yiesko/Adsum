@@ -329,7 +329,7 @@ Adsum can watch process start and exit events from the kernel (`cn_proc`) instea
 
 ```toml
 [dependencies]
-adsum-core = { git = "https://github.com/yiesko/adsum", tag = "v0.40.0" } # use the latest release tag
+adsum-core = { git = "https://github.com/yiesko/adsum", tag = "v0.50.0-rc3" } # use the latest release tag
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal"] }
 ```
 
