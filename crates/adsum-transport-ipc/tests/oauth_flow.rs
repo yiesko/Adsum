@@ -404,13 +404,13 @@ fn session(app: &str, identify: bool, expires: SystemTime) -> RpcOAuthResult {
     data: json!({"scopes":scopes,"user":if identify { Some(&user) } else { None }}),
     // Deliberately supply a user even without identify: the shared manager
     // must sanitize the session, and IPC must not substitute the fallback.
-    session: Some(OAuthSession {
+    session: Some(Arc::new(OAuthSession {
       application_id: AppId::from(app),
       user: Some(user),
       scopes,
       expires,
       access_token: "test-token".to_owned(),
-    }),
+    })),
   }
 }
 
@@ -830,7 +830,10 @@ fn shed_publications_do_not_gain_owned_clear_or_disconnect_cleanup_rights() {
   let mut peer = Peer::with_capacity(&fixture.manager, APP, 1);
   fixture.authenticate(&mut peer, true);
   peer.sink.emit(ActivityCmd::empty());
-  assert_success(&peer.rpc(publish(8, "shed")), "shed");
+  // Overload is signaled, and the shed publication still records no
+  // ownership: the same connection cannot clear, and disconnect
+  // cleanup publishes nothing.
+  assert_error(&peer.rpc(publish(8, "shed")), 5000, "shed");
   assert_eq!(peer.sink.dropped_total(), 1);
   assert_eq!(recv_cmd(&mut peer.events).cmd, "");
   peer.send(authenticate("failed-reauth"));
