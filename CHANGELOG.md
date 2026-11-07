@@ -8,97 +8,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Linux emulator awareness.** Adsum now resolves Box64, FEX, QEMU
-  user-mode, Wine/Proton and Steam reaper wrappers to their real target
-  executable before matching, preserving `Exec.path` and the target's own
-  arguments. `/proc/<pid>/exe` is read lazily for candidate emulators.
-- **Minecraft Java detection on Linux via macOS signatures.** Adsum now
-  reuses the official detectable database's macOS `>java` entries (which
-  carry the game's main class as a required argument) to detect Minecraft
-  and its loaders on Linux, with a `compatibility` provenance. No
-  database edit and no global `darwin` → `linux` remapping.
-- **Discord RPC OAuth over IPC and WebSocket (experimental).** `AUTHORIZE`
-  opens the system browser and finishes the loopback callback with state
-  validation; PKCE (S256) is supported. `AUTHENTICATE` checks the supplied
-  bearer token against Discord's `/oauth2/@me` endpoint, verifies the
-  application and the `rpc` scope, and creates a per-connection session.
-  `GET_USER` returns the authenticated identity when the `identify` scope
-  was granted.
-- **`GET_GUILDS` backed by Discord's REST API.** When the connection holds a
-  session with the `guilds` scope, the command proxies
-  `GET /users/@me/guilds` with a 30-second per-connection cache. Cache
-  misses are fetched outside the transport pumps, with a small global
-  concurrency cap. `GET_GUILD`, `GET_CHANNELS`, and `GET_CHANNEL` stay
-  unsupported because they need live Discord client state that a user token
-  cannot reach.
-- **Refresh-token persistence (optional).** With
-  `ADSUM_OAUTH_CLIENT_SECRET` set, `AUTHENTICATE` can be called with a
-  `refresh_token` (or with none) to exchange a stored refresh token for a
-  fresh access token without a browser flow. Rotated refresh tokens replace
-  the stored one in `~/.cache/adsum/oauth/<client_id>.json` (mode 0600).
-  Access tokens are never written to disk.
-- **`adsum oauth` command.** `login` runs browser authorization from the
-  terminal, exchanges the code, stores the grant, and prints who signed in.
-  `status` lists stored grants and whether restore is configured. `logout`
-  removes one grant or all of them.
-- **`ADSUM_STATE_PREFIX`.** Overrides the presence-snapshot file prefix
-  (default `adsum-state-`). Setting `arrpc-state-` makes Equibop's arRPC
-  status panel recognize Adsum when its built-in arRPC is disabled.
-- **State snapshot aliases (Linux and macOS).** With `--state-file`, the
-  snapshot is also published as a symlink (`arrpc-state-N` pointing at the
-  canonical file) in every client runtime directory that exists, including
-  Equibop Flatpak's `$XDG_RUNTIME_DIR/app/org.equicord.equibop/`. Status
-  panels that scan their own temp directory find it without client changes.
-  Aliases are marker-owned like the IPC aliases (marker written first,
-  exclusive creation, identity-checked removal, crash recovery), survive the
-  snapshot's atomic rewrite, are reconciled while running, and are removed on
-  shutdown. Foreign entries are never touched.
-- **OAuth rate limit per connection.** At most one OAuth command per 250 ms
-  per connection by default; `ADSUM_OAUTH_RATE_LIMIT_MS` tunes or disables
-  it.
-- **5-second IPC handshake deadline.** A connection that does not complete
-  its handshake within 5 seconds is closed and its slot freed, so probe
-  clients that open the endpoint and go silent no longer hold one of the 16
-  IPC slots.
-- **Configurable authorization timeout.** `ADSUM_OAUTH_TIMEOUT` (seconds,
-  1-600, default 180) bounds the browser authorization wait.
-- **Stricter redirect validation.** The configured loopback redirect must not
-  collide with Adsum's own listener ports (6463-6472, 1337, 1338).
-- **Shared OAuth session manager.** IPC and WebSocket use the same bounded
-  worker manager, with a daemon-wide concurrency limit, one in-flight OAuth
-  operation per connection, cancellation on disconnect or shutdown, and
-  checks that keep late worker results from authenticating closed
-  connections.
+- **Discord RPC OAuth, optional and experimental**. Add optional browser sign-in, the `adsum oauth` commands, optional refresh tokens, `GET_USER`, `GET_GUILDS`, limits, and timeouts.
+- **OAuth setup in the installer**. `install.sh` can write the OAuth redirect and secret settings for the user service.
+- **Cross-client state snapshots**. With `--state-file`, Adsum can create `arrpc-state-N` links in client runtime folders and use `ADSUM_STATE_PREFIX` to choose the file prefix.
+- **Compatibility detection**. Adsum now recognizes games started by Box64, FEX, QEMU, Wine/Proton, and Steam reaper, including Wine games on macOS, plus Minecraft and compatible loaders on Linux.
+- **Pre-release tags**. Alpha, beta, and release-candidate tags are now published as GitHub pre-releases with their own generated notes. Stable tags still need a numbered changelog section.
 
 ### Changed
-- OAuth stays optional. `ADSUM_REQUIRE_RPC_AUTH=1` enables strict
-  authentication gating; the default stays permissive, so existing Rich
-  Presence clients keep working without authenticating.
-- OAuth documentation now distinguishes the legacy RPC authorization flow
-  from Discord's separate native Social SDK. Adsum does not implement or
-  depend on the Social SDK.
+- **Lower memory use at startup**. The bundled game database is stored in a smaller form, so the measured startup peak fell from about 57 MB to about 28 MB in local testing.
+- **More exact game matching**. Game arguments keep their original boundaries, including empty arguments, so programs opened through a wrapper are matched by the real game.
+- **Clearer IPC overload response**. When the queue is full, publishing now reports
+  `5000 Activity queue is full; retry later` instead of appearing successful.
+  A rejected publication still does not gain ownership.
+- **Pre-release binary versions**. Build tags are stamped into the workspace, so the binary reports the exact tag version. The self-updater still uses GitHub's stable release only.
+
+### Fixed
+- **Cleaner shutdown**. The scanner is stopped before its threads are joined, so shutdown does not wait beyond the shared time limit for stuck workers.
+- **State aliases**. Existing aliases now follow only trusted paths, and a missing alias is not recreated from an old snapshot.
+- **OAuth expiry**. The first command that finds the expired session now reports `InvalidAccessToken`, not `NotAuthenticated`.
+- **Non-Linux builds**. Windows, macOS, and other non-Linux targets now compile.
 
 ### Security
-- **Windows named pipe DACL.** The IPC pipe now carries an explicit DACL
-  (full control to SYSTEM, Administrators, and the owner; read to Everyone
-  and Anonymous) instead of a security descriptor with no DACL. This matches
-  the access policy clients get from `lpSecurityAttributes = NULL` (what
-  arRPC and Node-based servers use) and fixes the JetBrains integration
-  failure inherited from rsRPC (rsRPC issue #10).
-- Access tokens stay in memory only, scoped to a single connection, and are
-  never logged, serialized, or written to disk. `Debug` implementations
-  redact all bearer credentials.
-- Refresh tokens are stored only when `ADSUM_OAUTH_CLIENT_SECRET` is set and
-  a refresh token is supplied by the client, issued by `adsum oauth login`,
-  or rotated by Discord, and only under
-  `~/.cache/adsum/oauth/<client_id>.json` (parent directory mode 0700, file
-  mode 0600, written through a temp file and renamed). Deleting the file
-  forces a fresh browser authorization.
-- `rpc_token`, provisional-account creation, token revocation, persistent
-  session restore without `ADSUM_OAUTH_CLIENT_SECRET`, friends and
-  relationships, direct messages, guild detail APIs, lobbies, and voice or
-  RTC remain unsupported. Adsum returns explicit unsupported-command errors
-  instead of simulating success.
+- **OAuth tokens**. Responses contain identity and scopes, never the access token. Logs and debug output do not show it.
+- **OAuth settings**. Refresh and restore require `ADSUM_OAUTH_CLIENT_SECRET`; without it, the client secret error is returned instead of a misleading invalid-argument error.
+- **Paths and IPC**. Paths reached through a symlink are checked across the full path, not only the last directory.
+- **Windows IPC pipe**. The named pipe now has an explicit access policy instead of receiving default permissions.
 
 ## [0.40.0] - 2026-10-29
 
