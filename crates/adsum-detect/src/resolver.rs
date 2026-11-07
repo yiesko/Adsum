@@ -250,11 +250,12 @@ pub(crate) fn resolve_steam_reaper(process: &Exec) -> Option<(u64, usize)> {
 }
 
 fn resolve_steam_reaper_inner(process: &Exec) -> Option<(u64, usize)> {
-  let args = process.arguments.as_deref()?;
+  process.arguments.as_deref()?;
   let mut has_steam_launch = false;
   let mut app_id: Option<u64> = None;
   let mut sep: Option<usize> = None;
-  for (idx, token) in args.split_ascii_whitespace().enumerate() {
+  let mut idx = 0usize;
+  while let Some(token) = process.argument_at(idx) {
     if token == "SteamLaunch" {
       has_steam_launch = true;
     } else if app_id.is_none()
@@ -266,6 +267,7 @@ fn resolve_steam_reaper_inner(process: &Exec) -> Option<(u64, usize)> {
     } else if sep.is_none() && token == "--" {
       sep = Some(idx);
     }
+    idx += 1;
   }
   if !has_steam_launch {
     return None;

@@ -65,6 +65,7 @@ pub fn read_exec_into(pid: u64, exec: &mut Exec, scratch: &mut ExecScratch) -> b
   let Ok(text) = std::str::from_utf8(&scratch.cmdline) else {
     return false;
   };
+  let text = text.strip_suffix('\0').unwrap_or(text);
   let mut cmd_iter = text.split('\0');
   let cmd_path = cmd_iter.next().unwrap_or("");
   // Output strings reuse the destination slot's capacity: `path` is

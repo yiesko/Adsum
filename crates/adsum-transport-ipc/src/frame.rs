@@ -669,14 +669,29 @@ fn handle_set_activity(ipc: &mut dyn IpcFacilitator, mut command: ActivityCmd) -
     .expect("validated activity args always build a response");
   if publish {
     let already_owned = ipc.owns_published_pid(pid);
-    if ipc.admit_published_pid(pid) {
-      let nonce = command.nonce.clone();
-      if ipc.send_event(command) {
-        ipc.set_pid(pid);
-        ipc.set_nonce(nonce);
-      } else if !already_owned {
+    if !ipc.admit_published_pid(pid) {
+      return commands::rpc_error(
+        &command.cmd,
+        &command.nonce,
+        5000,
+        "Too many tracked activity pids",
+      );
+    }
+    let nonce = command.nonce.clone();
+    let cmd_name = command.cmd.clone();
+    if ipc.send_event(command) {
+      ipc.set_pid(pid);
+      ipc.set_nonce(nonce);
+    } else {
+      if !already_owned {
         ipc.forget_published_pid(pid);
       }
+      return commands::rpc_error(
+        &cmd_name,
+        &nonce,
+        5000,
+        "Activity queue is full; retry later",
+      );
     }
   } else {
     // Explicit clears retry through transient queue pressure like disconnect
