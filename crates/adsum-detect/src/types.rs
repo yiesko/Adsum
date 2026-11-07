@@ -36,46 +36,40 @@ pub struct Exec {
 }
 
 impl Exec {
-  /// Returns the argument at `index` (zero-based, after argv[0]),
-  /// borrowed from the slot's own buffer. Tokens are split on ASCII
-  /// whitespace, so argv entries containing spaces cannot be recovered
-  /// (the reader joins argv with a single space); treat as a best-effort
-  /// view, not a faithful argv reconstruction.
+  /// Returns argument `index` (zero-based, argv[1..]), borrowed.
+  /// Prefers `argument_spans` for exact argv boundaries when available.
   pub(crate) fn argument_at(&self, index: usize) -> Option<&str> {
     let storage = self.arguments.as_deref()?;
     if !self.argument_spans.is_empty() {
       let span = self.argument_spans.get(index)?;
       return storage.get(span.start as usize..span.end as usize);
     }
-    // Fallback for callers that built `Exec` without spans.
     storage.split_ascii_whitespace().nth(index)
   }
 
-  /// Borrow the argument string starting at token `start`, preserving the
-  /// remaining tokens (and their separating spaces) without allocation.
+  /// Returns arguments from token `start` onward, borrowed.
   pub fn arguments_from(&self, start: usize) -> Option<&str> {
     let storage = self.arguments.as_deref()?;
     if !self.argument_spans.is_empty() {
       let span = self.argument_spans.get(start)?;
       return storage.get(span.start as usize..);
     }
-    // Fallback for callers that built `Exec` without spans.
-    let mut pos = 0usize;
-    let mut count = 0usize;
-    while pos < storage.len() {
-      while pos < storage.len() && storage.as_bytes()[pos].is_ascii_whitespace() {
-        pos += 1;
+    let bytes = storage.as_bytes();
+    let (mut i, mut seen) = (0usize, 0usize);
+    while i < bytes.len() {
+      while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
       }
-      if pos >= storage.len() {
+      if i >= bytes.len() {
         break;
       }
-      if count == start {
-        return Some(&storage[pos..]);
+      if seen == start {
+        return Some(&storage[i..]);
       }
-      while pos < storage.len() && !storage.as_bytes()[pos].is_ascii_whitespace() {
-        pos += 1;
+      seen += 1;
+      while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+        i += 1;
       }
-      count += 1;
     }
     None
   }

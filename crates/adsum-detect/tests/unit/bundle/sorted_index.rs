@@ -6,12 +6,7 @@ use crate::bundle::SortedIndex;
 /// aliases) wins — identical to the `or_insert` the table replaced.
 #[test]
 fn first_inserted_index_wins_duplicate_keys() {
-  let index = SortedIndex::build(vec![
-    ("dup".into(), 7),
-    ("aaa".into(), 1),
-    ("dup".into(), 9),
-    ("aaa".into(), 3),
-  ]);
+  let index = SortedIndex::build(vec![("dup", 7), ("aaa", 1), ("dup", 9), ("aaa", 3)]);
   assert_eq!(index.get("dup"), Some(7));
   assert_eq!(index.get("aaa"), Some(1));
   assert_eq!(index.len(), 2, "duplicates collapse");
@@ -23,9 +18,9 @@ fn first_inserted_index_wins_duplicate_keys() {
 #[test]
 fn packed_arena_round_trips_keys_and_indexes() {
   let index = SortedIndex::build(vec![
-    ("portal 2".into(), 440),
-    ("dota 2".into(), 570),
-    ("half life 2".into(), 220),
+    ("portal 2", 440),
+    ("dota 2", 570),
+    ("half life 2", 220),
   ]);
   // Sorted by key: dota < half < portal.
   assert_eq!(
@@ -49,7 +44,7 @@ fn packed_arena_round_trips_keys_and_indexes() {
 /// fallback builds exactly this shape).
 #[test]
 fn an_empty_index_answers_nobody() {
-  let index = SortedIndex::build(Vec::new());
+  let index = SortedIndex::build(Vec::<(&str, usize)>::new());
   assert_eq!(index.len(), 0);
   assert_eq!(index.get("anything"), None);
   assert_eq!(index.iter().count(), 0);

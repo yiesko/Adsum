@@ -16,7 +16,7 @@ fn steam_app_id_hit_carries_its_source() {
     epic_ids: Box::new([]),
     aliases: Box::new([]),
   });
-  let steam_map = SortedIndex::build(vec![("12345".into(), 0)]);
+  let steam_map = SortedIndex::build(vec![("12345", 0)]);
   let hit = match_steam_id(
     u64::from(std::process::id()),
     &mut String::new(),
@@ -56,7 +56,7 @@ fn steam_app_id_corroborates_a_short_heroic_launch() {
     epic_ids: Box::new([]),
     aliases: Box::new([]),
   });
-  let steam_map = SortedIndex::build(vec![("3240220".into(), 0)]);
+  let steam_map = SortedIndex::build(vec![("3240220", 0)]);
   let hit = match_steam_id(
     u64::from(std::process::id()),
     &mut String::new(),
@@ -111,7 +111,7 @@ fn install_dir_corroboration_accepts_an_undeclared_executable() {
     epic_ids: Box::new([]),
     aliases: Box::new([]),
   });
-  let steam_map = SortedIndex::build(vec![("2082470".into(), 0)]);
+  let steam_map = SortedIndex::build(vec![("2082470", 0)]);
   let hit = match_steam_id(
     u64::from(std::process::id()),
     &mut String::new(),
@@ -149,7 +149,7 @@ fn install_dir_corroboration_refuses_prerequisite_installers() {
     epic_ids: Box::new([]),
     aliases: Box::new([]),
   });
-  let steam_map = SortedIndex::build(vec![("2082470".into(), 0)]);
+  let steam_map = SortedIndex::build(vec![("2082470", 0)]);
   let lookup = |process_path| SteamIdLookup {
     app_id: Some("2082470"),
     process_path,
@@ -211,7 +211,7 @@ fn install_dir_corroboration_false_still_refuses() {
     epic_ids: Box::new([]),
     aliases: Box::new([]),
   });
-  let steam_map = SortedIndex::build(vec![("2082470".into(), 0)]);
+  let steam_map = SortedIndex::build(vec![("2082470", 0)]);
   assert!(
     match_steam_id(
       u64::from(std::process::id()),
@@ -251,7 +251,7 @@ fn install_dir_corroboration_refuses_a_declared_launcher() {
     epic_ids: Box::new([]),
     aliases: Box::new([]),
   });
-  let steam_map = SortedIndex::build(vec![("2082470".into(), 0)]);
+  let steam_map = SortedIndex::build(vec![("2082470", 0)]);
   assert!(
     match_steam_id(
       u64::from(std::process::id()),
@@ -286,7 +286,7 @@ fn install_dir_corroboration_keeps_id_only_entries_working() {
     epic_ids: Box::new([]),
     aliases: Box::new([]),
   });
-  let steam_map = SortedIndex::build(vec![("2082470".into(), 0)]);
+  let steam_map = SortedIndex::build(vec![("2082470", 0)]);
   for corroborated in [false, true] {
     let hit = match_steam_id(
       u64::from(std::process::id()),
@@ -337,7 +337,7 @@ fn command_line_app_id_corroborates_native_game_executable() {
     epic_ids: Box::new([]),
     aliases: Box::new([]),
   });
-  let steam_map = SortedIndex::build(vec![("892970".into(), 0)]);
+  let steam_map = SortedIndex::build(vec![("892970", 0)]);
   let hit = match_steam_id(
     8877,
     &mut String::new(),
@@ -387,7 +387,7 @@ fn command_line_app_id_refuses_the_reaper_helper() {
     epic_ids: Box::new([]),
     aliases: Box::new([]),
   });
-  let steam_map = SortedIndex::build(vec![("892970".into(), 0)]);
+  let steam_map = SortedIndex::build(vec![("892970", 0)]);
   assert!(
     match_steam_id(
       8877,
@@ -446,7 +446,7 @@ fn command_line_app_id_with_install_dir_evidence_accepts_undeclared_executable()
     epic_ids: Box::new([]),
     aliases: Box::new([]),
   });
-  let steam_map = SortedIndex::build(vec![("892970".into(), 0)]);
+  let steam_map = SortedIndex::build(vec![("892970", 0)]);
   let hit = match_steam_id(
     8877,
     &mut String::new(),
@@ -480,7 +480,7 @@ fn custom_sku_hit_keeps_library_source() {
     epic_ids: Box::new([]),
     aliases: Box::new([]),
   });
-  let empty_map = SortedIndex::build(Vec::new());
+  let empty_map = SortedIndex::build(Vec::<(&str, usize)>::new());
   let hit = match_steam_id(
     u64::from(std::process::id()),
     &mut String::new(),

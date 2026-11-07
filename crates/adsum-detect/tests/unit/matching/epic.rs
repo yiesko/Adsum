@@ -92,7 +92,7 @@ fn match_epic_id_hit_carries_its_source() {
     epic_ids: Box::new(["b0cd075465c44f87be3b505ac04a2e46".into()]),
     aliases: Box::new([]),
   });
-  let epic_map = SortedIndex::build(vec![("b0cd075465c44f87be3b505ac04a2e46".into(), 0)]);
+  let epic_map = SortedIndex::build(vec![("b0cd075465c44f87be3b505ac04a2e46", 0)]);
   let hit = match_epic_id(
     u64::from(std::process::id()),
     &mut String::new(),
@@ -128,7 +128,7 @@ fn match_epic_id_rejects_a_path_that_names_nothing_declared() {
     epic_ids: Box::new(["b0cd075465c44f87be3b505ac04a2e46".into()]),
     aliases: Box::new([]),
   });
-  let epic_map = SortedIndex::build(vec![("b0cd075465c44f87be3b505ac04a2e46".into(), 0)]);
+  let epic_map = SortedIndex::build(vec![("b0cd075465c44f87be3b505ac04a2e46", 0)]);
   assert!(
     match_epic_id(
       u64::from(std::process::id()),

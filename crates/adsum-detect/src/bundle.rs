@@ -53,21 +53,20 @@ impl SortedIndex {
   /// `or_insert` this replaces), then packs arena and slots — both
   /// exactly sized, since the tables outlive the build inside the
   /// bundle (the packed form IS the shrink-to-fit).
-  pub(crate) fn build(mut entries: Vec<(Box<str>, usize)>) -> Self {
+  /// Keys are borrowed: no per-key `Box<str>` at build time, only the
+  /// one arena allocation.
+  pub(crate) fn build<K: AsRef<str>>(mut entries: Vec<(K, usize)>) -> Self {
     // Stable sort: equal keys keep insertion order, so `dedup_by` below
     // (which keeps the FIRST of each run) preserves first-wins.
-    entries.sort_by(|a, b| {
-      let (ka, kb): (&str, &str) = (&a.0, &b.0);
-      ka.cmp(kb)
-    });
-    entries.dedup_by(|curr, prev| curr.0 == prev.0);
+    entries.sort_by(|a, b| a.0.as_ref().cmp(b.0.as_ref()));
+    entries.dedup_by(|curr, prev| curr.0.as_ref() == prev.0.as_ref());
 
-    let total: usize = entries.iter().map(|(key, _)| key.len()).sum();
+    let total: usize = entries.iter().map(|(key, _)| key.as_ref().len()).sum();
     let mut arena = String::with_capacity(total);
     let mut slots: Vec<(u32, u32, u32)> = Vec::with_capacity(entries.len());
     for (key, index) in entries {
       let start = arena.len() as u32;
-      arena.push_str(&key);
+      arena.push_str(key.as_ref());
       let end = arena.len() as u32;
       // Same bound rule as `pattern_index`: the fetched database is
       // structurally capped far below `u32::MAX` (64 MiB body, bounded
@@ -286,23 +285,24 @@ pub fn name_map_bound(detectables: &[Arc<ScannedEntry>]) -> usize {
 pub fn build_aux_maps(
   detectables: &[Arc<ScannedEntry>],
 ) -> (SortedIndex, SortedIndex, SortedIndex) {
-  // Steam ids ≤ entries in practice.
-  let mut steam: Vec<(Box<str>, usize)> = Vec::with_capacity(detectables.len());
+  // Steam ids ≤ entries in practice. Keys borrow the entries: no
+  // per-key allocation, only the (arena, slots) pair `build` returns.
+  let mut steam: Vec<(&str, usize)> = Vec::with_capacity(detectables.len());
   for (index, activity) in detectables.iter().enumerate() {
     for id in &activity.steam_ids {
       if !id.is_empty() {
-        steam.push((id.clone(), index));
+        steam.push((id, index));
       }
     }
   }
 
   // Epic sandbox ids: ~2.5k dwell in the real database (~1 entry in 8),
   // so `len / 8` covers the table without over-buying build scratch.
-  let mut epic: Vec<(Box<str>, usize)> = Vec::with_capacity(detectables.len() / 8);
+  let mut epic: Vec<(&str, usize)> = Vec::with_capacity(detectables.len() / 8);
   for (index, activity) in detectables.iter().enumerate() {
     for id in &activity.epic_ids {
       if !id.is_empty() {
-        epic.push((id.clone(), index));
+        epic.push((id, index));
       }
     }
   }
@@ -334,17 +334,17 @@ pub fn build_aux_maps(
 /// that is most of a megabyte of scratch held only for the build. It is
 /// also why the bound and the fill live together here: split apart, the
 /// reserve can drift back to a guess nobody tests.
-fn collect_names(detectables: &[Arc<ScannedEntry>]) -> Vec<(Box<str>, usize)> {
-  let mut names: Vec<(Box<str>, usize)> = Vec::with_capacity(name_map_bound(detectables));
+fn collect_names(detectables: &[Arc<ScannedEntry>]) -> Vec<(String, usize)> {
+  let mut names: Vec<(String, usize)> = Vec::with_capacity(name_map_bound(detectables));
   for (index, activity) in detectables.iter().enumerate() {
     let normalized = normalize_name(&activity.name);
     if name_matchable(&normalized) {
-      names.push((normalized.into_boxed_str(), index));
+      names.push((normalized, index));
     }
     for alias in &activity.aliases {
       let normalized = normalize_name(alias);
       if name_matchable(&normalized) {
-        names.push((normalized.into_boxed_str(), index));
+        names.push((normalized, index));
       }
     }
   }
@@ -367,10 +367,10 @@ pub(crate) fn dedot(name: &str) -> String {
 /// the extra table stays tiny. Built in canonical order (lowest index
 /// wins ties), exactly like the main map.
 pub fn undotted_names(name_map: &SortedIndex) -> SortedIndex {
-  let mut dotted: Vec<(usize, Box<str>)> = name_map
+  let mut dotted: Vec<(usize, String)> = name_map
     .iter()
     .filter(|(key, _)| key.contains('.'))
-    .map(|(key, index)| (index, Box::<str>::from(key)))
+    .map(|(key, index)| (index, key.to_owned()))
     .collect();
   // Lowest index first: `SortedIndex::build` keeps the first of each
   // duplicate key, so canonical entries win ties exactly like before.
@@ -378,7 +378,7 @@ pub fn undotted_names(name_map: &SortedIndex) -> SortedIndex {
   SortedIndex::build(
     dotted
       .into_iter()
-      .map(|(index, key)| (dedot(&key).into_boxed_str(), index))
+      .map(|(index, key)| (dedot(&key), index))
       .collect(),
   )
 }

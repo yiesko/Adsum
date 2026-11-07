@@ -116,7 +116,7 @@ fn argument_mismatch_skips_to_later_candidate() {
     aliases: Box::new([]),
   });
   // The automaton yields the failing candidate first.
-  let probe = vec![(Arc::clone(&failing), 0), (Arc::clone(&passing), 0)];
+  let probe = vec![(&failing, 0), (&passing, 0)];
   let outcome = first_hit_naming_path(probe.into_iter(), "/dir/game.exe", Some("-game tf2"));
   match outcome {
     MatchOutcome::Corroborated(obj, _) => {
@@ -143,7 +143,7 @@ fn argument_mismatch_refuses_when_no_later_candidate() {
     epic_ids: Box::new([]),
     aliases: Box::new([]),
   });
-  let probe = vec![(Arc::clone(&failing), 0)];
+  let probe = vec![(&failing, 0)];
   let outcome = first_hit_naming_path(probe.into_iter(), "/dir/game.exe", Some("-game tf2"));
   assert!(
     matches!(outcome, MatchOutcome::Refused),
@@ -168,7 +168,7 @@ fn non_naming_candidate_does_not_block_the_variant() {
     epic_ids: Box::new([]),
     aliases: Box::new([]),
   });
-  let probe = vec![(Arc::clone(&stranger), 0)];
+  let probe = vec![(&stranger, 0)];
   let outcome = first_hit_naming_path(probe.into_iter(), "/dir/game.exe", Some("-game tf"));
   assert!(
     matches!(outcome, MatchOutcome::Refused),

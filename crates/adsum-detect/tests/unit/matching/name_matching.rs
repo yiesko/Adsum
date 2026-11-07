@@ -15,8 +15,8 @@ fn name_and_folder_hits_carry_their_sources() {
     epic_ids: Box::new([]),
     aliases: Box::new([]),
   });
-  let name_map = SortedIndex::build(vec![("source game".into(), 0)]);
-  let empty = SortedIndex::build(Vec::new());
+  let name_map = SortedIndex::build(vec![("source game", 0)]);
+  let empty = SortedIndex::build(Vec::<(&str, usize)>::new());
   let list = [entry];
   let mut norm_out = String::new();
   let pid = u64::from(std::process::id());

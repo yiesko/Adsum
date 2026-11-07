@@ -141,9 +141,9 @@ fn matches_sidecar_family(basename: &str, base: &str) -> bool {
 /// anything the stem and folder tiers can say, so it is carried forward
 /// instead of being flattened into an ordinary miss.
 #[derive(Debug)]
-pub(crate) enum MatchOutcome {
+pub(crate) enum MatchOutcome<'a> {
   /// A match that names the probed string on a component boundary.
-  Corroborated(Arc<ScannedEntry>, usize),
+  Corroborated(&'a Arc<ScannedEntry>, usize),
   /// Declared names were seen in this string, and every one of them was
   /// refused: the process is running something that is *not* a declared
   /// executable of any entry.
@@ -152,11 +152,12 @@ pub(crate) enum MatchOutcome {
   NoMatch,
 }
 
-impl MatchOutcome {
-  /// The hit, when the walk corroborated one.
+impl MatchOutcome<'_> {
+  /// The hit, when the walk corroborated one. The sole `Arc` clone of
+  /// the walk: probes borrow, only the winning hit pays the bump.
   fn take_hit(&self) -> Option<(Arc<ScannedEntry>, usize)> {
     match self {
-      Self::Corroborated(obj, exe_index) => Some((obj.clone(), *exe_index)),
+      Self::Corroborated(obj, exe_index) => Some((Arc::clone(*obj), *exe_index)),
       Self::Refused | Self::NoMatch => None,
     }
   }
@@ -188,11 +189,11 @@ impl MatchOutcome {
 /// skipped the same way, so a later candidate that names the path *and*
 /// carries the arguments can win (issue: the first candidate used to be
 /// selected here and only rejected after the walk, losing the game).
-pub(crate) fn first_hit_naming_path(
-  probe: impl Iterator<Item = (Arc<ScannedEntry>, usize)>,
+pub(crate) fn first_hit_naming_path<'a>(
+  probe: impl Iterator<Item = (&'a Arc<ScannedEntry>, usize)>,
   variant: &str,
   process_args: Option<&str>,
-) -> MatchOutcome {
+) -> MatchOutcome<'a> {
   let mut any_match = false;
   for (obj, exe_index) in probe {
     let Some(exe) = obj.executables.get(exe_index) else {
@@ -245,15 +246,25 @@ pub(crate) fn arguments_contain_whole_word(args: Option<&str>, required: &str) -
   };
   // Token-based comparison: collapses runs of ASCII whitespace (including
   // empty argv entries that the reader joins with multiple spaces) so a
-  // required multi-token sequence matches regardless of spacing.
+  // required multi-token sequence matches regardless of spacing. Only
+  // the (usually 1-2 token) requirement is collected; the command line
+  // itself streams through a sliding window, so no Vec of its tokens.
   let required: Vec<&str> = required.split_ascii_whitespace().collect();
   if required.is_empty() {
     return true;
   }
-  let tokens: Vec<&str> = args.split_ascii_whitespace().collect();
-  tokens
-    .windows(required.len())
-    .any(|window| window == required.as_slice())
+  let mut window: Vec<&str> = Vec::with_capacity(required.len());
+  for token in args.split_ascii_whitespace() {
+    window.push(token);
+    if window.len() < required.len() {
+      continue;
+    }
+    if window == required.as_slice() {
+      return true;
+    }
+    window.remove(0);
+  }
+  false
 }
 
 impl ProcessServer {
@@ -269,27 +280,33 @@ impl ProcessServer {
   /// and keep looking at the rest of the variant instead of giving up on
   /// the variant as a whole. Overlapping iteration is what makes those
   /// two visible to the same walk.
-  fn main_probe<'a>(
+  fn main_probe<'b, 'r>(
     &self,
-    reversed_path: &'a str,
-    bundle: &'a DetectablesBundle,
-  ) -> impl Iterator<Item = (Arc<ScannedEntry>, usize)> + 'a {
+    reversed_path: &'r str,
+    bundle: &'b DetectablesBundle,
+  ) -> impl Iterator<Item = (&'b Arc<ScannedEntry>, usize)> + 'r
+  where
+    'b: 'r,
+  {
     bundle
       .ac
       .find_overlapping_iter(reversed_path)
       .filter_map(move |mat| {
         let pair = bundle.indexes.get(mat.pattern().as_usize())?.resolve();
-        Some((bundle.list.get(pair.0)?.clone(), pair.1))
+        Some((bundle.list.get(pair.0)?, pair.1))
       })
   }
 
   /// Custom-overrides half of [`ProcessServer::ac_probe`]. Same scan-order
   /// overlapping walk as [`main_probe`](ProcessServer::main_probe).
-  fn custom_probe<'a>(
+  fn custom_probe<'b, 'r>(
     &self,
-    reversed_path: &'a str,
-    bundle: &'a DetectablesBundle,
-  ) -> impl Iterator<Item = (Arc<ScannedEntry>, usize)> + 'a {
+    reversed_path: &'r str,
+    bundle: &'b DetectablesBundle,
+  ) -> impl Iterator<Item = (&'b Arc<ScannedEntry>, usize)> + 'r
+  where
+    'b: 'r,
+  {
     bundle.custom_ac.iter().flat_map(move |ac| {
       ac.find_overlapping_iter(reversed_path)
         .filter_map(move |mat| {
@@ -297,7 +314,7 @@ impl ProcessServer {
             .custom_indexes
             .get(mat.pattern().as_usize())?
             .resolve();
-          Some((bundle.custom.get(pair.0)?.clone(), pair.1))
+          Some((bundle.custom.get(pair.0)?, pair.1))
         })
     })
   }
@@ -319,11 +336,14 @@ impl ProcessServer {
   /// needs every match, because the first one can be a different entry's
   /// shorter name that does not name the process, and stopping there
   /// loses the game that does.
-  pub fn proton_probe<'a>(
+  pub fn proton_probe<'b, 'r>(
     &self,
-    reversed_path: &'a str,
-    bundle: &'a DetectablesBundle,
-  ) -> impl Iterator<Item = (Arc<ScannedEntry>, usize)> + 'a {
+    reversed_path: &'r str,
+    bundle: &'b DetectablesBundle,
+  ) -> impl Iterator<Item = (&'b Arc<ScannedEntry>, usize)> + 'r
+  where
+    'b: 'r,
+  {
     bundle.proton_ac.iter().flat_map(move |ac| {
       ac.find_overlapping_iter(reversed_path)
         .filter_map(move |mat| {
@@ -331,7 +351,7 @@ impl ProcessServer {
             .proton_indexes
             .get(mat.pattern().as_usize())?
             .resolve();
-          Some((bundle.list.get(pair.0)?.clone(), pair.1))
+          Some((bundle.list.get(pair.0)?, pair.1))
         })
     })
   }
@@ -351,15 +371,17 @@ impl ProcessServer {
   /// knows both halves at once — the string that was actually probed
   /// (the variant the 64-bit strip rewrote, or the cwd-joined candidate
   /// the caller built) and which executable matched it.
-  fn probe_variants(
+  fn probe_variants<'b>(
     &self,
     path: &str,
     probe: &mut ProbeBufs,
-    bundle: &DetectablesBundle,
+    bundle: &'b DetectablesBundle,
     proton: bool,
     process_args: Option<&str>,
-  ) -> MatchOutcome {
+  ) -> MatchOutcome<'b> {
     let variant_count = path_variants_into(path, &mut probe.variants);
+    // The returned `Arc` refs borrow `bundle` (as long as the generation),
+    // never the scratch path buffers that are refilled per variant.
     // Automaton passes outer, variants inner (strict precedence). Without
     // user overrides there is no custom automaton: run a single pass
     // instead of probing a guaranteed-`None` second automaton per variant.
@@ -405,7 +427,7 @@ impl ProcessServer {
         // A corroborated hit ends the walk. A refusal is remembered so the
         // looser tiers below can stand down, but the remaining variants
         // and the other automaton still get their turn.
-        if let Some((obj, exe_index)) = outcome.take_hit() {
+        if let MatchOutcome::Corroborated(obj, exe_index) = outcome {
           return MatchOutcome::Corroborated(obj, exe_index);
         }
       }
@@ -915,6 +937,7 @@ impl ProcessServer {
       .main_probe(reversed_path, bundle)
       .next()
       .or_else(|| self.custom_probe(reversed_path, bundle).next())
+      .map(|(obj, index)| (Arc::clone(obj), index))
   }
 }
 
