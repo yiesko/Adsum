@@ -383,8 +383,10 @@ impl Daemon {
     pump: Option<std::thread::JoinHandle<()>>,
   ) {
     if let Some(scanner) = scanner {
+      // Signal shutdown on the async side (non-blocking), then join
+      // the (potentially blocking) workers off the runtime worker.
+      scanner.shutdown();
       let joined = tokio::task::spawn_blocking(move || {
-        scanner.shutdown();
         let timed_out = scanner.join(Duration::from_secs(5));
         if timed_out > 0 {
           tracing::warn!(
