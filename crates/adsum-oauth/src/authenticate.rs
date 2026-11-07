@@ -201,7 +201,7 @@ pub fn refresh_access_token(
   refresh_token: &str,
   client_id: &str,
 ) -> Result<(String, Option<String>), OAuthError> {
-  let secret = store::client_secret().ok_or(OAuthError::InvalidArguments)?;
+  let secret = store::client_secret().ok_or(OAuthError::ClientSecretRequired)?;
   let agent: ureq::Agent = ureq::Agent::config_builder()
     .timeout_global(Some(Duration::from_secs(12)))
     .max_redirects(0)

@@ -79,21 +79,22 @@ pub fn read_exec_into(pid: u64, exec: &mut Exec, scratch: &mut ExecScratch) -> b
   exec.argument_spans.clear();
   // Preserve argv boundaries: one span per non-empty token, even when
   // the token itself contains spaces (NUL-separated in /proc).
+  // Preserve argv boundaries: one span per token (empty ones included),
+  // even when the token itself contains spaces (NUL-separated in /proc).
   const MAX_ARG_TOKENS: usize = 256;
-  for arg in cmd_iter {
-    if exec.argument_spans.len() >= MAX_ARG_TOKENS {
-      break;
-    }
-    if !exec.argument_spans.is_empty() {
+  for (index, arg) in cmd_iter.enumerate() {
+    if index > 0 {
       scratch.args.push(' ');
     }
     let start = scratch.args.len();
     scratch.args.push_str(arg);
     let end = scratch.args.len();
-    exec.argument_spans.push(ArgSpan {
-      start: u32::try_from(start).unwrap_or(u32::MAX),
-      end: u32::try_from(end).unwrap_or(u32::MAX),
-    });
+    if exec.argument_spans.len() < MAX_ARG_TOKENS {
+      exec.argument_spans.push(ArgSpan {
+        start: u32::try_from(start).unwrap_or(u32::MAX),
+        end: u32::try_from(end).unwrap_or(u32::MAX),
+      });
+    }
   }
   let previous = exec.arguments.take();
   if !scratch.args.is_empty() {
