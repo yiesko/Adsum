@@ -34,6 +34,9 @@ hotpath.workspace = true
 libc = "0.2"
 adsum-proc-events = { path = "../adsum-proc-events" }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 sysinfo = { version = "0.39.6", default-features = false, features = ["system", "multithread"] }
 

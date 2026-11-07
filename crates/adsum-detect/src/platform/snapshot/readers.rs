@@ -55,18 +55,55 @@ pub(crate) fn read_steam_app_id(pid: u64, _scratch: &mut ExecScratch) -> Option<
   })
 }
 
-/// Stubbed on non-Linux (Steam matching there is already limited).
+/// Read the process working directory. macOS supports this through
+/// `proc_pidinfo`; other non-Linux targets remain unsupported.
+#[allow(clippy::ptr_arg)]
 pub(crate) fn read_cwd_into(_pid: u64, _buf: &mut Vec<u8>, _path: &mut String) -> Option<()> {
+  #[cfg(target_os = "macos")]
+  return read_cwd_into_macos(_pid, _buf);
+  #[cfg(not(target_os = "macos"))]
   None
 }
 
+/// macOS cwd reader: copy the `proc_vnodepathinfo` cwd bytes into `buf`.
+#[cfg(target_os = "macos")]
+fn read_cwd_into_macos(pid: u64, buf: &mut Vec<u8>) -> Option<()> {
+  let pid = i32::try_from(pid).ok()?;
+  let mut info = std::mem::MaybeUninit::<libc::proc_vnodepathinfo>::uninit();
+  // SAFETY: `info` owns writable storage for the fixed-size structure
+  // the macOS kernel writes; the request size is the struct size.
+  let bytes = unsafe {
+    libc::proc_pidinfo(
+      pid,
+      libc::PROC_PIDVNODEPATHINFO,
+      0,
+      info.as_mut_ptr().cast::<libc::c_void>(),
+      std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int,
+    )
+  };
+  if bytes != std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int {
+    return None;
+  }
+  // SAFETY: proc_pidinfo wrote a valid proc_vnodepathinfo.
+  let info = unsafe { info.assume_init() };
+  let raw = info.pvi_cdir.vip_path;
+  let bytes = unsafe {
+    std::slice::from_raw_parts(raw.as_ptr().cast::<u8>(), raw.len() * raw.first()?.len())
+  };
+  let end = bytes.iter().position(|byte| *byte == 0)?;
+  buf.clear();
+  buf.extend_from_slice(&bytes[..end]);
+  std::str::from_utf8(buf).ok()?;
+  Some(())
+}
+
 /// Stubbed on non-Linux.
-pub(crate) fn read_image_path_into(
+pub(crate) fn read_image_path_into<'a>(
   _pid: u64,
-  _buf: &mut String,
-  _path: &mut String,
-  _raw: &mut Vec<u8>,
-) -> Option<&str> {
+  _buf: &'a mut String,
+  _path: &'a mut String,
+  _raw: &'a mut Vec<u8>,
+) -> Option<&'a str> {
   None
 }
 

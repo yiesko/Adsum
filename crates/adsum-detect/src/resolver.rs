@@ -14,7 +14,7 @@ fn basename(path: &str) -> Option<&str> {
 }
 
 /// Whether `name` is a Wine loader that should be skipped in a chain.
-fn is_wine_loader(name: &str) -> bool {
+pub(crate) fn is_wine_loader_name(name: &str) -> bool {
   name.eq_ignore_ascii_case("wine")
     || name.eq_ignore_ascii_case("wine64")
     || name.eq_ignore_ascii_case("wine-preloader")
@@ -93,7 +93,7 @@ fn resolve_box64_inner(process: &Exec) -> Option<ResolvedTarget<'_>> {
   // Skip chained Wine loaders.
   let mut i = 0usize;
   while let Some(tok) = process.argument_at(i) {
-    if is_wine_loader(tok) {
+    if is_wine_loader_name(tok) {
       i += 1;
     } else {
       break;
@@ -211,16 +211,42 @@ fn resolve_qemu_user_inner(process: &Exec) -> Option<ResolvedTarget<'_>> {
 /// Resolve a Wine/Proton chain, skipping loaders and rejecting system paths.
 pub(crate) fn resolve_wine_chain(process: &Exec) -> Option<ResolvedTarget<'_>> {
   let name = basename(&process.path)?;
-  if !is_wine_loader(name) {
+  if !is_wine_loader_name(name) {
     return None;
   }
   resolve_wine_chain_inner(process)
 }
 
+/// Resolve a Wine chain, joining a relative target to the caller's cwd.
+/// `buffer` is then borrowed, so the joined path needs no allocation.
+pub(crate) fn resolve_wine_chain_with_cwd<'a>(
+  process: &'a Exec,
+  cwd: Option<&str>,
+  buffer: &'a mut String,
+) -> Option<ResolvedTarget<'a>> {
+  let resolved = resolve_wine_chain(process)?;
+  if resolved.path.starts_with('/') {
+    return Some(resolved);
+  }
+  let cwd = cwd.filter(|cwd| !cwd.is_empty())?;
+  let relative = resolved.path.strip_prefix("./").unwrap_or(resolved.path);
+  buffer.clear();
+  buffer.push_str(cwd.trim_end_matches('/'));
+  if !buffer.ends_with('/') {
+    buffer.push('/');
+  }
+  buffer.push_str(relative);
+  Some(ResolvedTarget {
+    path: buffer.as_str(),
+    argument_start: resolved.argument_start,
+    is_windows_binary: resolved.is_windows_binary,
+  })
+}
+
 fn resolve_wine_chain_inner(process: &Exec) -> Option<ResolvedTarget<'_>> {
   let mut i = 0usize;
   while let Some(tok) = process.argument_at(i) {
-    if is_wine_loader(tok) {
+    if is_wine_loader_name(tok) {
       i += 1;
     } else {
       break;
@@ -297,7 +323,7 @@ pub(crate) fn resolve_target<'a>(
     || name.eq_ignore_ascii_case("qemu-x86_64-static")
   {
     resolve_qemu_user_inner(process)
-  } else if is_wine_loader(name) {
+  } else if is_wine_loader_name(name) {
     resolve_wine_chain_inner(process)
   } else if is_reaper(name) {
     resolve_steam_reaper_inner(process).map(|(_, idx)| ResolvedTarget {

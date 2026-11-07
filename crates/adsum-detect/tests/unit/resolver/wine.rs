@@ -1,5 +1,5 @@
 use super::*;
-use crate::resolver::resolve_wine_chain;
+use crate::resolver::{resolve_wine_chain, resolve_wine_chain_with_cwd};
 
 fn exec(path: &str, args: Option<&str>) -> Exec {
   Exec {
@@ -81,4 +81,30 @@ fn wine_preserves_target_arguments() {
   let r = resolve_wine_chain(&e).expect("resolves");
   assert_eq!(r.path, "./game.exe");
   assert_eq!(e.arguments_from(r.argument_start), Some("-windowed"));
+}
+
+/// A macOS Wine process carries the actual game in argv, not in the
+/// saved image path: a relative target must be joined with the current
+/// working directory without taking a heap copy.
+#[test]
+fn wine_joins_relative_target_with_cwd() {
+  let e = exec("wine64", Some("./demo/game.exe -windowed"));
+  let mut buffer = String::new();
+  let r = resolve_wine_chain_with_cwd(&e, Some("/games/steam"), &mut buffer).expect("resolves");
+  assert_eq!(r.path, "/games/steam/demo/game.exe");
+  assert_eq!(e.arguments_from(r.argument_start), Some("-windowed"));
+}
+
+#[test]
+fn wine_rejects_system_target_even_with_cwd() {
+  let e = exec("wine", Some("C:\\Windows\\System32\\explorer.exe"));
+  let mut buffer = String::new();
+  assert!(resolve_wine_chain_with_cwd(&e, Some("/games"), &mut buffer).is_none());
+}
+
+#[test]
+fn wine_requires_cwd_for_relative_target() {
+  let e = exec("wine", Some("./game.exe"));
+  let mut buffer = String::new();
+  assert!(resolve_wine_chain_with_cwd(&e, None, &mut buffer).is_none());
 }

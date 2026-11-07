@@ -463,6 +463,22 @@ impl ProcessServer {
     // backslashes, absolute path) allocates nothing at all.
     // Lazy /proc/<pid>/exe read only for candidate emulators.
     let raw_basename_for_image = process.path.rsplit('/').next().unwrap_or(&process.path);
+    // A Wine target is usually an argument, and may be relative to the
+    // process working directory; read it before the Wine branch below.
+    let wine_cwd: Option<String> = if crate::resolver::is_wine_loader_name(raw_basename_for_image)
+      && crate::platform::read_cwd_into(
+        process.pid,
+        &mut scratch.match_scratch.cwd,
+        &mut scratch.match_scratch.proc_path,
+      )
+      .is_some()
+    {
+      std::str::from_utf8(&scratch.match_scratch.cwd)
+        .ok()
+        .map(str::to_owned)
+    } else {
+      None
+    };
     // Reuse the scan scratch buffer for the lazy image path instead of
     // allocating a new String per candidate emulator.
     let image_path = if crate::resolver::is_emulator_basename(raw_basename_for_image) {
@@ -478,6 +494,8 @@ impl ProcessServer {
     };
     // Prefer the direct wrapper resolver for the common argv[0] case;
     // fall back to identity-based resolution for /proc/exe mismatches.
+    // A joined relative Wine target lives here, not in scan scratch.
+    let mut wine_target_buffer = String::new();
     let resolved_target = match raw_basename_for_image {
       name if name.eq_ignore_ascii_case("box64") => crate::resolver::resolve_box64(process),
       name
@@ -499,7 +517,11 @@ impl ProcessServer {
           || name.eq_ignore_ascii_case("wine-preloader")
           || name.eq_ignore_ascii_case("wine64-preloader") =>
       {
-        crate::resolver::resolve_wine_chain(process)
+        crate::resolver::resolve_wine_chain_with_cwd(
+          process,
+          wine_cwd.as_deref(),
+          &mut wine_target_buffer,
+        )
       }
       name if name.eq_ignore_ascii_case("reaper") => crate::resolver::resolve_steam_reaper(process)
         .and_then(|(_, idx)| {

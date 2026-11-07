@@ -199,7 +199,7 @@ pub struct DetectablesBundle {
   pub(crate) list: Arc<[Arc<ScannedEntry>]>,
   pub(crate) ac: AhoCorasick,
   pub(crate) indexes: Vec<PatternIndex>,
-  /// Proton fallback automaton (Linux only): `win32` executables from the
+  /// Wine fallback automaton (Linux and macOS): `win32` executables from the
   /// main DB, probed after the native patterns and the authoritative Steam
   /// AppId, but before the stem/folder heuristics. Empty on other platforms.
   pub(crate) proton_ac: Option<AhoCorasick>,
@@ -454,8 +454,8 @@ struct SplitPatterns {
 }
 
 /// Walk the entries once, partitioning executables into the native set
-/// (non-launcher, empty-OS or `os_matches`) and the Proton set (Linux
-/// only: non-launcher `win32`). Eligibility mirrors
+/// (non-launcher, empty-OS or `os_matches`) and the Wine set (Linux
+/// and macOS: non-launcher `win32`). Eligibility mirrors
 /// `build_ac_patterns_with_os_filter(enforce_os=true)` and the old
 /// `build_proton_ac_patterns` exactly; the two sets are disjoint on
 /// every platform, so each exe normalizes at most once — the same total
@@ -464,8 +464,8 @@ struct SplitPatterns {
 /// front); `build_bundle` shrinks the index vectors before they outlive
 /// the build.
 fn collect_split_patterns(detectables: &[Arc<ScannedEntry>]) -> SplitPatterns {
-  // Proton collection is unneeded off Linux: leave it unallocated.
-  let want_proton = cfg!(target_os = "linux");
+  // Wine fallback collection: Linux and macOS collect `win32` patterns.
+  let want_proton = cfg!(target_os = "linux") || cfg!(target_os = "macos");
   let mut split = SplitPatterns {
     native_patterns: Vec::new(),
     native_idx: Vec::new(),
@@ -479,9 +479,9 @@ fn collect_split_patterns(detectables: &[Arc<ScannedEntry>]) -> SplitPatterns {
       }
       // Native eligibility: empty OS or this platform's tag.
       let native = executable.os.is_empty() || os_matches(executable.os.as_str());
-      // Proton eligibility (Linux only): win32 exes. Disjoint from
-      // native on Linux (`win32` never `os_matches` there); unreachable
-      // elsewhere (`want_proton` is false).
+      // Wine eligibility (Linux and macOS): win32 exes. Disjoint from
+      // native on those targets (`win32` never `os_matches` there);
+      // unreachable elsewhere (`want_proton` is false).
       let proton = want_proton && executable.os == OsName::Win32;
       if !native && !proton {
         continue;
@@ -549,7 +549,7 @@ pub(crate) fn build_bundle_for_os(
     (None, split.proton_idx)
   } else {
     tracing::info!(
-      "[Process Scanner] Proton fallback: {} win32 patterns",
+      "[Process Scanner] Wine fallback: {} win32 patterns",
       split.proton_patterns.len()
     );
     let automaton = build_ac_automaton(&split.proton_patterns)?;
