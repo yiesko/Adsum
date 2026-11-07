@@ -441,6 +441,12 @@ impl OAuthConnection {
     self.with_live_session(|session: Option<&OAuthSession>| session.cloned())
   }
 
+  /// Whether this connection currently holds a live session, without
+  /// cloning the session or its tokens.
+  pub fn is_authenticated(&self) -> Result<bool, OAuthError> {
+    self.with_live_session(|session| session.is_some())
+  }
+
   /// Run `f` against the live session under one lock, after the shared
   /// cancellation and expiry checks.
   fn with_live_session<T>(
@@ -467,8 +473,7 @@ impl OAuthConnection {
   /// after expiry or failed reauthentication, never for another client's card.
   pub fn check_command(&self, command: &ActivityCmd, owned_clear: bool) -> Result<(), OAuthError> {
     let oauth = matches!(command.cmd.as_ref(), "AUTHORIZE" | "AUTHENTICATE");
-    let session = self.session();
-    let authenticated = matches!(&session, Ok(Some(_)));
+    let authenticated = self.is_authenticated().unwrap_or(false);
     if (oauth || authenticated || self.manager.policy == RpcAuthPolicy::Required)
       && command
         .application_id
@@ -483,7 +488,7 @@ impl OAuthConnection {
         .args
         .as_ref()
         .is_some_and(|args| matches!(args.activity, Some(None)));
-    match session {
+    match self.session() {
       Err(OAuthError::InvalidAccessToken) if cleanup || oauth => Ok(()),
       Err(error) => Err(error),
       Ok(_) if oauth || cleanup => Ok(()),

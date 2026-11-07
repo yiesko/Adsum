@@ -334,6 +334,14 @@ fn handle_rpc_command_with_context(
             );
             return Err(OAuthError::ClientSecretRequired);
           };
+          // Restoring a stored grant without proof of possession is opt-in.
+          if std::env::var("ADSUM_OAUTH_ALLOW_RESTORE").ok().as_deref() != Some("1") {
+            tracing::info!(
+              application = %expected_client_id,
+              "[oauth] stored grant restore disabled (set ADSUM_OAUTH_ALLOW_RESTORE=1 to enable)"
+            );
+            return Err(OAuthError::InvalidAccessToken);
+          }
           tracing::info!(
             application = %expected_client_id,
             stored_scopes = %stored.scopes.join(" "),
