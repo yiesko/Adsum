@@ -25,7 +25,9 @@ fn read_exec_into_captures_sleep() {
   }
   assert!(exec.path.ends_with("sleep"));
   let mut buf = String::new();
-  let image = read_image_path_into(pid, &mut buf);
+  let mut image_path = String::new();
+  let mut raw = Vec::new();
+  let image = read_image_path_into(pid, &mut buf, &mut image_path, &mut raw);
   // Process may have exited; accept None.
   if let Some(path) = image {
     assert!(path.ends_with("sleep"));

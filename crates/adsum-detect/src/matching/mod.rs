@@ -466,7 +466,13 @@ impl ProcessServer {
     // Reuse the scan scratch buffer for the lazy image path instead of
     // allocating a new String per candidate emulator.
     let image_path = if crate::resolver::is_emulator_basename(raw_basename_for_image) {
-      crate::platform::read_image_path_into(process.pid, &mut scratch.match_scratch.stat)
+      let scratch = &mut scratch.match_scratch;
+      crate::platform::read_image_path_into(
+        process.pid,
+        &mut scratch.stat,
+        &mut scratch.proc_path,
+        &mut scratch.cwd,
+      )
     } else {
       None
     };

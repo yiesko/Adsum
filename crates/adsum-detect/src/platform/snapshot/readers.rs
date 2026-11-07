@@ -61,7 +61,12 @@ pub(crate) fn read_cwd_into(_pid: u64, _buf: &mut Vec<u8>, _path: &mut String) -
 }
 
 /// Stubbed on non-Linux.
-pub(crate) fn read_image_path_into(_pid: u64, _buf: &mut String) -> Option<&str> {
+pub(crate) fn read_image_path_into(
+  _pid: u64,
+  _buf: &mut String,
+  _path: &mut String,
+  _raw: &mut Vec<u8>,
+) -> Option<&str> {
   None
 }
 

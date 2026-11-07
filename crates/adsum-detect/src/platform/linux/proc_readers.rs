@@ -77,10 +77,8 @@ pub fn read_exec_into(pid: u64, exec: &mut Exec, scratch: &mut ExecScratch) -> b
   exec.path.push_str(cmd_path);
   scratch.args.clear();
   exec.argument_spans.clear();
-  // Preserve argv boundaries: one span per non-empty token, even when
-  // the token itself contains spaces (NUL-separated in /proc).
-  // Preserve argv boundaries: one span per token (empty ones included),
-  // even when the token itself contains spaces (NUL-separated in /proc).
+  // Preserve argv boundaries: one span per argv entry, including empty
+  // ones, even when the token contains spaces (NUL-separated in /proc).
   const MAX_ARG_TOKENS: usize = 256;
   for (index, arg) in cmd_iter.enumerate() {
     if index > 0 {
@@ -152,46 +150,41 @@ pub(crate) fn read_steam_app_id(pid: u64, scratch: &mut ExecScratch) -> Option<S
   None
 }
 
-/// Process working directory via `/proc/<pid>/cwd` (one readlink, no file
-/// content), read into the caller's reuse buffers: `buf` receives the
-/// link target (lowercased in place — ASCII fold, byte-identical to the
-/// old `to_ascii_lowercase`), `path` carries the `/proc/<pid>/cwd`
-/// spelling. Proton launches with the game dir as cwd, so joining it with
-/// a bare exe reconstructs the install path the DB knows (DOOM Eternal
-/// case). Read lazily: only bare-exe misses pay for it.
-///
-/// Zero allocations once warm: the previous shape paid three per miss
-/// (`format!` path, `read_link`'s `PathBuf`, the lowercase `String`).
-/// `None` for unreadable links, non-UTF-8 targets (same rule as the old
-/// `to_str()?`) and oversized ones (past `MAX_CWD_BYTES`: hostile or
-/// broken, and no real cwd is kilobytes deep).
+/// Process working directory via `/proc/<pid>/cwd`, lowercased in place.
+/// Read lazily: only bare-exe misses pay for it.
 pub(crate) fn read_cwd_into(pid: u64, buf: &mut Vec<u8>, path: &mut String) -> Option<()> {
-  use std::fmt::Write as _;
-  // PATH_MAX on Linux is 4096; readlink truncates to the buffer, and a
-  // truncated cwd would join into a wrong path — refuse it instead.
-  const MAX_CWD_BYTES: usize = 4096;
-
-  path.clear();
-  // Trailing NUL rides inside the String: readlink wants a C string, and
-  // `write!` into the cleared buffer reuses it (OOM is the only failure).
-  write!(path, "/proc/{pid}/cwd\0").ok()?;
-  if buf.capacity() < MAX_CWD_BYTES {
-    buf.reserve(MAX_CWD_BYTES - buf.capacity());
-  }
-  // SAFETY: `path` is a NUL-terminated C string in a live buffer; `buf`
-  // has at least MAX_CWD_BYTES writable bytes behind its pointer; the
-  // kernel writes at most that many and returns the count (or -1).
-  let n = unsafe { libc::readlink(path.as_ptr().cast(), buf.as_mut_ptr().cast(), MAX_CWD_BYTES) };
-  if n < 0 || usize::try_from(n).unwrap_or(usize::MAX) >= MAX_CWD_BYTES {
-    return None;
-  }
-  // SAFETY: readlink wrote exactly `n` bytes into the spare capacity.
-  unsafe { buf.set_len(n as usize) };
-  // Same UTF-8 rule as the old `to_str()?`, then fold ASCII in place.
+  readlink_proc(pid, "cwd", buf, path)?;
   std::str::from_utf8(buf).ok()?;
   for byte in buf.iter_mut() {
     byte.make_ascii_lowercase();
   }
+  Some(())
+}
+
+/// Read `/proc/<pid>/<name>` into `raw` with caller-owned scratch.
+/// Zero allocations once warm; `None` on read errors or truncation.
+fn readlink_proc(pid: u64, name: &str, raw: &mut Vec<u8>, path: &mut String) -> Option<()> {
+  use std::fmt::Write as _;
+  // PATH_MAX on Linux is 4096; readlink truncates to the buffer, and a
+  // truncated target must not be mistaken for the real path.
+  const MAX_BYTES: usize = 4096;
+
+  path.clear();
+  // Trailing NUL rides inside the String: readlink wants a C string, and
+  // `write!` into the cleared buffer reuses it (OOM is the only failure).
+  write!(path, "/proc/{pid}/{name}\0").ok()?;
+  if raw.capacity() < MAX_BYTES {
+    raw.reserve(MAX_BYTES - raw.capacity());
+  }
+  // SAFETY: `path` is a NUL-terminated C string in a live buffer; `raw`
+  // has at least MAX_BYTES writable bytes behind its pointer; the
+  // kernel writes at most that many and returns the count (or -1).
+  let n = unsafe { libc::readlink(path.as_ptr().cast(), raw.as_mut_ptr().cast(), MAX_BYTES) };
+  if n < 0 || usize::try_from(n).unwrap_or(usize::MAX) >= MAX_BYTES {
+    return None;
+  }
+  // SAFETY: readlink wrote exactly `n` bytes into the spare capacity.
+  unsafe { raw.set_len(n as usize) };
   Some(())
 }
 
@@ -247,17 +240,18 @@ pub fn parse_stat_state(stat: &str) -> Option<char> {
     .and_then(|state| state.chars().next())
 }
 
-/// Read `/proc/<pid>/exe` into `buffer`, returning the borrowed string.
-/// Strips the ` (deleted)` suffix the kernel appends to unlinked
-/// binaries. Returns `None` off-Linux or on any read failure.
-pub(crate) fn read_image_path_into(pid: u64, buffer: &mut String) -> Option<&str> {
+/// Read `/proc/<pid>/exe` into `buffer`, stripped of ` (deleted)`.
+/// Candidate emulators only; borrows the caller's buffers.
+pub(crate) fn read_image_path_into<'a>(
+  pid: u64,
+  buffer: &'a mut String,
+  path: &mut String,
+  raw: &mut Vec<u8>,
+) -> Option<&'a str> {
+  readlink_proc(pid, "exe", raw, path)?;
+  let text = std::str::from_utf8(raw).ok()?;
   buffer.clear();
-  let link = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
-  let mut text = link.into_os_string().into_string().ok()?;
-  if text.ends_with(" (deleted)") {
-    text.truncate(text.len() - " (deleted)".len());
-  }
-  buffer.push_str(&text);
+  buffer.push_str(text.strip_suffix(" (deleted)").unwrap_or(text));
   Some(buffer.as_str())
 }
 
