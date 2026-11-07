@@ -18,6 +18,10 @@ target/
 # git consumers of adsum keep building.
 /detectable.json
 
+# Python bytecode
+__pycache__/
+*.py[cod]
+
 # JetBrains IDEs
 .idea/
 .direnv
