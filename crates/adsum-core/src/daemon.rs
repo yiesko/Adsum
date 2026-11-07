@@ -51,6 +51,15 @@ impl std::fmt::Debug for Daemon {
   }
 }
 
+struct ServeParams {
+  proc_rx: mpsc::Receiver<ProcInput>,
+  proc_tx: Option<mpsc::Sender<ProcInput>>,
+  watch_gauge: Option<adsum_telemetry::QueueGauge>,
+  user: Arc<Mutex<RpcUser>>,
+  oauth: Arc<OAuthManager>,
+  scanner_handle: Option<adsum_detect::runtime::ShutdownHandle>,
+}
+
 impl Daemon {
   /// Create from already-parsed activities (infallible).
   #[must_use]
@@ -232,12 +241,15 @@ impl Daemon {
     }
     let result = self
       .serve(
-        proc_rx,
-        proc_tx,
-        scanner_gauge,
-        user,
+        ServeParams {
+          proc_rx,
+          proc_tx,
+          watch_gauge: scanner_gauge,
+          user,
+          oauth: Arc::clone(&oauth),
+          scanner_handle: scanner.as_ref().map(ProcessServer::shutdown_handle),
+        },
         shutdown,
-        Arc::clone(&oauth),
       )
       .await;
     // Both transports have stopped on success and bind failure. Join OAuth
@@ -274,13 +286,17 @@ impl Daemon {
   /// completion; scanner and OAuth worker joins are the caller's job.
   async fn serve(
     &self,
-    proc_rx: mpsc::Receiver<ProcInput>,
-    proc_tx: Option<mpsc::Sender<ProcInput>>,
-    watch_gauge: Option<adsum_telemetry::QueueGauge>,
-    user: Arc<Mutex<RpcUser>>,
+    params: ServeParams,
     shutdown: impl Future<Output = ()> + Send + 'static,
-    oauth: Arc<OAuthManager>,
   ) -> Result<()> {
+    let ServeParams {
+      proc_rx,
+      proc_tx,
+      watch_gauge,
+      user,
+      oauth,
+      scanner_handle,
+    } = params;
     let (mut ipc_transport, mut ipc_rx) = split_option(None);
     let (mut game_transport, mut game_rx) = split_option(None);
 
@@ -355,6 +371,18 @@ impl Daemon {
 
       shutdown.await;
       tracing::info!("[daemon] Shutting down...");
+      // Signal the scanner first so its final events can still reach the
+      // bridge; then stop transports (which may emit cleanup), drain the
+      // bridge, and only then drop the alias ownership.
+      if let Some(handle) = scanner_handle {
+        handle.signal();
+      }
+      if let Some(transport) = game_transport.take() {
+        transport.shutdown().await;
+      }
+      if let Some(transport) = ipc_transport.take() {
+        transport.shutdown().await;
+      }
       bridge.shutdown().await;
       if let Some(aliases) = alias_ownership {
         aliases.shutdown().await;
@@ -363,14 +391,7 @@ impl Daemon {
     }
     .await;
 
-    // Await partial transports too: a later bind failure must not leave their
-    // connections racing the daemon-wide OAuth worker join.
-    if let Some(transport) = game_transport {
-      transport.shutdown().await;
-    }
-    if let Some(transport) = ipc_transport {
-      transport.shutdown().await;
-    }
+    // Partial transports are already shut down above; nothing to do here.
     result
   }
 
