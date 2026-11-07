@@ -109,27 +109,29 @@ impl StateSnapshot {
   }
 }
 
-/// Snapshot slot prefix: `adsum-state-` by default, so Adsum's files sit
-/// beside arRPC's without colliding. `ADSUM_STATE_PREFIX` overrides it.
+/// Snapshot slot prefix from `ADSUM_STATE_PREFIX`, or the default.
 pub fn snapshot_prefix() -> Cow<'static, str> {
-  snapshot_prefix_from(std::env::var("ADSUM_STATE_PREFIX").ok().as_deref())
+  std::env::var("ADSUM_STATE_PREFIX")
+    .ok()
+    .filter(|v| is_valid_prefix(v))
+    .map(Cow::Owned)
+    .unwrap_or(Cow::Borrowed(STATE_FILE_PREFIX))
 }
 
-/// Pure core of [`snapshot_prefix`]: blank, separator-bearing or over-long
-/// values fall back to the default instead of escaping the temp directory.
-fn snapshot_prefix_from(raw: Option<&str>) -> Cow<'static, str> {
-  match raw {
-    Some(value)
-      if !value.is_empty()
-        && value.len() <= 64
-        && value
-          .bytes()
-          .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')) =>
-    {
-      Cow::Owned(value.to_owned())
-    }
-    _ => Cow::Borrowed(STATE_FILE_PREFIX),
-  }
+/// Validates a borrowed prefix, returning it owned or the default.
+pub fn snapshot_prefix_from(raw: Option<&str>) -> Cow<'static, str> {
+  raw
+    .filter(|v| is_valid_prefix(v))
+    .map(|v| Cow::Owned(v.to_owned()))
+    .unwrap_or(Cow::Borrowed(STATE_FILE_PREFIX))
+}
+
+fn is_valid_prefix(value: &str) -> bool {
+  !value.is_empty()
+    && value.len() <= 64
+    && value
+      .bytes()
+      .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 /// Pick a snapshot slot in `dir`: the first missing, stale (`mtime` older
