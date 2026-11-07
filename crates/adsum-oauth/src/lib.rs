@@ -1,5 +1,6 @@
 //! Experimental OAuth support for Discord's legacy local RPC protocol.
 
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use adsum_types::user::RpcUser;
@@ -85,7 +86,7 @@ impl OAuthSession {
 #[derive(Clone)]
 pub struct RpcOAuthResult {
   pub data: Value,
-  pub session: Option<OAuthSession>,
+  pub session: Option<Arc<OAuthSession>>,
 }
 
 impl std::fmt::Debug for RpcOAuthResult {
@@ -382,7 +383,7 @@ fn handle_rpc_command_with_context(
       }
       Ok(RpcOAuthResult {
         data,
-        session: Some(session),
+        session: Some(Arc::new(session)),
       })
     }
     _ => Err(OAuthError::UnexpectedDiscordResponse),

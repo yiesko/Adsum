@@ -312,7 +312,7 @@ const REST_CACHE_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
 struct ConnectionState {
-  session: Option<OAuthSession>,
+  session: Option<Arc<OAuthSession>>,
   busy: bool,
   /// Short-lived cache of token-backed REST responses, keyed by path.
   /// Bounds memory: at most a few dozen entries per connection.
@@ -435,33 +435,30 @@ impl OAuthConnection {
     })
   }
 
-  /// Return a live session, reporting expiry once instead of falling back to a
-  /// cosmetic legacy identity for the request that discovered expiration.
-  pub fn session(&self) -> Result<Option<OAuthSession>, OAuthError> {
-    self.with_live_session(|session: Option<&OAuthSession>| session.cloned())
+  /// Returns the live session handle, reporting expiry once.
+  pub fn session(&self) -> Result<Option<Arc<OAuthSession>>, OAuthError> {
+    self.with_live_session(|session| session.map(Arc::clone))
   }
 
-  /// Whether this connection currently holds a live session, without
-  /// cloning the session or its tokens.
+  /// Whether this connection currently holds a live session.
   pub fn is_authenticated(&self) -> Result<bool, OAuthError> {
     self.with_live_session(|session| session.is_some())
   }
 
-  /// Run `f` against the live session under one lock, after the shared
-  /// cancellation and expiry checks.
+  /// Runs `f` against the live session under one lock.
   fn with_live_session<T>(
     &self,
-    f: impl FnOnce(Option<&OAuthSession>) -> T,
+    f: impl FnOnce(Option<&Arc<OAuthSession>>) -> T,
   ) -> Result<T, OAuthError> {
     if self.closed.load(Ordering::Acquire) || self.manager.shutdown.load(Ordering::Acquire) {
       return Err(OAuthError::Cancelled);
     }
-    let lock = self.state.lock();
-    let mut state = match lock {
-      Ok(g) => g,
-      Err(e) => e.into_inner(),
-    };
-    if state.session.as_ref().is_some_and(OAuthSession::is_expired) {
+    let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+    if state
+      .session
+      .as_ref()
+      .is_some_and(|s| s.as_ref().is_expired())
+    {
       state.session = None;
       return Err(OAuthError::InvalidAccessToken);
     }
@@ -473,7 +470,16 @@ impl OAuthConnection {
   /// after expiry or failed reauthentication, never for another client's card.
   pub fn check_command(&self, command: &ActivityCmd, owned_clear: bool) -> Result<(), OAuthError> {
     let oauth = matches!(command.cmd.as_ref(), "AUTHORIZE" | "AUTHENTICATE");
-    let authenticated = self.is_authenticated().unwrap_or(false);
+    let cleanup = owned_clear
+      && command.cmd == "SET_ACTIVITY"
+      && command
+        .args
+        .as_ref()
+        .is_some_and(|args| matches!(args.activity, Some(None)));
+    // One `session()` per check: expiry is reported once and clears the
+    // session, so a preliminary probe would consume it and hide it.
+    let session = self.session();
+    let authenticated = matches!(session, Ok(Some(_)));
     if (oauth || authenticated || self.manager.policy == RpcAuthPolicy::Required)
       && command
         .application_id
@@ -482,13 +488,7 @@ impl OAuthConnection {
     {
       return Err(OAuthError::ApplicationMismatch);
     }
-    let cleanup = owned_clear
-      && command.cmd == "SET_ACTIVITY"
-      && command
-        .args
-        .as_ref()
-        .is_some_and(|args| matches!(args.activity, Some(None)));
-    match self.session() {
+    match session {
       Err(OAuthError::InvalidAccessToken) if cleanup || oauth => Ok(()),
       Err(error) => Err(error),
       Ok(_) if oauth || cleanup => Ok(()),
@@ -623,10 +623,11 @@ impl OAuthConnection {
         } else {
           result.and_then(|mut result| {
             if authenticate {
-              let session = result
+              let session_arc = result
                 .session
                 .as_mut()
                 .ok_or(OAuthError::UnexpectedDiscordResponse)?;
+              let session = Arc::make_mut(session_arc);
               if session.application_id != connection.client_id {
                 return Err(OAuthError::ApplicationMismatch);
               }
@@ -657,7 +658,7 @@ impl OAuthConnection {
                   "[oauth] authenticated (no identify scope; user withheld)"
                 ),
               }
-              state.session = Some(session.clone());
+              state.session = result.session.as_ref().map(Arc::clone);
             } else {
               tracing::info!(
                 application = %connection.client_id.as_ref(),

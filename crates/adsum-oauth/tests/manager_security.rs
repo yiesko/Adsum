@@ -131,7 +131,7 @@ fn authenticated_result(session: OAuthSession) -> RpcOAuthResult {
       "scopes": &session.scopes,
       "user": &session.user,
     }),
-    session: Some(session),
+    session: Some(Arc::new(session)),
   }
 }
 
@@ -478,7 +478,7 @@ fn sessions_are_connection_local_even_for_the_same_application_and_snapshots_are
     );
   }
 
-  let mut snapshot = first.session().unwrap().unwrap();
+  let mut snapshot = (*first.session().unwrap().unwrap()).clone();
   snapshot.application_id = AppId::from(APPLICATION_B);
   snapshot.user.as_mut().unwrap().id = USER_B.to_owned();
   snapshot.scopes.clear();
@@ -1078,7 +1078,7 @@ fn rpc_oauth_result_debug_redacts_credentials_and_session_contents() {
       "nested": {"refresh_token": "secret-refresh-token"},
       "user": {"id": USER_A}
     }),
-    session: Some(session),
+    session: Some(Arc::new(session)),
   };
   for debug in [
     format!("{result:?}"),

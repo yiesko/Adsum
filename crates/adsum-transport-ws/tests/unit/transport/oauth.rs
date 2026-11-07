@@ -11,13 +11,13 @@ impl adsum_oauth::OAuthBackend for ImmediateBackend {
   ) -> std::result::Result<adsum_oauth::RpcOAuthResult, OAuthError> {
     Ok(adsum_oauth::RpcOAuthResult {
       data: serde_json::json!({ "authenticated": true }),
-      session: Some(adsum_oauth::OAuthSession {
+      session: Some(std::sync::Arc::new(adsum_oauth::OAuthSession {
         application_id: AppId::from(expected_client_id),
         user: Some(RpcUser::default()),
         scopes: vec!["rpc".into(), "identify".into()],
         expires: std::time::SystemTime::now() + Duration::from_secs(3600),
         access_token: "test-token".to_owned(),
-      }),
+      })),
     })
   }
 }

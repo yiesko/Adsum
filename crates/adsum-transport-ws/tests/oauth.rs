@@ -119,14 +119,14 @@ impl OAuthBackend for FakeOAuthBackend {
         "scopes": scopes,
         "user": (token != "no-identify").then_some(&user),
       }),
-      session: Some(OAuthSession {
+      session: Some(Arc::new(OAuthSession {
         application_id,
         // Include a user even without identify to exercise manager sanitization.
         user: Some(user),
         scopes,
         expires,
         access_token: "test-token".to_owned(),
-      }),
+      })),
     })
   }
 }
