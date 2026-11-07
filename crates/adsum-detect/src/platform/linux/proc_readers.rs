@@ -6,7 +6,7 @@
 //! multiply per process per tick.
 
 use crate::scratch::ExecScratch;
-use crate::types::Exec;
+use crate::types::{ArgSpan, Exec};
 
 /// Read one process's cmdline into an owned `Exec`: the throwaway twin
 /// of [`read_exec_into`], kept for the parity test (and any future
@@ -75,11 +75,27 @@ pub fn read_exec_into(pid: u64, exec: &mut Exec, scratch: &mut ExecScratch) -> b
   exec.path.clear();
   exec.path.push_str(cmd_path);
   scratch.args.clear();
-  for (index, arg) in cmd_iter.enumerate() {
-    if index > 0 {
+  exec.argument_spans.clear();
+  // Preserve argv boundaries: one span per non-empty token, even when
+  // the token itself contains spaces (NUL-separated in /proc).
+  const MAX_ARG_TOKENS: usize = 256;
+  for arg in cmd_iter {
+    if arg.is_empty() {
+      continue;
+    }
+    if exec.argument_spans.len() >= MAX_ARG_TOKENS {
+      break;
+    }
+    if !scratch.args.is_empty() {
       scratch.args.push(' ');
     }
+    let start = scratch.args.len();
     scratch.args.push_str(arg);
+    let end = scratch.args.len();
+    exec.argument_spans.push(ArgSpan {
+      start: u32::try_from(start).unwrap_or(u32::MAX),
+      end: u32::try_from(end).unwrap_or(u32::MAX),
+    });
   }
   let previous = exec.arguments.take();
   if !scratch.args.is_empty() {
@@ -239,8 +255,8 @@ pub(crate) fn read_image_path_into(pid: u64, buffer: &mut String) -> Option<&str
   buffer.clear();
   let link = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
   let mut text = link.into_os_string().into_string().ok()?;
-  if let Some(stripped) = text.strip_suffix(" (deleted)") {
-    text = stripped.to_owned();
+  if text.ends_with(" (deleted)") {
+    text.truncate(text.len() - " (deleted)".len());
   }
   buffer.push_str(&text);
   Some(buffer.as_str())

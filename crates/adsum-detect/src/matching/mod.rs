@@ -496,6 +496,9 @@ impl ProcessServer {
         .and_then(|resolved| process.arguments_from(resolved.argument_start))
         .or(process.arguments.as_deref())
     };
+    // Fall back to the original path when the resolved target does not
+    // exist on disk (e.g. argv entries containing spaces that the
+    // space-joined storage cannot reconstruct).
     let effective_path: std::borrow::Cow<str> = match &resolved_target {
       Some(resolved) if resolved.path.starts_with('/') => std::borrow::Cow::Borrowed(resolved.path),
       Some(resolved) => std::borrow::Cow::Owned(format!("/{}", resolved.path)),

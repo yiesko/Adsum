@@ -21,11 +21,18 @@ pub struct ProcessEventListeners {
   pub on_process_scan_complete: Option<Arc<Mutex<ProcessCallback>>>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub struct ArgSpan {
+  pub start: u32,
+  pub end: u32,
+}
+
 #[derive(Clone, Default)]
 pub struct Exec {
   pub pid: u64,
   pub path: String,
   pub arguments: Option<String>,
+  pub argument_spans: Vec<ArgSpan>,
 }
 
 impl Exec {
@@ -35,22 +42,28 @@ impl Exec {
   /// (the reader joins argv with a single space); treat as a best-effort
   /// view, not a faithful argv reconstruction.
   pub(crate) fn argument_at(&self, index: usize) -> Option<&str> {
-    self
-      .arguments
-      .as_deref()?
-      .split_ascii_whitespace()
-      .nth(index)
+    let storage = self.arguments.as_deref()?;
+    if !self.argument_spans.is_empty() {
+      let span = self.argument_spans.get(index)?;
+      return storage.get(span.start as usize..span.end as usize);
+    }
+    // Fallback for callers that built `Exec` without spans.
+    storage.split_ascii_whitespace().nth(index)
   }
 
   /// Borrow the argument string starting at token `start`, preserving the
   /// remaining tokens (and their separating spaces) without allocation.
   pub fn arguments_from(&self, start: usize) -> Option<&str> {
     let storage = self.arguments.as_deref()?;
-    let bytes = storage.as_bytes();
+    if !self.argument_spans.is_empty() {
+      let span = self.argument_spans.get(start)?;
+      return storage.get(span.start as usize..);
+    }
+    // Fallback for callers that built `Exec` without spans.
     let mut pos = 0usize;
     let mut count = 0usize;
     while pos < storage.len() {
-      while pos < storage.len() && bytes[pos].is_ascii_whitespace() {
+      while pos < storage.len() && storage.as_bytes()[pos].is_ascii_whitespace() {
         pos += 1;
       }
       if pos >= storage.len() {
@@ -59,7 +72,7 @@ impl Exec {
       if count == start {
         return Some(&storage[pos..]);
       }
-      while pos < storage.len() && !bytes[pos].is_ascii_whitespace() {
+      while pos < storage.len() && !storage.as_bytes()[pos].is_ascii_whitespace() {
         pos += 1;
       }
       count += 1;
