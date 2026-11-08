@@ -307,7 +307,7 @@ pub fn match_steam_id(
 pub struct EpicIdLookup<'a> {
   /// The Epic namespace to resolve.
   pub epic_id: &'a str,
-  /// Lowercased argv[0]: what corroboration matches against.
+  /// Lowercased `argv[0]`: what corroboration matches against.
   pub process_path: &'a str,
   /// Original-case path stamped on the hit.
   pub observed_path: &'a str,
@@ -370,7 +370,7 @@ pub fn match_epic_id(pid: u64, stat: &mut String, lookup: &EpicIdLookup<'_>) -> 
 /// Name/folder heuristic inputs, grouped so `match_name_or_folder`
 /// stays under the argument cap.
 pub struct NameOrFolderLookup<'a> {
-  /// Lowercased argv[0]: what the stem/folder heuristics match.
+  /// Lowercased `argv[0]`: what the stem/folder heuristics match.
   pub process_path: &'a str,
   /// Original-case path stamped on the hit.
   pub observed_path: &'a str,
