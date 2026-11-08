@@ -33,6 +33,14 @@ struct Args {
     value_parser = clap::builder::BoolishValueParser::new()
   )]
   no_proc_events: bool,
+  /// Run only the process scanner and the consumer bridges; do not
+  /// expose Adsum's own game IPC or game WebSocket transports.
+  #[arg(
+    long,
+    env = "ADSUM_DETECTOR_ONLY",
+    value_parser = clap::builder::BoolishValueParser::new()
+  )]
+  detector_only: bool,
   #[arg(
     long,
     short = 'D',
@@ -456,6 +464,9 @@ fn build_daemon_config(args: &Args) -> RPCConfig {
   RPCConfig::builder()
     .enable_process_scanner(!args.no_process_scan)
     .enable_proc_events(!args.no_proc_events)
+    .enable_ipc_connector(!args.detector_only)
+    .enable_websocket_connector(!args.detector_only)
+    .enable_secondary_events(!args.detector_only)
     .port(args.bridge_port)
     .bridge_port_end(args.bridge_port_end)
     .msgpack_port(args.msgpack_port)
