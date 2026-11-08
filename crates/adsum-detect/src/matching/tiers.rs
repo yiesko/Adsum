@@ -29,7 +29,7 @@ pub(crate) fn live_or_none(
   obj: &Arc<ScannedEntry>,
   pid: u64,
   source: DetectSource,
-  path: &str,
+  observed: &str,
   stat: &mut String,
 ) -> Option<ScannedHit> {
   if is_suspended(pid, stat) {
@@ -37,8 +37,8 @@ pub(crate) fn live_or_none(
     return None;
   }
   let mut hit = ScannedHit::stamp(obj.clone(), pid, source);
-  if !path.is_empty() {
-    hit.path = Some(Arc::from(path));
+  if !observed.is_empty() {
+    hit.path = Some(Arc::from(observed));
   }
   Some(hit)
 }
@@ -55,6 +55,7 @@ pub(crate) fn finish_direct_hit(
   exe_index: usize,
   process: &Exec,
   source: DetectSource,
+  matched_path: &str,
   stat: &mut String,
 ) -> Option<ScannedHit> {
   // A hit without executables (or a stale index) is corrupt input, not a
@@ -73,7 +74,7 @@ pub(crate) fn finish_direct_hit(
     }
   }
 
-  live_or_none(obj, process.pid, source, process.path.as_str(), stat)
+  live_or_none(obj, process.pid, source, matched_path, stat)
 }
 
 /// Whether `process_path` names an executable the entry declares.
@@ -203,6 +204,9 @@ pub struct SteamIdLookup<'a> {
   pub app_id: Option<&'a str>,
   /// `argv[0]` of the process being classified, `/`-separated.
   pub process_path: &'a str,
+  /// Original-case path stamped on the hit; `process_path` is the
+  /// lowercased form matching runs against.
+  pub observed_path: &'a str,
   /// Which matcher is asking, so the hit reports where it came from.
   pub source: DetectSource,
   /// Store id to entry index.
@@ -268,7 +272,7 @@ pub fn match_steam_id(
       obj.name,
       appid
     );
-    return live_or_none(obj, pid, lookup.source, lookup.process_path, stat);
+    return live_or_none(obj, pid, lookup.source, lookup.observed_path, stat);
   }
   // Custom override with a bare steam SKU (no executables to index):
   // the provenance travels through — a library-inherited app id matched
@@ -292,24 +296,39 @@ pub fn match_steam_id(
         obj.name,
         appid
       );
-      return live_or_none(obj, pid, lookup.source, lookup.process_path, stat);
+      return live_or_none(obj, pid, lookup.source, lookup.observed_path, stat);
     }
   }
   None
 }
 
+/// Epic namespace resolution inputs (sandbox id or Heroic app-name
+/// mapping), grouped so `match_epic_id` stays under the argument cap.
+pub struct EpicIdLookup<'a> {
+  /// The Epic namespace to resolve.
+  pub epic_id: &'a str,
+  /// Lowercased argv[0]: what corroboration matches against.
+  pub process_path: &'a str,
+  /// Original-case path stamped on the hit.
+  pub observed_path: &'a str,
+  /// Sandbox id to entry index.
+  pub epic_map: &'a SortedIndex,
+  /// The entries the index points into.
+  pub entries: &'a [Arc<ScannedEntry>],
+  /// User overrides, searched linearly.
+  pub custom: &'a [Arc<ScannedEntry>],
+}
+
 /// Resolve an Epic namespace (sandbox id or Heroic app-name mapping) to an
 /// entry, corroborated by the process path; mirrors [`match_steam_id`] and
 /// runs before the fuzzy heuristics.
-pub fn match_epic_id(
-  pid: u64,
-  stat: &mut String,
-  epic_id: &str,
-  process_path: &str,
-  epic_map: &SortedIndex,
-  entries: &[Arc<ScannedEntry>],
-  custom: &[Arc<ScannedEntry>],
-) -> Option<ScannedHit> {
+pub fn match_epic_id(pid: u64, stat: &mut String, lookup: &EpicIdLookup<'_>) -> Option<ScannedHit> {
+  let epic_id = lookup.epic_id;
+  let process_path = lookup.process_path;
+  let observed_path = lookup.observed_path;
+  let epic_map = lookup.epic_map;
+  let entries = lookup.entries;
+  let custom = lookup.custom;
   if let Some(idx) = epic_map.get(epic_id) {
     let obj = entries.get(idx)?;
     if !argv_names_an_executable(process_path, obj) {
@@ -324,7 +343,7 @@ pub fn match_epic_id(
       return None;
     }
     tracing::debug!("[Process Scanner] Epic match: {} (id {epic_id})", obj.name);
-    return live_or_none(obj, pid, DetectSource::EpicAppId, process_path, stat);
+    return live_or_none(obj, pid, DetectSource::EpicAppId, observed_path, stat);
   }
   // Custom override carrying a bare epic SKU: searched linearly
   // (user-sized, not DB-sized), same corroboration as the map path.
@@ -342,24 +361,40 @@ pub fn match_epic_id(
         "[Process Scanner] Epic match (custom): {} (id {epic_id})",
         obj.name
       );
-      return live_or_none(obj, pid, DetectSource::EpicAppId, process_path, stat);
+      return live_or_none(obj, pid, DetectSource::EpicAppId, observed_path, stat);
     }
   }
   None
+}
+
+/// Name/folder heuristic inputs, grouped so `match_name_or_folder`
+/// stays under the argument cap.
+pub struct NameOrFolderLookup<'a> {
+  /// Lowercased argv[0]: what the stem/folder heuristics match.
+  pub process_path: &'a str,
+  /// Original-case path stamped on the hit.
+  pub observed_path: &'a str,
+  /// Stem and folder indexes (exact and de-dotted).
+  pub name_map: &'a SortedIndex,
+  pub name_map_nodot: &'a SortedIndex,
+  /// The entries the indexes point into.
+  pub detectable_list: &'a [Arc<ScannedEntry>],
 }
 
 /// Heuristic aux lookup: exact exe-stem == multi-word
 /// game name, then the install-folder walk. Runs after the Proton AC probe
 /// in the scan loop — a DB-declared path (even `win32`) beats guessing.
 pub fn match_name_or_folder(
-  process_path: &str,
   pid: u64,
-  name_map: &SortedIndex,
-  name_map_nodot: &SortedIndex,
-  detectable_list: &[Arc<ScannedEntry>],
+  lookup: &NameOrFolderLookup<'_>,
   norm_out: &mut String,
   stat: &mut String,
 ) -> Option<ScannedHit> {
+  let process_path = lookup.process_path;
+  let observed_path = lookup.observed_path;
+  let name_map = lookup.name_map;
+  let name_map_nodot = lookup.name_map_nodot;
+  let detectable_list = lookup.detectable_list;
   let stem = exe_stem(process_path);
   if name_matchable(stem)
     && let Some(idx) = name_map.get(stem)
@@ -370,7 +405,7 @@ pub fn match_name_or_folder(
       obj.name,
       stem
     );
-    return live_or_none(obj, pid, DetectSource::ExeStem, process_path, stat);
+    return live_or_none(obj, pid, DetectSource::ExeStem, observed_path, stat);
   }
 
   // Install-folder fallback (Hydra / non-Steam shortcuts / renamed exes):
@@ -397,7 +432,7 @@ pub fn match_name_or_folder(
         obj.name,
         folder
       );
-      return live_or_none(obj, pid, DetectSource::Folder, process_path, stat);
+      return live_or_none(obj, pid, DetectSource::Folder, observed_path, stat);
     }
   }
 
@@ -424,7 +459,7 @@ pub fn match_name_or_folder(
         obj.name,
         folder
       );
-      return live_or_none(obj, pid, DetectSource::Folder, process_path, stat);
+      return live_or_none(obj, pid, DetectSource::Folder, observed_path, stat);
     }
   }
 

@@ -96,13 +96,14 @@ fn match_epic_id_hit_carries_its_source() {
   let hit = match_epic_id(
     u64::from(std::process::id()),
     &mut String::new(),
-    "b0cd075465c44f87be3b505ac04a2e46",
-    // The real Heroic path, normalized: the declared directory is
-    // absent, so the bare-basename fallback corroborates.
-    "/s:/heroic/gtavenhanced/gta5_enhanced.exe",
-    &epic_map,
-    &[entry],
-    &[],
+    &EpicIdLookup {
+      epic_id: "b0cd075465c44f87be3b505ac04a2e46",
+      process_path: "/s:/heroic/gtavenhanced/gta5_enhanced.exe",
+      observed_path: "/s:/heroic/gtavenhanced/gta5_enhanced.exe",
+      epic_map: &epic_map,
+      entries: &[entry],
+      custom: &[],
+    },
   )
   .expect("epic id hits");
   assert_eq!(hit.source, DetectSource::EpicAppId);
@@ -133,11 +134,14 @@ fn match_epic_id_rejects_a_path_that_names_nothing_declared() {
     match_epic_id(
       u64::from(std::process::id()),
       &mut String::new(),
-      "b0cd075465c44f87be3b505ac04a2e46",
-      "/s:/heroic/gtavenhanced/playgtav.exe",
-      &epic_map,
-      &[entry],
-      &[],
+      &EpicIdLookup {
+        epic_id: "b0cd075465c44f87be3b505ac04a2e46",
+        process_path: "/s:/heroic/gtavenhanced/playgtav.exe",
+        observed_path: "/s:/heroic/gtavenhanced/playgtav.exe",
+        epic_map: &epic_map,
+        entries: &[entry],
+        custom: &[],
+      },
     )
     .is_none(),
     "a path that names none of the entry's executables must be refused"

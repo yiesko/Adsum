@@ -24,6 +24,7 @@ fn steam_app_id_hit_carries_its_source() {
       app_id: Some("12345"),
       // No executables declared, so the id stands on its own: any path does.
       process_path: "/opt/whatever",
+      observed_path: "/opt/whatever",
       source: DetectSource::SteamAppId,
       steam_map: &steam_map,
       entries: &[entry],
@@ -63,6 +64,7 @@ fn steam_app_id_corroborates_a_short_heroic_launch() {
     &SteamIdLookup {
       app_id: Some("3240220"),
       process_path: "/s:/heroic/gtavenhanced/gta5_enhanced.exe",
+      observed_path: "/s:/heroic/gtavenhanced/gta5_enhanced.exe",
       source: DetectSource::SteamAppId,
       steam_map: &steam_map,
       entries: &[Arc::clone(&entry)],
@@ -79,6 +81,7 @@ fn steam_app_id_corroborates_a_short_heroic_launch() {
       &SteamIdLookup {
         app_id: Some("3240220"),
         process_path: "/s:/heroic/gtavenhanced/playgtav.exe",
+        observed_path: "/s:/heroic/gtavenhanced/playgtav.exe",
         source: DetectSource::SteamAppId,
         steam_map: &steam_map,
         entries: &[Arc::clone(&entry)],
@@ -118,6 +121,7 @@ fn install_dir_corroboration_accepts_an_undeclared_executable() {
     &SteamIdLookup {
       app_id: Some("2082470"),
       process_path: "/s:/steamapps/common/veindemo/vein/binaries/win64/veindemo-win64-test.exe",
+      observed_path: "/s:/steamapps/common/veindemo/vein/binaries/win64/veindemo-win64-test.exe",
       source: DetectSource::SteamAppId,
       steam_map: &steam_map,
       entries: &[entry],
@@ -153,6 +157,7 @@ fn install_dir_corroboration_refuses_prerequisite_installers() {
   let lookup = |process_path| SteamIdLookup {
     app_id: Some("2082470"),
     process_path,
+    observed_path: process_path,
     source: DetectSource::SteamAppId,
     steam_map: &steam_map,
     entries: std::slice::from_ref(&entry),
@@ -219,6 +224,7 @@ fn install_dir_corroboration_false_still_refuses() {
       &SteamIdLookup {
         app_id: Some("2082470"),
         process_path: "/s:/steamapps/common/veindemo/vein/binaries/win64/veindemo-win64-test.exe",
+        observed_path: "/s:/steamapps/common/veindemo/vein/binaries/win64/veindemo-win64-test.exe",
         source: DetectSource::SteamAppId,
         steam_map: &steam_map,
         entries: &[entry],
@@ -259,6 +265,7 @@ fn install_dir_corroboration_refuses_a_declared_launcher() {
       &SteamIdLookup {
         app_id: Some("2082470"),
         process_path: "/s:/steamapps/common/veindemo/veindemo.exe",
+        observed_path: "/s:/steamapps/common/veindemo/veindemo.exe",
         source: DetectSource::SteamAppId,
         steam_map: &steam_map,
         entries: &[entry],
@@ -294,6 +301,7 @@ fn install_dir_corroboration_keeps_id_only_entries_working() {
       &SteamIdLookup {
         app_id: Some("2082470"),
         process_path: "/opt/whatever",
+        observed_path: "/opt/whatever",
         source: DetectSource::SteamAppId,
         steam_map: &steam_map,
         entries: &[Arc::clone(&entry)],
@@ -346,6 +354,7 @@ fn command_line_app_id_corroborates_native_game_executable() {
       // Native Steam install layout, already lowercased the way the
       // matcher folds it before the steam-id tier runs.
       process_path: "/home/player/.local/share/steam/steamapps/common/frostpeak/frostpeak.x86_64",
+      observed_path: "/home/player/.local/share/steam/steamapps/common/frostpeak/frostpeak.x86_64",
       source: DetectSource::SteamAppId,
       steam_map: &steam_map,
       entries: &[entry],
@@ -395,6 +404,7 @@ fn command_line_app_id_refuses_the_reaper_helper() {
       &SteamIdLookup {
         app_id: Some("892970"),
         process_path: "/home/player/.local/share/steam/steamrt64/reaper",
+        observed_path: "/home/player/.local/share/steam/steamrt64/reaper",
         source: DetectSource::SteamAppId,
         steam_map: &steam_map,
         entries: &[entry],
@@ -453,6 +463,7 @@ fn command_line_app_id_with_install_dir_evidence_accepts_undeclared_executable()
     &SteamIdLookup {
       app_id: Some("892970"),
       process_path: "/home/player/.local/share/steam/steamapps/common/frostpeak/frostpeak.x86_64",
+      observed_path: "/home/player/.local/share/steam/steamapps/common/frostpeak/frostpeak.x86_64",
       source: DetectSource::SteamAppId,
       steam_map: &steam_map,
       entries: &[entry],
@@ -488,6 +499,7 @@ fn custom_sku_hit_keeps_library_source() {
       app_id: Some("999"),
       // Custom override with no executables: the id is the only evidence.
       process_path: "/opt/custom",
+      observed_path: "/opt/custom",
       source: DetectSource::SteamLibrary,
       steam_map: &empty_map,
       entries: &[],
