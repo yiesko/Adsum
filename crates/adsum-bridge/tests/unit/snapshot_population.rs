@@ -47,6 +47,7 @@ fn sample_payload() -> Arc<commands::CachedActivity> {
     start: 0,
     source: DetectSource::SteamAppId,
     process_start_ms: None,
+    path: None,
   };
   generic_payload(&game).expect("builds")
 }
@@ -260,6 +261,7 @@ async fn proc_pump_detected_flows_to_cache() {
     start: 0,
     source: DetectSource::SteamAppId,
     process_start_ms: None,
+    path: None,
   };
   if let Some(payload) = generic_payload(&game) {
     shared.broadcast_activity(payload, SocketId::from("app-1"));

@@ -14,6 +14,7 @@ fn hit(id: &str) -> ScannedHit {
     pid: 1,
     start: 0,
     source: DetectSource::Automaton,
+    path: None,
   }
 }
 

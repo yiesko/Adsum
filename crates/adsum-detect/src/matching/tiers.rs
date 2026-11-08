@@ -29,13 +29,18 @@ pub(crate) fn live_or_none(
   obj: &Arc<ScannedEntry>,
   pid: u64,
   source: DetectSource,
+  path: &str,
   stat: &mut String,
 ) -> Option<ScannedHit> {
   if is_suspended(pid, stat) {
     tracing::debug!("[Process Scanner] Ignoring suspended process (pid {pid})");
     return None;
   }
-  Some(ScannedHit::stamp(obj.clone(), pid, source))
+  let mut hit = ScannedHit::stamp(obj.clone(), pid, source);
+  if !path.is_empty() {
+    hit.path = Some(Arc::from(path));
+  }
+  Some(hit)
 }
 
 /// Shared tail of every direct path hit (native or Proton): when the
@@ -68,7 +73,7 @@ pub(crate) fn finish_direct_hit(
     }
   }
 
-  live_or_none(obj, process.pid, source, stat)
+  live_or_none(obj, process.pid, source, process.path.as_str(), stat)
 }
 
 /// Whether `process_path` names an executable the entry declares.
@@ -263,7 +268,7 @@ pub fn match_steam_id(
       obj.name,
       appid
     );
-    return live_or_none(obj, pid, lookup.source, stat);
+    return live_or_none(obj, pid, lookup.source, lookup.process_path, stat);
   }
   // Custom override with a bare steam SKU (no executables to index):
   // the provenance travels through — a library-inherited app id matched
@@ -287,7 +292,7 @@ pub fn match_steam_id(
         obj.name,
         appid
       );
-      return live_or_none(obj, pid, lookup.source, stat);
+      return live_or_none(obj, pid, lookup.source, lookup.process_path, stat);
     }
   }
   None
@@ -319,7 +324,7 @@ pub fn match_epic_id(
       return None;
     }
     tracing::debug!("[Process Scanner] Epic match: {} (id {epic_id})", obj.name);
-    return live_or_none(obj, pid, DetectSource::EpicAppId, stat);
+    return live_or_none(obj, pid, DetectSource::EpicAppId, process_path, stat);
   }
   // Custom override carrying a bare epic SKU: searched linearly
   // (user-sized, not DB-sized), same corroboration as the map path.
@@ -337,7 +342,7 @@ pub fn match_epic_id(
         "[Process Scanner] Epic match (custom): {} (id {epic_id})",
         obj.name
       );
-      return live_or_none(obj, pid, DetectSource::EpicAppId, stat);
+      return live_or_none(obj, pid, DetectSource::EpicAppId, process_path, stat);
     }
   }
   None
@@ -365,7 +370,7 @@ pub fn match_name_or_folder(
       obj.name,
       stem
     );
-    return live_or_none(obj, pid, DetectSource::ExeStem, stat);
+    return live_or_none(obj, pid, DetectSource::ExeStem, process_path, stat);
   }
 
   // Install-folder fallback (Hydra / non-Steam shortcuts / renamed exes):
@@ -392,7 +397,7 @@ pub fn match_name_or_folder(
         obj.name,
         folder
       );
-      return live_or_none(obj, pid, DetectSource::Folder, stat);
+      return live_or_none(obj, pid, DetectSource::Folder, process_path, stat);
     }
   }
 
@@ -419,7 +424,7 @@ pub fn match_name_or_folder(
         obj.name,
         folder
       );
-      return live_or_none(obj, pid, DetectSource::Folder, stat);
+      return live_or_none(obj, pid, DetectSource::Folder, process_path, stat);
     }
   }
 

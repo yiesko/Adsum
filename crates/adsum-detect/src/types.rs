@@ -457,6 +457,10 @@ pub struct ScannedHit {
   pub start: u64,
   /// Which matcher classified the process (detection provenance).
   pub source: DetectSource,
+  /// Observed executable path (`argv[0]` of the matched `Exec`):
+  /// travels to the bridge so consumers can name the running binary.
+  /// `None` when the scanner had no path to carry.
+  pub path: Option<Arc<str>>,
 }
 
 impl ScannedHit {
@@ -471,6 +475,7 @@ impl ScannedHit {
       pid,
       start: epoch_ms(),
       source,
+      path: None,
     }
   }
 }

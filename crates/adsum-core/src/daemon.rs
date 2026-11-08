@@ -517,6 +517,7 @@ impl Daemon {
               // start-time read here, never on the scan tick.
               source: hit.source,
               process_start_ms: adsum_detect::proc_start::process_start_ms(hit.pid),
+              path: hit.path.clone(),
             }),
             adsum_detect::ProcessDetectedEvent::Cleared => ProcInput::Cleared,
             adsum_detect::ProcessDetectedEvent::Removed { id, pid } => ProcInput::Removed(id, pid),

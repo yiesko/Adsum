@@ -30,5 +30,6 @@ fn placeholder_hit() -> ScannedHit {
     pid: 1,
     start: 0,
     source: adsum_types::DetectSource::Automaton,
+    path: None,
   }
 }

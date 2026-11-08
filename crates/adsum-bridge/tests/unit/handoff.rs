@@ -19,6 +19,7 @@ fn game(id: &str) -> ScannedGame {
     start: 0,
     source: DetectSource::Automaton,
     process_start_ms: None,
+    path: None,
   }
 }
 
@@ -109,6 +110,7 @@ fn resume_only_matches_scanned_game() {
     start: 0,
     source: DetectSource::Automaton,
     process_start_ms: None,
+    path: None,
   }));
   // A different game on screen: not ours to resume.
   assert_eq!(handoff.resume_for("1"), None);

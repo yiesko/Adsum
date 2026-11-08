@@ -5,8 +5,7 @@ use super::*;
 /// game WebSocket transports; defaults keep them on.
 #[test]
 fn detector_only_flag_disables_game_transports() {
-  let on =
-    Args::try_parse_from(["adsum-cli", "--detector-only"]).expect("--detector-only parses");
+  let on = Args::try_parse_from(["adsum-cli", "--detector-only"]).expect("--detector-only parses");
   assert!(on.detector_only);
   let config = build_daemon_config(&on);
   assert!(config.enable_process_scanner);

@@ -36,6 +36,10 @@ pub struct ProcessPayload {
   pub pid: u64,
   #[serde(rename = "socketId")]
   pub socket_id: SocketId,
+  /// Observed executable path of the detected process, for external
+  /// consumers that name the running binary. Omitted when unknown.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub path: Option<Arc<str>>,
 }
 
 /// An activity payload serialized once for both bridge protocols (JSON text

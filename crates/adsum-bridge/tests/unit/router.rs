@@ -2,6 +2,37 @@ use super::*;
 use crate::handoff::HandoffState;
 use adsum_types::DetectSource;
 
+/// The detected executable path travels on the generic payload at the
+/// envelope level (next to `pid`/`socketId`), in both bridge
+/// encodings, so external consumers can name the running binary.
+#[test]
+fn generic_payload_carries_detected_path() {
+  let game = ScannedGame {
+    id: AppId::from("12345"),
+    name: Arc::from("Path Game"),
+    pid: 4242,
+    start: 0,
+    source: DetectSource::Automaton,
+    process_start_ms: None,
+    path: Some(Arc::from("/games/path-game/binary")),
+  };
+  let payload = generic_payload(&game).expect("builds");
+  let json = payload.json.as_str();
+  assert!(
+    json.contains(r#""path":"/games/path-game/binary""#),
+    "json: {json}"
+  );
+  // MsgPack carries the same bytes; the payload structs are
+  // Serialize-only wire types, so check the encoded frame directly.
+  assert!(
+    payload
+      .msgpack
+      .windows(b"/games/path-game/binary".len())
+      .any(|w| w == b"/games/path-game/binary"),
+    "msgpack frame must carry the path"
+  );
+}
+
 /// Epoch millis for latency fixtures.
 fn now_ms() -> u64 {
   std::time::SystemTime::now()
@@ -23,6 +54,7 @@ fn generic_payload_stamps_provenance() {
     start: 0,
     source: DetectSource::SteamAppId,
     process_start_ms: Some(now_ms().saturating_sub(5000)),
+    path: None,
   };
   let payload = generic_payload(&game).expect("builds");
   let provenance = payload.provenance.clone().expect("stamped");
@@ -61,6 +93,7 @@ fn provenance_source_travels_as_the_matcher_enum() {
       start: 0,
       source,
       process_start_ms: Some(now_ms().saturating_sub(5000)),
+      path: None,
     };
     let payload = generic_payload(&game).expect("builds");
     let provenance = payload.provenance.clone().expect("stamped");
@@ -113,6 +146,7 @@ fn handoff_resume_shares_the_game_name_buffer() {
     start: 0,
     source: DetectSource::Automaton,
     process_start_ms: None,
+    path: None,
   };
   handoff.note_scan(Some(game));
   let name_ptr = handoff.resume_for("12345").expect("resumed").name.as_ptr();
