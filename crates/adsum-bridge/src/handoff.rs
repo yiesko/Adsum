@@ -31,6 +31,10 @@ pub struct ScannedGame {
   /// Process start as epoch millis, when the detector could read it:
   /// snapshot latency is measured against this, never re-read.
   pub process_start_ms: Option<u64>,
+  /// Observed executable path of the detected process (`argv[0]` as
+  /// read for the match): published on the generic payload so
+  /// external consumers can name the running binary.
+  pub path: Option<Arc<str>>,
 }
 
 /// Scanner input to the bridge: one game appeared, one slot vanished, or

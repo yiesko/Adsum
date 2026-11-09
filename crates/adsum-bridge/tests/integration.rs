@@ -277,6 +277,7 @@ async fn process_scan_publishes_generic_and_null_clears() {
       start: 1_700_000_000,
       source: adsum_types::DetectSource::Automaton,
       process_start_ms: None,
+      path: None,
     }))
     .await
     .unwrap();
@@ -309,6 +310,7 @@ async fn null_scan_clears_live_generic_exactly_once() {
       start: 1_700_000_000,
       source: adsum_types::DetectSource::Automaton,
       process_start_ms: None,
+      path: None,
     }))
     .await
     .unwrap();
@@ -468,6 +470,7 @@ async fn null_scan_keeps_live_pid_cards() {
       start: 1_700_000_000,
       source: adsum_types::DetectSource::Automaton,
       process_start_ms: None,
+      path: None,
     }))
     .await
     .unwrap();
@@ -660,6 +663,7 @@ async fn session_transitions_emit_census_lines() {
       start: 1_700_000_000,
       source: adsum_types::DetectSource::Automaton,
       process_start_ms: None,
+      path: None,
     }))
     .await
     .unwrap();

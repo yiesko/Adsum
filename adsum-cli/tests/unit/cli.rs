@@ -1,5 +1,25 @@
 use super::*;
 
+/// `--detector-only` (env `ADSUM_DETECTOR_ONLY`) keeps the scanner
+/// and the consumer bridges but disables Adsum's own game IPC and
+/// game WebSocket transports; defaults keep them on.
+#[test]
+fn detector_only_flag_disables_game_transports() {
+  let on = Args::try_parse_from(["adsum-cli", "--detector-only"]).expect("--detector-only parses");
+  assert!(on.detector_only);
+  let config = build_daemon_config(&on);
+  assert!(config.enable_process_scanner);
+  assert!(!config.enable_ipc_connector);
+  assert!(!config.enable_websocket_connector);
+  assert!(!config.enable_secondary_events);
+  let off = Args::try_parse_from(["adsum-cli"]).expect("defaults parse");
+  assert!(!off.detector_only);
+  let config = build_daemon_config(&off);
+  assert!(config.enable_ipc_connector);
+  assert!(config.enable_websocket_connector);
+  assert!(config.enable_secondary_events);
+}
+
 /// `--state-file` (env `ADSUM_STATE_FILE`) enables presence snapshots;
 /// the default keeps them off.
 #[test]

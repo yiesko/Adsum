@@ -222,7 +222,13 @@ pub(crate) fn match_compatibility(
   }
   let rule = matched?;
   let entry = bundle.list.get(rule.entry_index as usize)?;
-  live_or_none(entry, process.pid, DetectSource::Compatibility, stat)
+  live_or_none(
+    entry,
+    process.pid,
+    DetectSource::Compatibility,
+    process.path.as_str(),
+    stat,
+  )
 }
 
 #[cfg(test)]

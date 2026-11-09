@@ -22,23 +22,30 @@ fn name_and_folder_hits_carry_their_sources() {
   let pid = u64::from(std::process::id());
 
   let stem_hit = match_name_or_folder(
-    "/opt/source game",
     pid,
-    &name_map,
-    &empty,
-    &list,
+    &NameOrFolderLookup {
+      process_path: "/opt/source game",
+      observed_path: "/opt/Source Game",
+      name_map: &name_map,
+      name_map_nodot: &empty,
+      detectable_list: &list,
+    },
     &mut norm_out,
     &mut String::new(),
   )
   .expect("stem hits");
   assert_eq!(stem_hit.source, DetectSource::ExeStem);
+  assert_eq!(stem_hit.path.as_deref(), Some("/opt/Source Game"));
 
   let folder_hit = match_name_or_folder(
-    "/opt/source game/bin/run",
     pid,
-    &name_map,
-    &empty,
-    &list,
+    &NameOrFolderLookup {
+      process_path: "/opt/source game/bin/run",
+      observed_path: "/opt/source game/bin/run",
+      name_map: &name_map,
+      name_map_nodot: &empty,
+      detectable_list: &list,
+    },
     &mut norm_out,
     &mut String::new(),
   )

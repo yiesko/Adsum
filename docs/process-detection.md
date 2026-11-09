@@ -347,6 +347,16 @@ identity) and do not read `/proc` themselves.
   is on egdata (a community mirror), and the Among Us Store URL carries
   [`epic_gameId=33956bcb55d4452d8c47e16b94e294bd`](https://store.epicgames.com/p/among-us?epic_gameId=33956bcb55d4452d8c47e16b94e294bd).
 
+## Published executable path
+
+Process-detected cards carry the observed executable path on the
+bridge envelope (`path`, next to `pid`/`socketId`) so external
+consumers can name the running binary. It is the `argv[0]` read when
+the process matched — not a canonicalized `/proc/<pid>/exe` path — so
+it can be bare or relative (launchers), Windows-shaped under
+Proton/Wine, or already cwd-joined. Treat it as observed evidence,
+not a resolved install location.
+
 ## See also
 
 - [detection-traceability.md](detection-traceability.md) — provenance,

@@ -95,6 +95,15 @@ After that, each activity message is an object with three fields:
   when the publisher did not send one.
 - `socketId` — who published it: the pid for game-SDK frames, the app id
   for process-detected cards.
+- `path` — process-detected cards only, and only when known: the
+  observed executable path (`argv[0]` as read for the match). It is not
+  canonicalized — see [process-detection.md](process-detection.md).
+  External consumers (for example an Equibop-style detector adapter)
+  use it to name the running binary; game-SDK frames never carry it.
+
+Run Adsum with `--detector-only` when it should act purely as such a
+detection source: the scanner and these consumer bridges stay up while
+Adsum's own game IPC and game WebSocket transports stay closed.
 
 MessagePack frames carry the same field names. A clear is `activity: null`
 on an otherwise normal frame — it is not a separate message type, and the

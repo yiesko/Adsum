@@ -139,6 +139,7 @@ fn table_transition_fires_only_on_state_edges() {
     start: 0,
     source: DetectSource::Automaton,
     process_start_ms: None,
+    path: None,
   };
   // Empty -> game: session start; repeats stay quiet.
   assert_eq!(

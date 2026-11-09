@@ -40,7 +40,10 @@ pub use normalize::{
   normalize_name_into,
 };
 pub use paths::exe_stem;
-pub use tiers::{SteamIdLookup, match_epic_id, match_name_or_folder, match_steam_id};
+pub use tiers::{
+  EpicIdLookup, NameOrFolderLookup, SteamIdLookup, match_epic_id, match_name_or_folder,
+  match_steam_id,
+};
 
 pub(crate) use args::{epic_launch_args, is_shortcut_id};
 pub(crate) use paths::exe_names_path;
@@ -757,6 +760,7 @@ impl ProcessServer {
           &SteamIdLookup {
             app_id,
             process_path: lowered,
+            observed_path: &process_path,
             source: DetectSource::SteamAppId,
             steam_map: &bundle.steam_map,
             entries: &bundle.list,
@@ -782,11 +786,14 @@ impl ProcessServer {
           && let Some(hit) = match_epic_id(
             process.pid,
             &mut scratch.match_scratch.stat,
-            id,
-            lowered,
-            &bundle.epic_map,
-            &bundle.list,
-            &bundle.custom,
+            &EpicIdLookup {
+              epic_id: id,
+              process_path: lowered,
+              observed_path: &process_path,
+              epic_map: &bundle.epic_map,
+              entries: &bundle.list,
+              custom: &bundle.custom,
+            },
           )
         {
           return Some(hit);
@@ -800,11 +807,14 @@ impl ProcessServer {
             && let Some(hit) = match_epic_id(
               process.pid,
               &mut scratch.match_scratch.stat,
-              namespace,
-              lowered,
-              &bundle.epic_map,
-              &bundle.list,
-              &bundle.custom,
+              &EpicIdLookup {
+                epic_id: namespace,
+                process_path: lowered,
+                observed_path: &process_path,
+                epic_map: &bundle.epic_map,
+                entries: &bundle.list,
+                custom: &bundle.custom,
+              },
             )
           {
             return Some(hit);
@@ -838,11 +848,14 @@ impl ProcessServer {
           );
         } else if non_steam
           && let Some(hit) = match_name_or_folder(
-            lowered,
             process.pid,
-            &bundle.name_map,
-            &bundle.name_map_nodot,
-            &bundle.list,
+            &NameOrFolderLookup {
+              process_path: lowered,
+              observed_path: &process_path,
+              name_map: &bundle.name_map,
+              name_map_nodot: &bundle.name_map_nodot,
+              detectable_list: &bundle.list,
+            },
             &mut scratch.match_scratch.norm_out,
             &mut scratch.match_scratch.stat,
           )
@@ -874,6 +887,7 @@ impl ProcessServer {
             exe_index,
             process,
             DetectSource::ProtonAutomaton,
+            proton_path,
             &mut scratch.match_scratch.stat,
           );
         }
@@ -901,6 +915,7 @@ impl ProcessServer {
             &SteamIdLookup {
               app_id: Some(&library_appid),
               process_path: lowered,
+              observed_path: &process_path,
               source: DetectSource::SteamLibrary,
               steam_map: &bundle.steam_map,
               entries: &bundle.list,
@@ -924,11 +939,14 @@ impl ProcessServer {
           return None;
         }
         return match_name_or_folder(
-          lowered,
           process.pid,
-          &bundle.name_map,
-          &bundle.name_map_nodot,
-          &bundle.list,
+          &NameOrFolderLookup {
+            process_path: lowered,
+            observed_path: &process_path,
+            name_map: &bundle.name_map,
+            name_map_nodot: &bundle.name_map_nodot,
+            detectable_list: &bundle.list,
+          },
           &mut scratch.match_scratch.norm_out,
           &mut scratch.match_scratch.stat,
         );
@@ -940,6 +958,7 @@ impl ProcessServer {
       exe_index,
       process,
       found_source,
+      &process_path,
       &mut scratch.match_scratch.stat,
     )
   }

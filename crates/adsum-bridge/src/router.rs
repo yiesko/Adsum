@@ -62,6 +62,7 @@ pub(crate) fn generic_payload(game: &ScannedGame) -> Option<Arc<CachedActivity>>
     },
     pid: game.pid,
     socket_id: SocketId::from(&game.id),
+    path: game.path.clone(),
   };
   // Fixed shapes: practically unreachable encode failure surfaces as
   // `None` so callers log and drop instead of shipping an empty frame.
