@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Detector-only mode**. `--detector-only` (or `ADSUM_DETECTOR_ONLY=1`) keeps the process scanner and the consumer bridges while disabling Adsum's own game IPC, game WebSocket and secondary-event transports, so Adsum can act purely as a detection source for external consumers.
+- **Detected executable path on bridge payloads**. Process-detected cards now carry the observed executable path at envelope level, so consumers such as Equibop can name the running binary.
 - **Cross-client state snapshots**. With `--state-file`, Adsum can create `arrpc-state-N` links in client runtime folders and use `ADSUM_STATE_PREFIX` to choose the file prefix.
 - **Compatibility detection**. Adsum now recognizes games started by Box64, FEX, QEMU, Wine/Proton, and Steam reaper, including Wine games on macOS, plus Minecraft and compatible loaders on Linux.
 - **Pre-release tags**. Alpha, beta, and release-candidate tags are now published as GitHub pre-releases with notes from this changelog. Stable tags still need a numbered changelog section.
@@ -19,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `5000 Activity queue is full; retry later` instead of appearing successful.
   A rejected publication still does not gain ownership.
 - **Pre-release binary versions**. Build tags are stamped into the workspace, so the binary reports the exact tag version. The self-updater still uses GitHub's stable release only.
+- **cn_proc watcher on by default**. The event-driven watcher subscribes to `EXEC`/`EXIT` only and the scan loop forces one full sweep every few ticks as reconciliation, so a single lost netlink event can delay detection by at most about a minute and never hide a game indefinitely.
+- **Real process start in presence timestamps**. Generic detection payloads stamp when the game process launched, not when the scanner found it.
 
 ### Fixed
 - **Cleaner shutdown**. The scanner is stopped before its threads are joined, so shutdown does not wait beyond the shared time limit for stuck workers.
@@ -28,6 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 - **Paths and IPC**. Paths reached through a symlink are checked across the full path, not only the last directory.
 - **Windows IPC pipe**. The named pipe now has an explicit access policy instead of receiving default permissions.
+
+### Removed
+- **Discord RPC OAuth system**. The `adsum-oauth` crate, its CLI commands, token storage, strict-auth policy and installer flags are gone. `AUTHORIZE`/`AUTHENTICATE`/`GET_GUILDS` now answer `Not authenticated`; `GET_USER` returns the configured fallback identity. See #38.
 
 ## [0.40.0] - 2026-10-29
 
