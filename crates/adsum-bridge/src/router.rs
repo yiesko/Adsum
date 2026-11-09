@@ -55,7 +55,9 @@ pub(crate) fn generic_payload(game: &ScannedGame) -> Option<Arc<CachedActivity>>
     activity: commands::ProcessActivity {
       application_id: game.id.clone(),
       name: game.name.clone(),
-      timestamps: commands::ProcessTimestamps { start: game.start },
+      timestamps: commands::ProcessTimestamps {
+        start: game.process_start_ms.unwrap_or(game.start),
+      },
       r#type: 0,
       metadata: HashMap::new(),
       flags: 0,

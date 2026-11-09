@@ -323,3 +323,31 @@ fn seq_of(shared: &crate::bridge::Shared, pid: u64) -> u64 {
     .map(|(_, seq)| *seq)
     .unwrap_or(0)
 }
+
+/// Generic payloads stamp the process start, not the detection time:
+/// elapsed presence time must count from when the game launched, even
+/// when the scanner found it long after.
+#[test]
+fn generic_payload_stamps_process_start() {
+  let game = ScannedGame {
+    id: AppId::from("12345"),
+    name: Arc::from("Clock Game"),
+    pid: 4242,
+    start: now_ms(),
+    source: DetectSource::Automaton,
+    process_start_ms: Some(now_ms().saturating_sub(3_600_000)),
+    path: None,
+  };
+  let payload = generic_payload(&game).expect("builds");
+  let activity: serde_json::Value =
+    serde_json::from_slice(&payload.activity_json).expect("activity is json");
+  let start = activity["timestamps"]["start"].as_u64().expect("start");
+  assert!(
+    start <= now_ms().saturating_sub(3_600_000) + 10_000,
+    "start {start} should be the process start, not the detection time"
+  );
+  assert!(
+    start < now_ms().saturating_sub(3_590_000),
+    "start {start} too fresh"
+  );
+}
