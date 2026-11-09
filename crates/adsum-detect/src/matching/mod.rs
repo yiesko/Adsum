@@ -94,7 +94,9 @@ pub(crate) use args::EpicArgs;
 /// `steamapprun_pipeline_cache`, `fossilize_replay`). `bwrap` is the
 /// primitive below pressure-vessel, and `steamwebhelper` is Steam's own
 /// browser process; a game runs as a child of them, never as them.
-pub const STEAM_SIDECAR_BASENAMES: [&str; 13] = [
+/// Unity's crash handler ships with every Unity game and inherits its
+/// Steam AppId, but it is a reporter, never the game itself.
+pub const STEAM_SIDECAR_BASENAMES: [&str; 16] = [
   "steamapprun",
   "fossilize",
   "wineserver",
@@ -108,6 +110,9 @@ pub const STEAM_SIDECAR_BASENAMES: [&str; 13] = [
   "steam-runtime",
   "pv-wrap",
   "run-in-soldier",
+  "unitycrashhandler.exe",
+  "unitycrashhandler32.exe",
+  "unitycrashhandler64.exe",
 ];
 
 /// Whether a process basename is a Steam sidecar: one that runs on a
