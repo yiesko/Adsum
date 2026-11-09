@@ -22,6 +22,11 @@ use super::lanes::{
 };
 use super::workers::{is_shutting_down, track_shutdown_thread, wait_scan};
 
+/// Ticks between forced full sweeps while the watcher is live: bounds
+/// how long an undetected EXEC loss (or a cached transient miss) can hide
+/// a game — about a minute at the stretched cadence.
+const RECONCILE_TICKS: u32 = 6;
+
 /// The hourly database/exclusions refresh loop (thread body).
 pub(crate) fn run_refresh_loop(server: ProcessServer, db_url: String) {
   // Seeded from the startup fetch when available: the first check
@@ -183,6 +188,8 @@ pub(crate) fn run_scan_loop(server: ProcessServer, wait_time: Duration) {
   // a warm tick allocates nothing per process (see `read_exec_into`).
   let mut tick_processes: Vec<Exec> = Vec::new();
   let mut tick_scratch = ScanScratch::default();
+  // Ticks since the last forced full sweep (reconciliation counter).
+  let mut ticks_since_full: u32 = 0;
   // Run the process scan repeatedly (base cadence, stretched while idle)
   loop {
     // Directed shutdown: the unpark below only shortens the cadence
@@ -190,6 +197,13 @@ pub(crate) fn run_scan_loop(server: ProcessServer, wait_time: Duration) {
     // wait, since EXIT wakes share the same unpark).
     if is_shutting_down(&server.shutdown) {
       break;
+    }
+    ticks_since_full = ticks_since_full.saturating_add(1);
+    if ticks_since_full >= RECONCILE_TICKS {
+      ticks_since_full = 0;
+      server
+        .cache_dirty
+        .store(true, std::sync::atomic::Ordering::Release);
     }
     *server.last_scan.lock().unwrap_or_else(|e| e.into_inner()) = std::time::Instant::now();
     let mut detected = match server.scan_for_processes(&mut tick_processes, &mut tick_scratch) {
@@ -326,12 +340,12 @@ pub(crate) fn run_scan_loop(server: ProcessServer, wait_time: Duration) {
     }
 
     // Idle backoff: consecutive empty ticks stretch the cadence
-    // (base → 30s cap), but only while the EXEC watcher is live to
+    // (base → 10s cap), but only while the EXEC watcher is live to
     // wake us early. Game START arrives via EXEC instantly and EXITs
     // of tracked games unpark us — polling only backstops what the
     // watcher cannot (untracked exits, DB refreshes). Polling-only
     // paths (other OSes, disabled/failed watcher) keep the base
-    // cadence so a short interval never silently grows to 30s.
+    // cadence so a short interval never silently grows.
     // Any detection or early wake resets.
     if detected.is_empty() {
       idle_ticks = idle_ticks.saturating_add(1);

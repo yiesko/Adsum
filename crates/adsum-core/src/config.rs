@@ -10,7 +10,9 @@
 pub struct RPCConfig {
   /// Run the process scanner (`--no-process-scan` / `ADSUM_NO_PROCESS_SCAN`).
   pub enable_process_scanner: bool,
-  /// Event-driven proc-events watcher, Linux only (`--no-proc-events`).
+  /// Event-driven proc-events watcher, Linux only (`--no-proc-events`
+  /// opts out; on by default: EXEC/EXIT give instant detection and the
+  /// periodic full sweep backstops any loss).
   pub enable_proc_events: bool,
   /// Serve game clients over IPC (`discord-ipc-0..9`).
   pub enable_ipc_connector: bool,

@@ -43,9 +43,16 @@ const CN_IDX_PROC: u32 = 0x1;
 const CN_VAL_PROC: u32 = 0x1;
 /// `struct cn_msg` header size: idx + val + seq + ack (u32) + len + flags (u16).
 const SIZE_CN_MSG: usize = 20;
-/// One framed multicast request: `nlmsghdr` + `cn_msg` + the `u32` op.
+/// One framed multicast request: `nlmsghdr` + `cn_msg` + `proc_input`
+/// (`op` + `event_type`). The filter restricts delivery to EXEC/EXIT so
+/// burst FORK traffic cannot overflow the queue and drop the events we
+/// actually consume. Kernels predating event filtering ignore the second
+/// field (their `mcast_op` dispatch reads only the first).
 #[cfg(target_os = "linux")]
-const MCAST_REQUEST_LEN: usize = SIZE_NLMSGHDR + SIZE_CN_MSG + 4;
+const MCAST_REQUEST_LEN: usize = SIZE_NLMSGHDR + SIZE_CN_MSG + 8;
+/// `PROC_EVENT_EXEC | PROC_EVENT_EXIT` (`linux/cn_proc.h`).
+#[cfg(target_os = "linux")]
+const EVENT_FILTER: u32 = 0x0000_0002 | 0x0000_0020;
 /// Multicast ops (`linux/cn_proc.h`).
 #[cfg(target_os = "linux")]
 const PROC_CN_MCAST_LISTEN: u32 = 0x1;
@@ -375,9 +382,10 @@ fn mcast_request(op: u32) -> [u8; MCAST_REQUEST_LEN] {
   message[cn + 4..cn + 8].copy_from_slice(&CN_VAL_PROC.to_le_bytes());
   message[cn + 8..cn + 12].copy_from_slice(&0u32.to_le_bytes());
   message[cn + 12..cn + 16].copy_from_slice(&0u32.to_le_bytes());
-  message[cn + 16..cn + 18].copy_from_slice(&(4u16).to_le_bytes());
+  message[cn + 16..cn + 18].copy_from_slice(&(8u16).to_le_bytes());
   message[cn + 18..cn + 20].copy_from_slice(&0u16.to_le_bytes());
   message[cn + 20..cn + 24].copy_from_slice(&op.to_le_bytes());
+  message[cn + 24..cn + 28].copy_from_slice(&EVENT_FILTER.to_le_bytes());
   message
 }
 

@@ -14,7 +14,7 @@ accept `1`, `0`, `true`, `false`, `yes`, `no`, `on`, and `off`.
 |---|---|---|---|
 | `-d, --detectable-file <FILE>` | `ADSUM_DETECTABLE_FILE` | — | Load your game list from this file instead of the built-in one. |
 | `-n, --no-process-scan` (alias `--no-process-scanning`) | `ADSUM_NO_PROCESS_SCAN` | off | Turn off process detection entirely. |
-| `--no-proc-events` | `ADSUM_NO_PROC_EVENTS` | off | Turn off only the fast event watcher (the netlink `cn_proc` path). Polling keeps running. |
+| `--no-proc-events` | `ADSUM_NO_PROC_EVENTS` | off | Turn off the fast event watcher (netlink `cn_proc`) and run polling only. On by default. |
 | `--detector-only` | `ADSUM_DETECTOR_ONLY` | off | Keep only the scanner and the consumer bridges; do not open Adsum's game IPC, game WebSocket, or secondary-event transports. |
 | `--scan-interval-secs <SECS>` | `ADSUM_SCAN_INTERVAL` | `5` | Base seconds between scans. While the event watcher is live, quiet periods stretch ×2 per empty tick (5 → 10 → 20 → 30 seconds). |
 | `--ignore-ids <IDS>` | `ADSUM_IGNORE_IDS` | — | Comma-separated application IDs the scanner never publishes. |

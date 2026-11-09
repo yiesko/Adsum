@@ -47,7 +47,7 @@ fn extra_db() -> Vec<DetectableActivity> {
 /// Server with the sleep entry pre-installed and the watcher "live".
 fn live_server() -> ProcessServer {
   let (tx, _rx) = adsum_telemetry::QueueGauge::pair();
-  let server = ProcessServer::new_with_custom(
+  let mut server = ProcessServer::new_with_custom(
     vec![],
     sleep_db(),
     tx,
@@ -55,10 +55,11 @@ fn live_server() -> ProcessServer {
     RefreshConfig::default(),
     vec![],
   );
-  // enable_proc_events defaults true; force the watcher-live belief that
-  // gates incremental mode (no socket in unit tests — the mode's inputs
-  // are the flag and the cache, both driven by hand here). The receiver
-  // drops with this function: nothing in these tests publishes.
+  // Force the watcher-live belief that gates incremental mode (no socket
+  // in unit tests — the mode's inputs are the flag and the cache, both
+  // driven by hand here). The receiver drops with this function:
+  // nothing in these tests publishes.
+  server.set_proc_events(true);
   server.watcher_live.store(true, Ordering::Release);
   drop(_rx);
   server

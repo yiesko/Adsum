@@ -189,10 +189,15 @@ can rarely go silent for stretches. When its self-test fails it resubscribes
 instead of dying. A detected non-initial user or PID namespace turns the
 watcher off with one warning; a procfs mounted inside a nested PID
 namespace can hide the nesting, so the self-test remains the final word.
-Polling covers everything either way. Use
-`--no-proc-events` / `ADSUM_NO_PROC_EVENTS=1` to disable the watcher and
-run polling only (which also disables the incremental cache), or `-n` /
-`--no-process-scan` to disable detection entirely.
+Netlink delivery is officially lossy, so the watcher only subscribes to
+`EXEC`/`EXIT` to keep burst traffic from overflowing the queue, and the
+scan loop forces one full sweep every 12 ticks (~1 minute) regardless of
+the watcher: a single lost event can delay detection by at most one
+reconciliation window, never hide a game indefinitely.
+Polling covers everything either way. The watcher is on by default;
+`--no-proc-events` / `ADSUM_NO_PROC_EVENTS=1` opts out to polling only
+(which also disables the incremental cache), or `-n` /
+`--no-process-scan` disables detection entirely.
 
 ## IPC-wins handoff (generic card vs. companion)
 

@@ -61,11 +61,17 @@ fn request_carries_the_multicast_operation() {
   );
   assert_eq!(
     u16::from_le_bytes(message[cn + 16..cn + 18].try_into().unwrap()),
-    4
+    8
   );
   assert_eq!(
     u32::from_le_bytes(message[cn + 20..cn + 24].try_into().unwrap()),
     PROC_CN_MCAST_IGNORE
+  );
+  // Pinned to linux/cn_proc.h: EXEC (0x2) | EXIT (0x20), so FORK traffic
+  // cannot overflow the queue and drop the events we consume.
+  assert_eq!(
+    u32::from_le_bytes(message[cn + 24..cn + 28].try_into().unwrap()),
+    0x0000_0022
   );
 }
 

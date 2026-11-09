@@ -49,9 +49,9 @@ fn backoff_applies_only_with_live_watcher() {
   // off: a short configured interval stays short.
   assert_eq!(scan_cadence(base, 4, false), base);
   assert_eq!(scan_cadence(base, 0, false), base);
-  // Live watcher: idle ticks stretch up to the 30s cap.
+  // Live watcher: idle ticks stretch up to the 10s cap.
   assert_eq!(scan_cadence(base, 0, true), base);
-  assert_eq!(scan_cadence(base, 4, true), Duration::from_secs(30));
+  assert_eq!(scan_cadence(base, 4, true), Duration::from_secs(10));
 }
 
 /// The debounce consumes the pid: a second EXIT for the same game
