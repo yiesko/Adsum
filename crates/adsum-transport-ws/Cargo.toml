@@ -16,7 +16,6 @@ workspace = true
 [dependencies]
 adsum-types = { path = "../adsum-types" }
 adsum-protocol = { path = "../adsum-protocol" }
-adsum-oauth = { path = "../adsum-oauth" }
 adsum-ws = { path = "../adsum-ws" }
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "time", "macros", "sync"] }
 serde_json.workspace = true

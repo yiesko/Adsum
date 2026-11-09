@@ -19,8 +19,6 @@ path = "../crates/adsum-types"
 path = "../crates/adsum-protocol"
 [dependencies.adsum-transport-ipc]
 path = "../crates/adsum-transport-ipc"
-[dependencies.adsum-oauth]
-path = "../crates/adsum-oauth"
 
 [[bin]]
 name = "activity_full"

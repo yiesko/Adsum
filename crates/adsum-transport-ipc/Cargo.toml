@@ -16,7 +16,6 @@ workspace = true
 [dependencies]
 adsum-types = { path = "../adsum-types" }
 adsum-protocol = { path = "../adsum-protocol" }
-adsum-oauth = { path = "../adsum-oauth" }
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "time", "macros", "sync"] }
 tokio-util = "0.7"
 interprocess = "2.2"

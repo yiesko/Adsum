@@ -8,8 +8,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Discord RPC OAuth, optional and experimental**. Add optional browser sign-in, the `adsum oauth` commands, optional refresh tokens, `GET_USER`, `GET_GUILDS`, limits, and timeouts.
-- **OAuth setup in the installer**. `install.sh` can write the OAuth redirect and secret settings for the user service.
 - **Cross-client state snapshots**. With `--state-file`, Adsum can create `arrpc-state-N` links in client runtime folders and use `ADSUM_STATE_PREFIX` to choose the file prefix.
 - **Compatibility detection**. Adsum now recognizes games started by Box64, FEX, QEMU, Wine/Proton, and Steam reaper, including Wine games on macOS, plus Minecraft and compatible loaders on Linux.
 - **Pre-release tags**. Alpha, beta, and release-candidate tags are now published as GitHub pre-releases with notes from this changelog. Stable tags still need a numbered changelog section.
@@ -25,12 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **Cleaner shutdown**. The scanner is stopped before its threads are joined, so shutdown does not wait beyond the shared time limit for stuck workers.
 - **State aliases**. Existing aliases now follow only trusted paths, and a missing alias is not recreated from an old snapshot.
-- **OAuth expiry**. The first command that finds the expired session now reports `InvalidAccessToken`, not `NotAuthenticated`.
 - **Non-Linux builds**. Windows, macOS, and other non-Linux targets now compile.
 
 ### Security
-- **OAuth tokens**. Responses contain identity and scopes, never the access token. Logs and debug output do not show it.
-- **OAuth settings**. Refresh and restore require `ADSUM_OAUTH_CLIENT_SECRET`; without it, the client secret error is returned instead of a misleading invalid-argument error.
 - **Paths and IPC**. Paths reached through a symlink are checked across the full path, not only the last directory.
 - **Windows IPC pipe**. The named pipe now has an explicit access policy instead of receiving default permissions.
 

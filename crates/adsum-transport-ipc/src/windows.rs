@@ -9,7 +9,6 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use adsum_oauth::OAuthManager;
 use adsum_protocol::error::{AdsumError, Result};
 use adsum_types::AppId;
 use adsum_types::cmd::ActivityCmd;
@@ -39,7 +38,6 @@ struct ConnFacilitator {
   pid: u64,
   nonce: Value,
   user: Arc<Mutex<RpcUser>>,
-  oauth: Arc<OAuthManager>,
   token: CancellationToken,
   sink: EventSink,
   /// Pids published on this connection, oldest first (bounded).
@@ -48,19 +46,13 @@ struct ConnFacilitator {
 
 impl ConnFacilitator {
   /// Blank per-connection state (handshake pending, no pid yet).
-  fn fresh(
-    user: Arc<Mutex<RpcUser>>,
-    sink: EventSink,
-    oauth: Arc<OAuthManager>,
-    token: CancellationToken,
-  ) -> Self {
+  fn fresh(user: Arc<Mutex<RpcUser>>, sink: EventSink, token: CancellationToken) -> Self {
     Self {
       handshake: false,
       client_id: AppId::from(""),
       pid: 0,
       nonce: Value::Null,
       user,
-      oauth,
       token,
       sink,
       published_pids: Vec::new(),
@@ -113,9 +105,6 @@ impl IpcFacilitator for ConnFacilitator {
   fn current_user(&self) -> RpcUser {
     self.user.lock().unwrap_or_else(|e| e.into_inner()).clone()
   }
-  fn oauth_manager(&self) -> &Arc<OAuthManager> {
-    &self.oauth
-  }
   fn is_cancelled(&self) -> bool {
     self.token.is_cancelled()
   }
@@ -166,18 +155,6 @@ impl IpcTransport {
   ///
   /// [`AdsumError::IpcBind`] when every pipe name is taken.
   pub async fn bind(user: Arc<Mutex<RpcUser>>) -> Result<(Self, mpsc::Receiver<ActivityCmd>)> {
-    Self::bind_with_oauth(user, Arc::new(OAuthManager::from_env())).await
-  }
-
-  /// Bind with the daemon-wide OAuth policy/backend shared with other transports.
-  ///
-  /// # Errors
-  ///
-  /// [`AdsumError::IpcBind`] when every pipe name is taken.
-  pub async fn bind_with_oauth(
-    user: Arc<Mutex<RpcUser>>,
-    oauth: Arc<OAuthManager>,
-  ) -> Result<(Self, mpsc::Receiver<ActivityCmd>)> {
     let (listener, pipe_path) =
       tokio::task::spawn_blocking(create_pipe)
         .await
@@ -200,7 +177,6 @@ impl IpcTransport {
       conns: Arc::clone(&conns),
       pump_sem: Arc::new(tokio::sync::Semaphore::new(MAX_PUMPS)),
       user,
-      oauth,
       sink: sink.clone(),
     }));
 
@@ -238,8 +214,7 @@ impl IpcTransport {
   /// Graceful shutdown: stop accepting, drain connections with a deadline.
   ///
   /// Nonblocking pumps observe cancellation even for silent peers and
-  /// partial frames. Only connection-owned OAuth work is cancelled; the
-  /// shared manager remains available to other transports.
+  /// partial frames.
   pub async fn shutdown(mut self) {
     self.token.cancel();
     if let Some(task) = self.accept_task.take() {
@@ -371,7 +346,6 @@ struct DispatchCtx {
   /// Bounds concurrent pumps (see `MAX_PUMPS`).
   pump_sem: Arc<tokio::sync::Semaphore>,
   user: Arc<Mutex<RpcUser>>,
-  oauth: Arc<OAuthManager>,
   sink: EventSink,
 }
 
@@ -383,7 +357,6 @@ async fn dispatch_loop(
     conns,
     pump_sem,
     user,
-    oauth,
     sink,
   }: DispatchCtx,
 ) {
@@ -397,9 +370,7 @@ async fn dispatch_loop(
           tracing::warn!(kind = ?error.kind(), "[ipc] Failed to set nonblocking pipe mode");
           continue;
         }
-        let facil = ConnFacilitator::fresh(
-          Arc::clone(&user), sink.clone(), Arc::clone(&oauth), token.clone(),
-        );
+        let facil = ConnFacilitator::fresh(Arc::clone(&user), sink.clone(), token.clone());
         // Bounded pumps: past the cap the peer is dropped at once instead
         // of parking another blocking thread. The permit rides into the
         // closure and releases when the pump returns.

@@ -86,7 +86,7 @@ fn current_user_update_is_a_dispatch_with_the_user_inside() {
 
 #[test]
 fn unsupported_commands_map_to_official_codes() {
-  // OAuth is handled by the experimental loopback adapter.
+  // AUTHORIZE/AUTHENTICATE are answered directly by the transports.
   assert!(unsupported_command("AUTHORIZE").is_none());
   assert!(unsupported_command("AUTHENTICATE").is_none());
   // Invites target live sessions on the real client.
@@ -100,6 +100,27 @@ fn unsupported_commands_map_to_official_codes() {
   // Voice/guilds/overlay/store: real-client state only.
   let (code, _) = unsupported_command("SELECT_VOICE_CHANNEL").expect("known");
   assert_eq!(code, 1000);
+  // Networking, tickets and browser handoff (official commands):
+  // covered by the same real-client error.
+  for known in [
+    "BROWSER_HANDOFF",
+    "GET_APPLICATION_TICKET",
+    "GET_ENTITLEMENT_TICKET",
+    "GET_NETWORKING_CONFIG",
+    "NETWORKING_CREATE_TOKEN",
+    "NETWORKING_PEER_METRICS",
+    "NETWORKING_SYSTEM_METRICS",
+  ] {
+    let (code, _) = unsupported_command(known).expect("known");
+    assert_eq!(code, 1000, "{known}");
+  }
+  assert_eq!(
+    unsupported_command("CLOSE_ACTIVITY_JOIN_REQUEST"),
+    Some((
+      5006,
+      "No eligible activity: invites require the real Discord client"
+    ))
+  );
   // GET_GUILDS is token-backed; the rest need the real Discord client.
   assert!(unsupported_command("GET_GUILDS").is_none());
   let (code, _) = unsupported_command("GET_GUILD").expect("known");

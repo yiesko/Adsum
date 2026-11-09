@@ -16,7 +16,6 @@ struct FuzzFacilitator {
   pid: u64,
   sink: EventSink,
   published_pids: Vec<u64>,
-  oauth: std::sync::Arc<adsum_oauth::OAuthManager>,
 }
 
 impl IpcFacilitator for FuzzFacilitator {
@@ -48,9 +47,6 @@ impl IpcFacilitator for FuzzFacilitator {
   }
   fn sink(&self) -> &EventSink {
     &self.sink
-  }
-  fn oauth_manager(&self) -> &std::sync::Arc<adsum_oauth::OAuthManager> {
-    &self.oauth
   }
   fn admit_published_pid(&mut self, pid: u64) -> bool {
     adsum_transport_ipc::frame::admit_pid(&mut self.published_pids, pid)
@@ -101,7 +97,6 @@ fuzz_target!(|data: &[u8]| {
     pid: 0,
     sink,
     published_pids: Vec::new(),
-    oauth: std::sync::Arc::new(adsum_oauth::OAuthManager::from_env()),
   };
   handle_stream(&mut ipc, &mut stream);
   // Every response byte belongs to a complete frame.

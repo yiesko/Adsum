@@ -3,17 +3,8 @@ use super::*;
 mod clear_payload;
 mod clear_retry;
 mod connection;
-mod oauth;
 mod pending_queue;
 mod publish;
-
-fn oauth_connection(client_id: &str) -> OAuthConnection {
-  Arc::new(OAuthManager::new(
-    adsum_oauth::RpcAuthPolicy::Permissive,
-    Arc::new(adsum_oauth::BrowserOAuthBackend::new(None)),
-  ))
-  .connection(AppId::from(client_id))
-}
 
 /// An activity with a sizable `details`, so a clear that still carried
 /// one would dominate the entry's size.

@@ -9,12 +9,7 @@
 mod common;
 
 use std::os::unix::net::UnixStream;
-use std::sync::{Arc, LazyLock};
 use std::time::Duration;
-
-use adsum_oauth::{
-  OAuthBackend, OAuthCancellation, OAuthError, OAuthManager, RpcAuthPolicy, RpcOAuthResult,
-};
 
 use adsum_transport_ipc::EventSink;
 use adsum_transport_ipc::frame::{IpcFacilitator, PacketType, handle_stream as pump_stream};
@@ -22,19 +17,6 @@ use adsum_types::AppId;
 use adsum_types::cmd::ActivityCmd;
 use adsum_types::user::RpcUser;
 use common::{read_frame, recv_cmd, write_frame};
-
-struct NoOAuth;
-
-impl OAuthBackend for NoOAuth {
-  fn execute(
-    &self,
-    _command: &ActivityCmd,
-    _client_id: &str,
-    _cancellation: &OAuthCancellation,
-  ) -> Result<RpcOAuthResult, OAuthError> {
-    Err(OAuthError::InvalidArguments)
-  }
-}
 
 fn handle_stream(ipc: &mut dyn IpcFacilitator, stream: &mut UnixStream) {
   stream.set_nonblocking(true).expect("nonblocking pump");
@@ -96,15 +78,6 @@ impl IpcFacilitator for TestFacilitator {
   /// scheduling in the socketpair tests. The deadline has its own test.
   fn handshake_deadline(&self) -> Option<Duration> {
     self.deadline
-  }
-  fn oauth_manager(&self) -> &Arc<OAuthManager> {
-    static OAUTH: LazyLock<Arc<OAuthManager>> = LazyLock::new(|| {
-      Arc::new(OAuthManager::new(
-        RpcAuthPolicy::Permissive,
-        Arc::new(NoOAuth),
-      ))
-    });
-    &OAUTH
   }
   /// Test sink under assertion.
   fn sink(&self) -> &EventSink {

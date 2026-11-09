@@ -53,8 +53,6 @@ fn slot_snapshot_shares_the_connection_client_id() {
     responder: Responder::for_test(),
     published: Vec::new(),
     query_client_id: Some(AppId::from("123456789012345678")),
-    oauth: oauth_connection("123456789012345678"),
-    oauth_reply: None,
   };
   let stored_ptr = slot
     .query_client_id
@@ -86,8 +84,6 @@ fn forgetting_the_last_pid_releases_the_published_buffer() {
     responder: adsum_ws::Responder::for_test(),
     published: Vec::new(),
     query_client_id: None,
-    oauth: oauth_connection(""),
-    oauth_reply: None,
   };
   for pid in 1..=handlers::MAX_TRACKED_PIDS as u64 {
     let admission = slot.note_published(
@@ -125,8 +121,6 @@ fn a_partially_forgotten_list_keeps_its_buffer() {
     responder: adsum_ws::Responder::for_test(),
     published: Vec::new(),
     query_client_id: None,
-    oauth: oauth_connection(""),
-    oauth_reply: None,
   };
   slot.note_published(
     Some(adsum_types::AppId::from("app-1")),

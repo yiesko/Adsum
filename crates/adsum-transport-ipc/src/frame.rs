@@ -1,16 +1,11 @@
 //! Discord IPC wire protocol: framing, handshake, command dispatch.
 //!
-//! Every connection owns an OAuth handle and a single reply mailbox. The
-//! nonblocking pump keeps servicing frames, EOF and shutdown during browser
-//! authorization; both platform servers use exactly the same framing logic.
+//! The nonblocking pump keeps servicing frames, EOF and shutdown; both
+//! platform servers use exactly the same framing logic.
 
 use std::io::{Read, Write};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
 
-use adsum_oauth::{OAuthConnection, OAuthError, OAuthManager, OAuthTask, RpcAuthPolicy};
 use adsum_protocol::commands;
 use adsum_types::AppId;
 use adsum_types::cmd::{ActivityCmd, ActivityCmdArgs};
@@ -50,10 +45,6 @@ pub trait IpcFacilitator: Send {
 
   /// The current shared fallback identity (for unauthenticated legacy clients).
   fn current_user(&self) -> RpcUser;
-
-  /// Daemon-wide policy/backend. Required: authentication must never be
-  /// acknowledged using a default no-op session setter.
-  fn oauth_manager(&self) -> &Arc<OAuthManager>;
 
   /// Transport cancellation, also checked while a peer sends a partial frame.
   fn is_cancelled(&self) -> bool {
@@ -215,102 +206,14 @@ fn release_message_capacity(message: &mut String) {
   }
 }
 
-struct PendingOAuth {
-  task: OAuthTask,
-  // Keep only the reply envelope, never a second copy of codes/tokens/args.
-  reply: ActivityCmd,
-}
-
-/// A cache-miss REST fetch running off the pump thread.
-struct PendingRest {
-  receiver: Receiver<Result<Arc<Value>, OAuthError>>,
-  reply: ActivityCmd,
-}
-
-/// Daemon-wide cap on REST fetches started by the IPC pump: cache misses
-/// beyond it are refused instead of queueing more blocking work.
-const REST_FETCH_LIMIT: usize = 4;
-static REST_FETCHES: AtomicUsize = AtomicUsize::new(0);
-
-/// Reserve one REST fetch slot, returning its guard, or `None` when the pump
-/// should refuse.
-fn try_acquire_rest_fetch() -> Option<RestFetchSlot> {
-  REST_FETCHES
-    .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-      (current < REST_FETCH_LIMIT).then_some(current + 1)
-    })
-    .ok()?;
-  Some(RestFetchSlot)
-}
-
-/// Releases the slot when the detached fetch thread exits.
-struct RestFetchSlot;
-
-impl Drop for RestFetchSlot {
-  fn drop(&mut self) {
-    REST_FETCHES.fetch_sub(1, Ordering::AcqRel);
-  }
-}
-
-#[derive(Default)]
-struct Connection {
-  oauth: Option<OAuthConnection>,
-  pending: Option<PendingOAuth>,
-  pending_rest: Option<PendingRest>,
-}
-
-impl Connection {
-  fn close(&mut self) {
-    if let Some(oauth) = &self.oauth {
-      oauth.close();
-    }
-    self.pending = None;
-    self.pending_rest = None;
-  }
-
-  fn poll_oauth(&mut self) -> Option<String> {
-    let pending = self.pending.as_ref()?;
-    let result = pending.task.try_result()?;
-    let response = match result {
-      Ok(result) => commands::oauth_response(&pending.reply, &result.data),
-      Err(error) => auth_error(&pending.reply, &error),
-    };
-    self.pending = None;
-    Some(response)
-  }
-
-  fn poll_rest(&mut self) -> Option<String> {
-    let pending = self.pending_rest.as_ref()?;
-    let result = match pending.receiver.try_recv() {
-      Ok(result) => result,
-      Err(TryRecvError::Empty) => return None,
-      Err(TryRecvError::Disconnected) => Err(OAuthError::WorkerUnavailable),
-    };
-    let response = match result {
-      Ok(data) => commands::rpc_data_response(&pending.reply, &data),
-      Err(error) => auth_error(&pending.reply, &error),
-    };
-    self.pending_rest = None;
-    Some(response)
-  }
-}
-
-impl Drop for Connection {
-  fn drop(&mut self) {
-    self.close();
-  }
-}
-
 /// Pump one connection until close, error, cancellation or peer loss.
 ///
 /// The caller must configure nonblocking I/O (or bounded read/write timeouts).
 /// Run on a dedicated thread or in `spawn_blocking`, never on an async worker.
-/// Partial headers, bodies and replies survive WouldBlock/TimedOut. OAuth
-/// workers use a separate bounded pool; waiting for them never blocks reads.
+/// Partial headers, bodies and replies survive WouldBlock/TimedOut.
 pub fn handle_stream(ipc: &mut dyn IpcFacilitator, stream: &mut (impl Read + Write)) {
   let mut decoder = Decoder::default();
   let mut replies = Replies::default();
-  let mut connection = Connection::default();
   let mut closing = false;
   let mut clean_close = false;
   let connected_at = std::time::Instant::now();
@@ -334,14 +237,14 @@ pub fn handle_stream(ipc: &mut dyn IpcFacilitator, stream: &mut (impl Read + Wri
         Ok(ReadFrame::Frame(packet, mut message)) => {
           progressed = true;
           let reply = match packet {
-            PacketType::Handshake => match on_handshake(ipc, &mut connection, &message) {
+            PacketType::Handshake => match on_handshake(ipc, &message) {
               Ok(response) => replies.push(PacketType::Frame, &response),
               Err((code, reason)) => {
                 closing = true;
                 replies.push_encoded(close_frame(code, reason))
               }
             },
-            PacketType::Frame => match on_frame(ipc, &mut connection, &message) {
+            PacketType::Frame => match on_frame(ipc, &message) {
               Some(response) => replies.push(PacketType::Frame, &response),
               None => Ok(()),
             },
@@ -376,27 +279,6 @@ pub fn handle_stream(ipc: &mut dyn IpcFacilitator, stream: &mut (impl Read + Wri
         }
       }
     }
-    if closing {
-      // Still try to deliver pending OAuth/REST replies before closing:
-      // the peer may have shut down its read half but the worker result
-      // already arrived and must reach the connection before it drops.
-      let response = connection.poll_oauth().or_else(|| connection.poll_rest());
-      if let Some(response) = response {
-        if replies.push(PacketType::Frame, &response).is_err() {
-          break;
-        }
-        progressed = true;
-      }
-      connection.close();
-    } else {
-      let response = connection.poll_oauth().or_else(|| connection.poll_rest());
-      if let Some(response) = response {
-        if replies.push(PacketType::Frame, &response).is_err() {
-          break;
-        }
-        progressed = true;
-      }
-    }
     match replies.poll_flush(stream) {
       Ok(written) => progressed |= written,
       Err(error) => {
@@ -411,19 +293,17 @@ pub fn handle_stream(ipc: &mut dyn IpcFacilitator, stream: &mut (impl Read + Wri
       std::thread::sleep(POLL_INTERVAL);
     }
   }
-  connection.close();
   let clean = clean_close || ipc.is_cancelled();
   cleanup(ipc, clean);
 }
 
 fn on_handshake(
   ipc: &mut dyn IpcFacilitator,
-  connection: &mut Connection,
   message: &str,
 ) -> Result<String, (u16, &'static str)> {
-  // Even an identical handshake is a protocol violation. Never rebind an
-  // authenticated connection to a new application or retain its old session.
-  if connection.oauth.is_some() || ipc.handshake() {
+  // Even an identical handshake is a protocol violation. Never rebind a
+  // connection to a new application.
+  if ipc.handshake() {
     return Err((4000, "Already handshaked"));
   }
   let data = serde_json::from_str::<Handshake>(message).map_err(|_| (4000, "Invalid handshake"))?;
@@ -434,7 +314,6 @@ fn on_handshake(
     return Err((4000, "Invalid client_id"));
   }
   let client_id = AppId::from(data.client_id.as_str());
-  connection.oauth = Some(ipc.oauth_manager().connection(client_id.clone()));
   ipc.set_client_id(client_id);
   ipc.set_handshake(true);
   tracing::info!("[ipc] Client connected");
@@ -476,25 +355,16 @@ fn cleanup(ipc: &mut dyn IpcFacilitator, clean_close: bool) {
   ipc.set_nonce(Value::Null);
 }
 
-fn auth_error(command: &ActivityCmd, error: &OAuthError) -> String {
-  let (code, message) = error.rpc_error();
-  commands::rpc_error(&command.cmd, &command.nonce, code, message)
-}
-
-/// Dispatch a command, returning an immediate reply or leaving it in the
-/// connection's OAuth mailbox. No command handler writes to the stream.
-fn on_frame(
-  ipc: &mut dyn IpcFacilitator,
-  connection: &mut Connection,
-  message: &str,
-) -> Option<String> {
-  // The handle is created only by a successful, first handshake. A stale
-  // facilitator flag alone cannot grant command access.
-  let oauth = connection.oauth.as_ref()?;
+/// Dispatch a command, returning an immediate reply. No command
+/// handler writes to the stream.
+fn on_frame(ipc: &mut dyn IpcFacilitator, message: &str) -> Option<String> {
+  // Commands before a successful handshake get no command access.
+  if !ipc.handshake() {
+    return None;
+  }
   let mut command = match serde_json::from_str::<ActivityCmd>(message) {
     Ok(command) => command,
     Err(_) => {
-      // Serde errors may contain client-supplied values, including tokens.
       tracing::warn!("[ipc] Invalid command encoding");
       return Some(commands::rpc_error(
         "",
@@ -504,131 +374,20 @@ fn on_frame(
       ));
     }
   };
-  let owned_clear = command.cmd == "SET_ACTIVITY"
-    && command.args.as_ref().is_some_and(|args| {
-      matches!(args.activity, Some(None))
-        && args
-          .pid
-          .is_some_and(|pid| pid != 0 && ipc.owns_published_pid(pid))
-    });
-  if let Err(error) = oauth.check_command(&command, owned_clear) {
-    return Some(auth_error(&command, &error));
-  }
   Some(match command.cmd.as_ref() {
     "SUBSCRIBE" | "UNSUBSCRIBE" => commands::subscribe_ack(&command),
-    "SET_ACTIVITY" => {
-      // Legacy unauthenticated clients retain explicit-clear compatibility.
-      // Protected connections cannot clear another connection's pid, even
-      // after authenticating; a null activity never establishes ownership.
-      if command
-        .args
-        .as_ref()
-        .is_some_and(|args| matches!(args.activity, Some(None)))
-        && !owned_clear
-      {
-        let protected = match oauth.session() {
-          Ok(session) => {
-            session.is_some() || ipc.oauth_manager().policy() == RpcAuthPolicy::Required
-          }
-          Err(error) => return Some(auth_error(&command, &error)),
-        };
-        if protected {
-          return Some(commands::rpc_error(
-            &command.cmd,
-            &command.nonce,
-            4006,
-            "Activity pid is not owned by this connection",
-          ));
-        }
-      }
-      handle_set_activity(ipc, command)
-    }
+    "SET_ACTIVITY" => handle_set_activity(ipc, command),
     "GET_USER" => {
-      let (has_session, user) = match oauth.session_user() {
-        Ok((true, user)) => (true, user),
-        Ok((false, _)) => (false, None),
-        Err(error) => return Some(auth_error(&command, &error)),
-      };
-      let user = if has_session {
-        user
-      } else {
-        Some(ipc.current_user())
-      };
+      let user = Some(ipc.current_user());
       let wanted = command.args.as_ref().and_then(|args| args.user_id.as_ref());
       let matched = wanted.is_none_or(|id| user.as_ref().is_some_and(|user| *id == user.id));
       commands::user_response(&command, if matched { user.as_ref() } else { None })
     }
-    "GET_GUILDS" => match oauth.auth_scope("guilds") {
-      Ok(Some(true)) => {
-        if let Some(data) = oauth.cached_value("/users/@me/guilds") {
-          commands::rpc_data_response(&command, &data)
-        } else if connection.pending_rest.is_some() {
-          commands::rpc_error(
-            &command.cmd,
-            &command.nonce,
-            5000,
-            "Too many concurrent Discord queries; retry later",
-          )
-        } else {
-          match try_acquire_rest_fetch() {
-            Some(slot) => {
-              // Cache miss: fetch on a detached thread so the pump keeps
-              // reading frames, answering pings and honouring cancellation.
-              let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-              let fetch = oauth.clone();
-              std::thread::spawn(move || {
-                let _slot = slot;
-                let _ = sender.send(fetch.cached_fetch("/users/@me/guilds"));
-              });
-              connection.pending_rest = Some(PendingRest {
-                receiver,
-                reply: ActivityCmd {
-                  cmd: command.cmd.clone(),
-                  nonce: command.nonce.clone(),
-                  ..ActivityCmd::empty()
-                },
-              });
-              return None;
-            }
-            None => commands::rpc_error(
-              &command.cmd,
-              &command.nonce,
-              5000,
-              "Too many concurrent Discord queries; retry later",
-            ),
-          }
-        }
-      }
-      // Authenticated but missing the required scope.
-      Ok(Some(false)) => commands::rpc_error(
-        &command.cmd,
-        &command.nonce,
-        4006,
-        "Missing required scope: guilds",
-      ),
-      Ok(None) => auth_error(&command, &OAuthError::NotAuthenticated),
-      Err(error) => auth_error(&command, &error),
-    },
+    "GET_GUILDS" => commands::rpc_error(&command.cmd, &command.nonce, 4006, "Not authenticated"),
     // GET_GUILD / GET_CHANNELS / GET_CHANNEL require the local Discord client
-    // (or a bot token) — user OAuth tokens cannot access /guilds/{id}.
+    // (or a bot token).
     "AUTHORIZE" | "AUTHENTICATE" => {
-      // Keep the mailbox until its reply is consumed, even if the worker
-      // finished between polls. Never overwrite a pending request's nonce.
-      if connection.pending.is_some() {
-        return Some(auth_error(&command, &OAuthError::OperationInProgress));
-      }
-      let reply = ActivityCmd {
-        cmd: command.cmd.clone(),
-        nonce: command.nonce.clone(),
-        ..ActivityCmd::empty()
-      };
-      match oauth.start(command) {
-        Ok(task) => {
-          connection.pending = Some(PendingOAuth { task, reply });
-          return None;
-        }
-        Err(error) => auth_error(&reply, &error),
-      }
+      commands::rpc_error(&command.cmd, &command.nonce, 4006, "Not authenticated")
     }
     "CONNECTIONS_CALLBACK" => commands::rpc_error(
       &command.cmd,

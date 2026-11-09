@@ -164,7 +164,7 @@ pub struct ActivityCmdArgs {
   pub guild_id: Option<String>,
   // For GET_CHANNEL
   pub channel_id: Option<String>,
-  /// Forward-compatible RPC args (OAuth and future protocol extensions).
+  /// Forward-compatible RPC args (future protocol extensions).
   #[serde(flatten, default)]
   pub extra: HashMap<String, Value>,
 }

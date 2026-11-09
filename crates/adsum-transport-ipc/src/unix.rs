@@ -23,7 +23,6 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use adsum_oauth::OAuthManager;
 use adsum_protocol::error::{AdsumError, Result};
 use adsum_types::AppId;
 use adsum_types::cmd::ActivityCmd;
@@ -76,7 +75,6 @@ struct ConnFacilitator {
   pid: u64,
   nonce: Value,
   user: Arc<Mutex<RpcUser>>,
-  oauth: Arc<OAuthManager>,
   token: CancellationToken,
   sink: EventSink,
   /// Pids published on this connection, oldest first (bounded).
@@ -85,19 +83,13 @@ struct ConnFacilitator {
 
 impl ConnFacilitator {
   /// Blank per-connection state (handshake pending, no pid yet).
-  fn fresh(
-    user: Arc<Mutex<RpcUser>>,
-    sink: EventSink,
-    oauth: Arc<OAuthManager>,
-    token: CancellationToken,
-  ) -> Self {
+  fn fresh(user: Arc<Mutex<RpcUser>>, sink: EventSink, token: CancellationToken) -> Self {
     Self {
       handshake: false,
       client_id: AppId::from(""),
       pid: 0,
       nonce: Value::Null,
       user,
-      oauth,
       token,
       sink,
       published_pids: Vec::new(),
@@ -149,9 +141,6 @@ impl IpcFacilitator for ConnFacilitator {
   /// Snapshot of the current identity for `GET_USER` answers.
   fn current_user(&self) -> RpcUser {
     self.user.lock().unwrap_or_else(|e| e.into_inner()).clone()
-  }
-  fn oauth_manager(&self) -> &Arc<OAuthManager> {
-    &self.oauth
   }
   fn is_cancelled(&self) -> bool {
     self.token.is_cancelled()
@@ -211,18 +200,6 @@ impl IpcTransport {
   ///
   /// [`AdsumError::IpcBind`] when every index is held by a live holder.
   pub async fn bind(user: Arc<Mutex<RpcUser>>) -> Result<(Self, mpsc::Receiver<ActivityCmd>)> {
-    Self::bind_with_oauth(user, Arc::new(OAuthManager::from_env())).await
-  }
-
-  /// Bind with the daemon-wide OAuth policy/backend shared with other transports.
-  ///
-  /// # Errors
-  ///
-  /// [`AdsumError::IpcBind`] when every candidate socket is unavailable.
-  pub async fn bind_with_oauth(
-    user: Arc<Mutex<RpcUser>>,
-    oauth: Arc<OAuthManager>,
-  ) -> Result<(Self, mpsc::Receiver<ActivityCmd>)> {
     let (preferred, bind_dirs, aliases) = tokio::task::spawn_blocking(|| {
       let bases = socket_dir_candidates();
       let preferred = prepare_preferred_dir();
@@ -239,7 +216,7 @@ impl IpcTransport {
       attempts: 10,
       source: std::io::Error::other("socket path preparation panicked"),
     })?;
-    let (transport, rx) = Self::bind_with_paths(user, bind_dirs, aliases, oauth).await?;
+    let (transport, rx) = Self::bind_with_paths(user, bind_dirs, aliases).await?;
     let bound = Path::new(transport.socket_path());
     if !flatpak_compatibility_available(preferred.as_deref(), bound) {
       tracing::warn!("{FLATPAK_UNAVAILABLE_WARNING}");
@@ -259,19 +236,6 @@ impl IpcTransport {
     user: Arc<Mutex<RpcUser>>,
     dirs: Vec<PathBuf>,
   ) -> Result<(Self, mpsc::Receiver<ActivityCmd>)> {
-    Self::bind_with_dirs_and_oauth(user, dirs, Arc::new(OAuthManager::from_env())).await
-  }
-
-  /// Bind in explicit directories with an injected OAuth manager.
-  ///
-  /// # Errors
-  ///
-  /// [`AdsumError::IpcBind`] when no directory/index can be bound.
-  pub async fn bind_with_dirs_and_oauth(
-    user: Arc<Mutex<RpcUser>>,
-    dirs: Vec<PathBuf>,
-    oauth: Arc<OAuthManager>,
-  ) -> Result<(Self, mpsc::Receiver<ActivityCmd>)> {
     if dirs.is_empty() {
       return Err(AdsumError::IpcBind {
         attempts: 10,
@@ -290,7 +254,7 @@ impl IpcTransport {
       attempts: 10,
       source: std::io::Error::other("socket alias discovery panicked"),
     })?;
-    Self::bind_with_paths(user, dirs, aliases, oauth).await
+    Self::bind_with_paths(user, dirs, aliases).await
   }
 
   /// Bind in `bind_dirs` (first = primary) and publish marked aliases into
@@ -300,7 +264,6 @@ impl IpcTransport {
     user: Arc<Mutex<RpcUser>>,
     bind_dirs: Vec<PathBuf>,
     alias_dirs: Vec<PathBuf>,
-    oauth: Arc<OAuthManager>,
   ) -> Result<(Self, mpsc::Receiver<ActivityCmd>)> {
     // Blocking syscalls (recovery, bind, probe with its 1s budget, alias
     // publication) run off the async workers; this executes once per bind.
@@ -366,7 +329,6 @@ impl IpcTransport {
       live: Arc::clone(&live),
       next_conn_id: Arc::clone(&next_conn_id),
       user,
-      oauth,
       sink: sink.clone(),
     }));
 
@@ -874,7 +836,6 @@ struct AcceptCtx {
   live: Arc<Mutex<Vec<(u64, std::os::unix::net::UnixStream)>>>,
   next_conn_id: Arc<AtomicU64>,
   user: Arc<Mutex<RpcUser>>,
-  oauth: Arc<OAuthManager>,
   sink: EventSink,
 }
 
@@ -888,7 +849,6 @@ async fn accept_loop(
     live,
     next_conn_id,
     user,
-    oauth,
     sink,
   }: AcceptCtx,
 ) {
@@ -919,16 +879,14 @@ async fn accept_loop(
             continue;
           }
         };
-        // Keep reads/writes bounded so OAuth, EOF and cancellation are polled
+        // Keep reads/writes bounded so EOF and cancellation are polled
         // even when the peer is idle or has sent only part of a frame.
         if let Err(err) = std_stream.set_nonblocking(true) {
           tracing::warn!("[ipc] Failed to set nonblocking mode: {err}");
           continue;
         };
         tracing::debug!("[ipc] Incoming stream...");
-        let facil = ConnFacilitator::fresh(
-          Arc::clone(&user), sink.clone(), Arc::clone(&oauth), token.clone(),
-        );
+        let facil = ConnFacilitator::fresh(Arc::clone(&user), sink.clone(), token.clone());
         // Bounded pumps (Windows parity): past the cap the peer is
         // dropped at once instead of parking another blocking thread.
         // The permit rides into the closure and releases when the pump

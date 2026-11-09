@@ -16,7 +16,6 @@ workspace = true
 [dependencies]
 adsum-types = { path = "../adsum-types" }
 adsum-protocol = { path = "../adsum-protocol" }
-adsum-oauth = { path = "../adsum-oauth" }
 adsum-detect = { path = "../adsum-detect" }
 adsum-telemetry = { path = "../adsum-telemetry" }
 adsum-transport-ipc = { path = "../adsum-transport-ipc" }

@@ -8,11 +8,6 @@ flag without an environment variable.
 Boolean flags (`--no-process-scan`, `--enable-db-update`, and the rest)
 accept `1`, `0`, `true`, `false`, `yes`, `no`, `on`, and `off`.
 
-One subcommand exists alongside the flags: `adsum oauth` manages Discord
-OAuth grants (`login`, `status`, `logout`) — see the
-[OAuth test guide](oauth-rpc-social-sdk-testing.md) and the
-[operator setup](oauth-social-sdk-prototype.md#operator-setup-installed-service).
-
 ## Detection and scanning
 
 | Flag | Environment variable | Default | What it does |

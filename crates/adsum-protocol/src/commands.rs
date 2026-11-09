@@ -309,47 +309,6 @@ pub fn current_user_update(user: &RpcUser) -> String {
   .unwrap_or_else(|_| String::from("{}"))
 }
 
-/// Build the RPC reply carrying OAuth data (`code` or `/oauth2/@me`).
-/// The OAuth adapter has already validated the result; this builder only
-/// preserves the common command/nonce envelope used by the transports.
-#[must_use]
-pub fn oauth_response(cmd: &ActivityCmd, data: &Value) -> String {
-  serde_json::to_string(&Reply {
-    cmd: &cmd.cmd,
-    data,
-    evt: None,
-    nonce: &cmd.nonce,
-  })
-  .unwrap_or_else(|_| error_fallback_json(&cmd.cmd, Some("ERROR")))
-}
-
-/// Build the reply for a token-backed RPC data command (`GET_GUILDS`,
-/// `GET_GUILD`, `GET_CHANNELS`, `GET_CHANNEL`): echoes `cmd`/`nonce` with
-/// the fetched Discord payload under `data`.
-#[must_use]
-pub fn rpc_data_response(cmd: &ActivityCmd, data: &Value) -> String {
-  serde_json::to_string(&Reply {
-    cmd: &cmd.cmd,
-    data,
-    evt: None,
-    nonce: &cmd.nonce,
-  })
-  .unwrap_or_else(|_| error_fallback_json(&cmd.cmd, Some("ERROR")))
-}
-
-/// Same envelope as [`rpc_data_response`], for callers that moved the
-/// command's identity into a detached task and kept only `cmd` and `nonce`.
-#[must_use]
-pub fn rpc_data_response_cmd(cmd: &str, nonce: &Value, data: &Value) -> String {
-  serde_json::to_string(&Reply {
-    cmd,
-    data,
-    evt: None,
-    nonce,
-  })
-  .unwrap_or_else(|_| error_fallback_json(cmd, Some("ERROR")))
-}
-
 /// Official error for a known command that has no backend here (voice,
 /// voice, guilds, overlay, store...). Returns `(code, message)` so the IPC
 /// and WebSocket dispatches share one table instead of drifting apart;
@@ -362,6 +321,7 @@ pub fn unsupported_command(cmd: &str) -> Option<(u16, &'static str)> {
     // Activity invites target live sessions on the real client.
     "SEND_ACTIVITY_JOIN_INVITE"
     | "CLOSE_ACTIVITY_REQUEST"
+    | "CLOSE_ACTIVITY_JOIN_REQUEST"
     | "ACCEPT_ACTIVITY_INVITE"
     | "ACTIVITY_INVITE_USER" => Some((
       5006,
@@ -393,6 +353,13 @@ pub fn unsupported_command(cmd: &str) -> Option<(u16, &'static str)> {
     | "OPEN_OVERLAY_VOICE_SETTINGS"
     | "GET_SKUS"
     | "GET_ENTITLEMENTS"
+    | "GET_ENTITLEMENT_TICKET"
+    | "GET_APPLICATION_TICKET"
+    | "GET_NETWORKING_CONFIG"
+    | "NETWORKING_CREATE_TOKEN"
+    | "NETWORKING_PEER_METRICS"
+    | "NETWORKING_SYSTEM_METRICS"
+    | "BROWSER_HANDOFF"
     | "START_PURCHASE"
     | "VALIDATE_APPLICATION" => Some((1000, NEEDS_CLIENT)),
     _ => None,

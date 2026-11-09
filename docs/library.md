@@ -40,12 +40,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 `run_until` takes a shutdown future: whatever you pass resolves when the
 daemon should stop (a Ctrl+C signal, a channel closing, a test ending).
-Teardown runs in reverse startup order: transports, bridge, OAuth workers,
-scanner threads and the event pump are signalled and joined with bounded
-deadlines (5 s for scanner threads; an in-flight OAuth HTTPS request can
-take up to 12 s). A worker that misses its deadline is logged and left
-detached. Dropping the `run_until` future signals cancellation but does
-not join.
+Teardown runs in reverse startup order: transports, bridge, scanner
+threads and the event pump are signalled and joined with bounded
+deadlines (5 s for scanner threads). A worker that misses its deadline
+is logged and left detached. Dropping the `run_until` future signals
+cancellation but does not join.
 
 ## Loading the database
 

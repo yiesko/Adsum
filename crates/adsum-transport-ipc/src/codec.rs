@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::frame::{MAX_IPC_PAYLOAD, PacketType, encode};
 
-/// A slow reader cannot retain a committed OAuth session indefinitely.
+/// A slow reader cannot retain a committed session indefinitely.
 const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_QUEUED_REPLIES: usize = 8;
 const MAX_QUEUED_BYTES: usize = MAX_IPC_PAYLOAD as usize * 8;
@@ -36,7 +36,7 @@ pub(crate) enum DecodeError {
 
 impl Decoder {
   /// At most two reads per poll, so even an active peer cannot starve
-  /// cancellation, the OAuth mailbox or outgoing replies.
+  /// cancellation or outgoing replies.
   pub(crate) fn poll_read(&mut self, stream: &mut impl Read) -> Result<ReadFrame, DecodeError> {
     if self.header_len < self.header.len() {
       match stream.read(&mut self.header[self.header_len..]) {

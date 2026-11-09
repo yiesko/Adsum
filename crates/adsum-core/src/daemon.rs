@@ -17,7 +17,6 @@ use adsum_detect::refresh::RefreshConfig;
 use adsum_detect::runtime::ShutdownHandle;
 use adsum_detect::server::ProcessServer;
 use adsum_detect::types::{ProcessCallback, ProcessEventListeners, ProcessScanState, ScannedEntry};
-use adsum_oauth::OAuthManager;
 use adsum_protocol::error::{AdsumError, Result};
 use adsum_telemetry::QueueGauge;
 use adsum_transport_ipc::IpcTransport;
@@ -56,7 +55,6 @@ struct ServeParams {
   proc_tx: Option<mpsc::Sender<ProcInput>>,
   watch_gauge: Option<adsum_telemetry::QueueGauge>,
   user: Arc<Mutex<RpcUser>>,
-  oauth: Arc<OAuthManager>,
   scanner_handle: Option<adsum_detect::runtime::ShutdownHandle>,
 }
 
@@ -189,31 +187,19 @@ impl Daemon {
   /// transports stop, the scanner is shut down and
   /// joined (directed shutdown — no orphaned scan/refresh/watcher
   /// threads), then the server handle is dropped so the event pump's
-  /// channel closes, and the pump itself is joined. A single OAuth manager
-  /// shares policy and worker capacity across IPC and WebSocket. After the
-  /// transports stop, its workers are cancelled and joined off-runtime; an
-  /// in-flight HTTPS request may take up to its 12-second deadline to finish.
+  /// channel closes, and the pump itself is joined.
   /// Bind failures use the same teardown. Dropping the future signals scanner
-  /// and OAuth cancellation, but cannot synchronously join their workers.
+  /// cancellation, but cannot synchronously join their workers.
   ///
   /// # Errors
   ///
   /// Bind failures (`IpcBind`, `WsBind`, `BridgeBind`) surface here;
   /// nothing exits the process — the caller (CLI) decides.
-  pub async fn run_until(self, shutdown: impl Future<Output = ()> + Send + 'static) -> Result<()> {
-    self
-      .run_until_with_oauth(shutdown, Arc::new(OAuthManager::from_env()))
-      .await
-  }
-
-  async fn run_until_with_oauth(
+  pub async fn run_until(
     mut self,
     shutdown: impl Future<Output = ()> + Send + 'static,
-    oauth: Arc<OAuthManager>,
   ) -> Result<()> {
-    let _oauth_cancel = OAuthCancelGuard(Arc::clone(&oauth));
     let user = Arc::new(Mutex::new(RpcUser::from_env()));
-    log_persisted_grants();
 
     // Move (never clone) the database into the scanner build: it is
     // already scanner-only, so no second full generation is pinned
@@ -245,44 +231,19 @@ impl Daemon {
           proc_tx,
           watch_gauge: scanner_gauge,
           user,
-          oauth: Arc::clone(&oauth),
           scanner_handle: scanner.as_ref().map(ProcessServer::shutdown_handle),
         },
         shutdown,
       )
       .await;
-    // Both transports have stopped on success and bind failure. Join OAuth
-    // independently of Tokio's IPC/scanner work, never on a runtime worker.
-    oauth.cancel();
-    // Snapshot before the blocking shutdown consumes the Arc.
-    let oauth_metrics = oauth.metrics();
-    let oauth_teardown = tokio::task::spawn_blocking(move || {
-      let timed_out = oauth.shutdown();
-      if timed_out > 0 {
-        tracing::warn!(
-          "[daemon] {timed_out} OAuth worker(s) did not exit within the shutdown deadline"
-        );
-      }
-    });
     Self::teardown_scanner(scanner, pump).await;
-    if oauth_teardown.await.is_err() {
-      tracing::warn!("[daemon] OAuth teardown task failed");
-    }
-    tracing::info!(
-      authorize = oauth_metrics.authorize_total,
-      authenticate = oauth_metrics.authenticate_total,
-      cache_hits = oauth_metrics.cache_hits,
-      cache_misses = oauth_metrics.cache_misses,
-      rate_limited = oauth_metrics.rate_limited,
-      "[daemon] OAuth session totals"
-    );
     cancel_guard.disarm();
     result
   }
 
   /// Bind transports + bridge, serve until `shutdown`, stop the async
   /// legs. Partial binds use the same awaited transport teardown as normal
-  /// completion; scanner and OAuth worker joins are the caller's job.
+  /// completion; scanner joins are the caller's job.
   async fn serve(
     &self,
     params: ServeParams,
@@ -293,7 +254,6 @@ impl Daemon {
       proc_tx,
       watch_gauge,
       user,
-      oauth,
       scanner_handle,
     } = params;
     let (mut ipc_transport, mut ipc_rx) = split_option(None);
@@ -301,8 +261,7 @@ impl Daemon {
 
     let result = async {
       if self.config.enable_ipc_connector {
-        let (transport, rx) =
-          IpcTransport::bind_with_oauth(Arc::clone(&user), Arc::clone(&oauth)).await?;
+        let (transport, rx) = IpcTransport::bind(Arc::clone(&user)).await?;
         tracing::info!("[daemon] IPC transport on {}", transport.socket_path());
         ipc_transport = Some(transport);
         ipc_rx = rx;
@@ -312,8 +271,7 @@ impl Daemon {
       // when both are off.
       if self.config.enable_websocket_connector || self.config.enable_secondary_events {
         let ws_config = ws_transport_config(&self.config);
-        let (transport, rx) =
-          WsTransport::bind_with_oauth(ws_config, Arc::clone(&user), Arc::clone(&oauth)).await?;
+        let (transport, rx) = WsTransport::bind(ws_config, Arc::clone(&user)).await?;
         tracing::info!("[daemon] Game transport on port {}", transport.bound_port());
         game_transport = Some(transport);
         game_rx = rx;
@@ -561,55 +519,6 @@ impl Drop for CancelGuard {
     if let Some(handle) = self.handle.take() {
       handle.signal();
     }
-  }
-}
-
-/// Dropping an abandoned run must signal OAuth cancellation without joining
-/// blocking I/O on the runtime thread. Normal completion joins explicitly.
-struct OAuthCancelGuard(Arc<OAuthManager>);
-
-/// Surface stored OAuth grants at startup: which applications have one, what
-/// scopes they carry, when the last access token expired, and whether the
-/// file is still private. Refresh tokens are never read into a log line —
-/// only their presence.
-fn log_persisted_grants() {
-  let ids = adsum_oauth::store::list();
-  if ids.is_empty() {
-    tracing::debug!("[daemon] no persisted OAuth grants");
-    return;
-  }
-  for id in ids {
-    match adsum_oauth::store::load(&id) {
-      Some(session) => {
-        #[cfg(unix)]
-        if let Some(mode) = adsum_oauth::store::stored_mode(&id)
-          && mode & 0o077 != 0
-        {
-          tracing::warn!(
-            application = %id,
-            mode = format!("{mode:04o}"),
-            "[daemon] persisted OAuth grant has loose file permissions; expected 0600"
-          );
-        }
-        tracing::info!(
-          application = %id,
-          scopes = %session.scopes.join(" "),
-          expires = session.expires,
-          refresh_stored = session.refresh_token.is_some(),
-          "[daemon] persisted OAuth grant"
-        );
-      }
-      None => tracing::warn!(
-        application = %id,
-        "[daemon] persisted OAuth grant file is unreadable or corrupt"
-      ),
-    }
-  }
-}
-
-impl Drop for OAuthCancelGuard {
-  fn drop(&mut self) {
-    self.0.cancel();
   }
 }
 
